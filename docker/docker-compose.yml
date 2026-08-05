@@ -1,0 +1,36 @@
+name: engram
+services:
+  engram:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # LOCAL-FIRST by default (review 6f2cf4e9 #2): ports bind to loopback.
+    # Widening exposure is a deliberate user edit, never a silent default.
+    ports:
+      - "127.0.0.1:6174:6174"
+      - "127.0.0.1:3004:3004"
+    # .env at the staged/public repo root is the source of truth for the API
+    # key; do not duplicate key vars under environment (override footgun).
+    env_file:
+      - ../.env
+    environment:
+      - NEURAL_MCP_PORT=6174
+      - MESSAGE_HUB_PORT=3004
+      - NODE_ENV=production
+      # DB truth (review 6f2cf4e9 #3): explicit path on the mounted volume —
+      # matches BACKUP-AND-RESTORE.md; never the legacy default filename.
+      - NEURAL_DB_PATH=/app/data/engram.db
+      - SQLITE_VEC_CACHE_DIR=/app/data/models
+      - SQLITE_VEC_DIMENSIONS=384
+      - SQLITE_VEC_MODEL=Xenova/all-MiniLM-L6-v2
+    volumes:
+      - engram_data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:6174/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+volumes:
+  engram_data:

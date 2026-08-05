@@ -1,0 +1,37 @@
+# HYTHE CI — mirrors the local staged-proof gates that a runner can carry:
+# typecheck, build, schema-drift, the full single-fork contract suite, and
+# the docker image build. The lock-verify/script-integrity/final-tree-smoke
+# gates remain local (they bind to internal/, which never ships publicly).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run ci:schemas
+      # P2 release verification remains explicit and contains no publish step.
+      - run: node scripts/verify-hythe-release-tree.mjs
+      # Single-fork matches the proven local invocation; the contract suite
+      # boots its own hermetic server (tests/global-setup.ts).
+      - run: npx vitest run --pool=forks --poolOptions.forks.singleFork
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f docker/Dockerfile -t engram .

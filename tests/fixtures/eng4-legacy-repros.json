@@ -1,0 +1,23 @@
+{
+  "description": "Live failures of the legacy get_agent_context path, observed by engram-sol on 2026-07-15 (review msgs d001e2be / 4179250c). Pinned so the failure evidence cannot drift. Each converts to an expected-failure test against legacy behavior when ENG-4 implementation starts; resume() must pass the same scenario.",
+  "repros": [
+    {
+      "id": "substring-resolver-empty-project",
+      "tool": "get_agent_context",
+      "args": { "projectHint": "sample-portal-app", "budgetTokens": 2000 },
+      "observed": "Returned project={} after trimming — the LOWER(content) LIKE '%...%' substring resolver matched incidental mentions and the assembler trimmed the project section to an empty object. A task-scoped query returned one old project observation instead of task state.",
+      "observedOn": "2026-07-15",
+      "mustFailAgainstLegacy": true,
+      "eng4Expectation": "resume({scope:{project:'sample-portal-app'}}) exact-resolves the canonical entity UUID and returns a populated bundle or explicit resolvedScope nulls — never a silently-empty section."
+    },
+    {
+      "id": "definition-prose-as-state",
+      "tool": "get_agent_context",
+      "args": { "projectHint": "engram", "budgetTokens": 4000 },
+      "observed": "Bundle spent 3556/4000 tokens on creation-time entity prose, dropped projectSummary, and omitted the engram-productize satellite entirely — definition prose masqueraded as current state.",
+      "observedOn": "2026-07-15",
+      "mustFailAgainstLegacy": true,
+      "eng4Expectation": "resume() returns entity.definition and state.current as separate fields with per-section coverage accounting; omissions are explicit handles, never silent."
+    }
+  ]
+}

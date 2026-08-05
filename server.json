@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.hythe/hythe",
+  "description": "HYTHE — coordination bus + shared truth for AI agent fleets — self-hosted MCP server + stdio bridge.",
+  "repository": {
+    "url": "https://github.com/hythe-dev/hythe",
+    "source": "github"
+  },
+  "version": "0.1.2",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@hythe/mcp",
+      "version": "0.1.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "API_KEY",
+          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (generate with: npx -y @hythe/mcp init)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "MCP_HOST",
+          "description": "HYTHE server host (default 127.0.0.1)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "MCP_PORT",
+          "description": "HYTHE server port (default 6174)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

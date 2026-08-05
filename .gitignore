@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+logs/
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage/
+GATE-RESULTS.txt
+internal/hythe-p1/.artifacts/
+internal/hythe-p2/.artifacts/
