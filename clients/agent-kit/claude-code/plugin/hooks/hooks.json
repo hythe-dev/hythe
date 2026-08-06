@@ -1,0 +1,29 @@
+{
+  "description": "Memory hooks — resume on session start, checkpoint + recover after compaction",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\"",
+            "timeout": 10,
+            "statusMessage": "Loading memory context..."
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/post-compaction.sh\"",
+            "timeout": 10,
+            "statusMessage": "Recovering memory context after compaction..."
+          }
+        ]
+      }
+    ]
+  }
+}

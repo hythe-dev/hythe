@@ -1,0 +1,14 @@
+This kit adapts client-integration patterns from:
+
+  Gentleman-Programming/engram (https://github.com/Gentleman-Programming/engram)
+  Copyright (c) Gentleman Programming
+  Licensed under the MIT License
+
+Adapted elements: Claude Code hook structure (SessionStart startup/compact
+matchers, instruction-injection via stdout), post-compaction recovery step
+contract, marker-block managed instruction files, Codex
+experimental_compact_prompt_file wiring, and the per-agent setup approach.
+All server-side logic, tool names, protocol content, and the hub-topology
+documentation are original to this project.
+
+The MIT license text of the source project is available at the URL above.

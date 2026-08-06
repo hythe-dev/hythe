@@ -1,0 +1,15 @@
+# Codex config additions (~/.codex/config.toml) — HYTHE memory wiring.
+# Easiest path: run `npx -y @hythe/mcp init` — it generates an API key and
+# prints this exact block ready to paste. Placeholders below are non-secret.
+
+[mcp_servers.hythe]
+command = "npx"
+args = ["-y", "@hythe/mcp"]
+env = { API_KEY = "YOUR_API_KEY", MCP_HOST = "127.0.0.1", MCP_PORT = "6174" }
+
+# Memory Protocol loaded as model instructions (see instructions.md):
+model_instructions_file = "~/.codex/hythe-instructions.md"
+
+# Compaction survival — compacted summaries end with mandatory
+# checkpoint/resume steps (see compact-prompt.md):
+experimental_compact_prompt_file = "~/.codex/hythe-compact-prompt.md"

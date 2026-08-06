@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "hythe",
+  "description": "HYTHE — persistent memory + multi-agent coordination for AI agent fleets: knowledge graph, checkpoints, agent inbox.",
+  "owner": {
+    "name": "tomcat65",
+    "email": "talvarez.uh@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "hythe",
+      "description": "Session memory that survives compaction: auto-resume on start, checkpoint-on-compact, Memory Protocol skill, agent inbox awareness.",
+      "version": "0.1.0",
+      "author": {
+        "name": "tomcat65"
+      },
+      "source": "./clients/agent-kit/claude-code/plugin",
+      "category": "productivity",
+      "homepage": "https://hythe.dev"
+    }
+  ]
+}
