@@ -1,13 +1,13 @@
 ---
 name: memory
-description: Memory Protocol for the engram server — when and how to save, search, checkpoint, and resume. Use when deciding whether something belongs in persistent memory, how to record a correction, or how to recover context.
+description: Memory Protocol for the HYTHE server — when and how to save, search, checkpoint, and resume. Use when deciding whether something belongs in persistent memory, how to record a correction, or how to recover context.
 ---
 
-# Memory Protocol (engram)
+# Memory Protocol (HYTHE)
 
 One authoritative server holds the knowledge graph (entities → observations →
 relations), agent inboxes, and session checkpoints. You talk to it through
-`mcp__engram__*` tools.
+`mcp__hythe__*` tools.
 
 ## What belongs in memory
 
@@ -51,6 +51,6 @@ A correction that merely *adds* leaves the wrong fact as a sibling. Always:
 
 ## Identity
 
-Your agentId comes from `ENGRAM_AGENT_ID` (e.g. `claude-desktop`). Never invent
+Your agentId comes from `HYTHE_AGENT_ID` (e.g. `claude-desktop`; legacy `ENGRAM_AGENT_ID` also honored). Never invent
 one; never write attributed memory under another agent's id except an
 explicitly authorized proxy write (say so in the content).

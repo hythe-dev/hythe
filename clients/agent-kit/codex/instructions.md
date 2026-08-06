@@ -1,10 +1,10 @@
-# Memory instructions (engram) — Codex
+# Memory instructions (HYTHE) — Codex
 
-You have `engram` MCP tools: persistent memory + agent coordination on one
+You have `hythe` MCP tools: persistent memory + agent coordination on one
 authoritative server.
 
 ## Session start
-1. `resume` with your agentId (from env `ENGRAM_AGENT_ID`, e.g. `codex-cli`).
+1. `resume` with your agentId (from env `HYTHE_AGENT_ID`, e.g. `codex-cli`).
 2. `get_ai_messages` — check your inbox; other agents leave tasks/answers there.
 
 ## While working — save proactively

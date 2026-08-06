@@ -1,9 +1,9 @@
-<!-- BEGIN ENGRAM MEMORY PROTOCOL — managed by setup.sh -->
-## Persistent Memory Protocol (engram)
+<!-- BEGIN HYTHE MEMORY PROTOCOL — managed by setup.sh -->
+## Persistent Memory Protocol (HYTHE)
 
-You have engram MCP memory tools (persistent memory + agent coordination).
+You have HYTHE MCP memory tools (persistent memory + agent coordination).
 
-- SESSION START: call `resume` with agentId from ENGRAM_AGENT_ID, then
+- SESSION START: call `resume` with agentId from HYTHE_AGENT_ID, then
   `get_ai_messages` (your inbox — other agents leave tasks/answers there).
 - SAVE PROACTIVELY via `add_observations`: decisions (with why), bug fixes
   (with root cause), discoveries, learned constraints. Factual claims carry
@@ -14,4 +14,4 @@ You have engram MCP memory tools (persistent memory + agent coordination).
   compacted summary FIRST, then `resume` to recover state, then continue.
 - BEFORE SAYING DONE on substantial work: `checkpoint` with goal /
   discoveries / accomplished / next steps / entities.
-<!-- END ENGRAM MEMORY PROTOCOL -->
+<!-- END HYTHE MEMORY PROTOCOL -->

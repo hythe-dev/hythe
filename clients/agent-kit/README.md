@@ -38,10 +38,11 @@ and `setup.sh` for instruction-file wiring.
 - **Instruction-injection first.** Hooks emit protocol + mandatory recovery
   steps to stdout (Claude Code `additionalContext`); the agent itself performs
   memory calls through its MCP tools. No credentials in hooks by default.
-  Optional direct-context fetch is stubbed behind `ENGRAM_GATEWAY_URL` +
-  `ENGRAM_API_KEY` env vars and OFF by default.
+  The bridge connection itself comes from the standard `@hythe/mcp` env
+  set (`API_KEY`, `MCP_HOST`, `MCP_PORT`) — generate it with
+  `npx -y @hythe/mcp init`.
 - **Name-agnostic where possible.** Directory and script names avoid the
-  product name; the MCP server key (`engram`) and tool prefixes are the
-  current working names during the server's phased migration.
-- **Agent identity** comes from `ENGRAM_AGENT_ID` (e.g. `claude-desktop`);
+  product name; new installs use the `hythe` MCP server key and
+  `mcp__hythe__*` tool names (printed by `npx -y @hythe/mcp init`).
+- **Agent identity** comes from `HYTHE_AGENT_ID` (legacy `ENGRAM_AGENT_ID` honored; e.g. `claude-desktop`);
   hooks refuse to guess.

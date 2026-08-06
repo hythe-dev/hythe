@@ -25,8 +25,9 @@ chains and message state, and silent data loss. One hub, many clients.
    The gateway listens on the tailnet address; nothing is exposed to the
    public internet. No port forwarding, no TLS certificates to manage.
 3. **Point clients at the hub** — every machine's agent config uses the same
-   stdio bridge with `ENGRAM_GATEWAY_URL` set to the hub's tailnet address
-   and that machine's own `ENGRAM_AGENT_ID` (e.g. `claude-desktop`,
+   stdio bridge with `MCP_HOST` set to the hub's tailnet address (plus
+   `MCP_PORT` and the shared `API_KEY` from `npx -y @hythe/mcp init`), and
+   that machine's own `HYTHE_AGENT_ID` (e.g. `claude-desktop`,
    `claude-laptop`). Distinct ids per machine: the inbox and attribution
    model assume one identity per client lane.
 4. **Backups live with the hub** — scheduled snapshot + off-host copy.
