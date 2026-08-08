@@ -7,14 +7,14 @@
  *
  *   engram-mcp             run the stdio↔HTTP bridge (default; what MCP
  *                          clients invoke — reads API_KEY/MCP_HOST/MCP_PORT)
- *   engram-mcp init        first-run wizard: generate an API key and print
- *                          ready-to-paste config for Claude Code, Codex,
- *                          Cursor and Claude Desktop. --write-env also
- *                          writes ./.env (never overwrites an existing one).
+ *   engram-mcp init        first-run wizard: print secret-free config for
+ *                          Claude Code, Codex, Cursor and Claude Desktop.
+ *                          --write-env generates an API key and writes ./.env
+ *                          (never overwrites an existing one).
  *   engram-mcp --help      this text
  *
- * The wizard only generates and prints; it never contacts a server and
- * never overwrites existing files — closed-safe by default.
+ * The wizard never prints credential bytes, contacts a server, or overwrites
+ * existing files — closed-safe by default.
  */
 
 const crypto = require('crypto');
@@ -30,6 +30,7 @@ const HYTHE_DISTRIBUTION = PKG.hytheDistribution === true;
 const PRODUCT_NAME = HYTHE_DISTRIBUTION ? 'HYTHE' : 'Engram';
 const CLI_NAME = HYTHE_DISTRIBUTION ? 'hythe-mcp' : 'engram-mcp';
 const SERVER_KEY = HYTHE_DISTRIBUTION ? 'hythe' : 'engram';
+const KEY_FILE_ENV = HYTHE_DISTRIBUTION ? 'HYTHE_API_KEY_FILE' : 'ENGRAM_API_KEY_FILE';
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = '6174';
 
@@ -38,9 +39,9 @@ function helpText() {
     `${PKG_NAME} — ${PRODUCT_NAME} stdio bridge + first-run wizard`,
     '',
     'Usage:',
-    `  ${CLI_NAME}             run the stdio bridge (env: API_KEY, MCP_HOST, MCP_PORT)`,
-    `  ${CLI_NAME} init        generate an API key + print MCP client config blocks`,
-    '    --write-env          also write ./.env (refuses if .env already exists)',
+    `  ${CLI_NAME}             run the stdio bridge (env: API_KEY or ${KEY_FILE_ENV})`,
+    `  ${CLI_NAME} init        print secret-free MCP client config blocks`,
+    '    --write-env          generate an API key + write ./.env (mode 600; write-once)',
     '    --host <host>        bridge target host in printed configs (default 127.0.0.1)',
     '    --port <port>        bridge target port in printed configs (default 6174)',
     `  ${CLI_NAME} demo        seed a small two-agent coordination demo (demo-*`,
@@ -81,8 +82,12 @@ function envFileContent(key) {
   ].join('\n');
 }
 
-function configBlocks(key, host, port) {
-  const env = { API_KEY: key, MCP_HOST: host, MCP_PORT: String(port) };
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function configBlocks(keyFilePath, host, port) {
+  const env = { [KEY_FILE_ENV]: keyFilePath, MCP_HOST: host, MCP_PORT: String(port) };
   const clientJson = JSON.stringify(
     { mcpServers: { [SERVER_KEY]: { command: 'npx', args: ['-y', PKG_NAME], env } } },
     null,
@@ -92,7 +97,7 @@ function configBlocks(key, host, port) {
   return [
     '─── Claude Code ─────────────────────────────────────────────────────',
     'Run:',
-    `  claude mcp add ${SERVER_KEY} --env API_KEY=${key} --env MCP_HOST=${host} --env MCP_PORT=${port} -- npx -y ${PKG_NAME}`,
+    `  claude mcp add ${SERVER_KEY} --env ${KEY_FILE_ENV}=${shellQuote(keyFilePath)} --env MCP_HOST=${shellQuote(host)} --env MCP_PORT=${shellQuote(port)} -- npx -y ${PKG_NAME}`,
     '',
     'Or add to .mcp.json / ~/.claude.json:',
     clientJson,
@@ -101,7 +106,7 @@ function configBlocks(key, host, port) {
     `[mcp_servers.${SERVER_KEY}]`,
     'command = "npx"',
     `args = ["-y", "${PKG_NAME}"]`,
-    `env = { API_KEY = "${key}", MCP_HOST = "${host}", MCP_PORT = "${port}" }`,
+    `env = { ${KEY_FILE_ENV} = ${JSON.stringify(keyFilePath)}, MCP_HOST = ${JSON.stringify(host)}, MCP_PORT = ${JSON.stringify(String(port))} }`,
     '',
     '─── Cursor (.cursor/mcp.json) ───────────────────────────────────────',
     clientJson,
@@ -122,38 +127,79 @@ function runInit(argv) {
     process.exit(2);
   }
 
-  const key = generateApiKey();
+  const envPath = path.resolve(process.cwd(), '.env');
   const lines = [];
   lines.push(`${PRODUCT_NAME} first-run wizard`);
   lines.push('');
-  lines.push(`Generated API key (server + bridge share it):`);
-  lines.push(`  API_KEY=${key}`);
-  lines.push('');
 
   if (writeEnv) {
-    const envPath = path.resolve(process.cwd(), '.env');
-    if (fs.existsSync(envPath)) {
+    try {
+      const key = generateApiKey();
+      fs.writeFileSync(envPath, envFileContent(key), { mode: 0o600, flag: 'wx' });
+      lines.push(`Generated an API key and wrote ${envPath} (mode 600).`);
+      lines.push('The credential was not printed; the client blocks reference that file.');
+      lines.push('');
+    } catch (error) {
+      if (error && error.code !== 'EEXIST') throw error;
       process.stderr.write(
         `${CLI_NAME} init: ./.env already exists — refusing to overwrite. ` +
-          'Reuse the API_KEY from that file in the config blocks below, or move it away first.\n'
+          `Rerun without --write-env to print config that references ${envPath}.\n`
       );
       process.exitCode = 1;
-    } else {
-      fs.writeFileSync(envPath, envFileContent(key), { mode: 0o600 });
-      lines.push(`Wrote ${envPath} (mode 600).`);
-      lines.push('');
+      return;
     }
   } else {
-    lines.push('(.env not written — pass --write-env to create one next to docker-compose.)');
+    lines.push('No credential file was written and no API key was generated.');
+    lines.push(`The client blocks reference ${envPath}.`);
+    lines.push(`Create that file with mode 600 and an API_KEY entry, or rerun ${CLI_NAME} init --write-env.`);
     lines.push('');
   }
 
   lines.push('Start the server:  docker compose -f docker/docker-compose.yml up -d');
   lines.push('Then paste the block for your client:');
   lines.push('');
-  lines.push(configBlocks(key, host, port));
+  lines.push(configBlocks(envPath, host, port));
   lines.push('');
   process.stdout.write(lines.join('\n') + '\n');
+}
+
+function parseApiKeyFile(contents) {
+  const envMatch = contents.match(/^(?:export\s+)?API_KEY\s*=\s*(.*)$/m);
+  let key = envMatch ? envMatch[1].trim() : contents.trim();
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    key = key.slice(1, -1);
+  }
+  if (!key || key.includes('\n') || key.includes('\r') || key === 'CHANGE_ME') {
+    throw new Error('credential file does not contain a usable API_KEY');
+  }
+  return key;
+}
+
+function loadApiKeyFromFile() {
+  if (process.env.API_KEY) return;
+  const keyFileVariable = [KEY_FILE_ENV, 'HYTHE_API_KEY_FILE', 'ENGRAM_API_KEY_FILE']
+    .find((name, index, names) => names.indexOf(name) === index && process.env[name]);
+  if (!keyFileVariable) return;
+
+  const keyFilePath = path.resolve(process.env[keyFileVariable]);
+  const stat = fs.statSync(keyFilePath);
+  if (!stat.isFile()) throw new Error(`${keyFileVariable} must point to a regular file`);
+  const permissions = stat.mode & 0o777;
+  if (process.platform !== 'win32' && permissions !== 0o400 && permissions !== 0o600) {
+    throw new Error(`${keyFileVariable} must point to a mode-400 or mode-600 file`);
+  }
+  process.env.API_KEY = parseApiKeyFile(fs.readFileSync(keyFilePath, 'utf8'));
+}
+
+function prepareCredential(mode) {
+  try {
+    loadApiKeyFromFile();
+    return true;
+  } catch (error) {
+    process.stderr.write(`${CLI_NAME} ${mode}: ${error.message}\n`);
+    process.exitCode = 2;
+    return false;
+  }
 }
 
 // --- demo seed -------------------------------------------------------------
@@ -277,13 +323,15 @@ if (argv.includes('--help') || argv.includes('-h') || argv[0] === 'help') {
 } else if (argv[0] === 'init') {
   runInit(argv.slice(1));
 } else if (argv[0] === 'demo') {
-  runDemo().catch((e) => {
+  if (prepareCredential('demo')) runDemo().catch((e) => {
     process.stderr.write(`${CLI_NAME} demo: ${e.message}\n`);
     process.exit(1);
   });
 } else if (argv.length === 0 || argv[0] === 'bridge') {
   // Default mode: hand the process over to the stdio bridge.
-  require(path.join(__dirname, '..', 'mcp-stdio-http-bridge.cjs'));
+  if (prepareCredential('bridge')) {
+    require(path.join(__dirname, '..', 'mcp-stdio-http-bridge.cjs'));
+  }
 } else {
   process.stderr.write(`${CLI_NAME}: unknown command '${argv[0]}'\n\n` + helpText() + '\n');
   process.exit(2);

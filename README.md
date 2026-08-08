@@ -32,14 +32,14 @@ House rule: every claim in these docs must trace to a test or a measurement (see
 | Tree green, full gates | lock-verify (manifest-bound pin matched), clean `npm ci`, script-integrity, typecheck, build, tests (33 files, 408 passed \| 2 skipped \| 6 todo), schema-docs, final-tree smoke, docker build — all PASS, exit 0 | this repository, `internal/run-staged-proof.sh` | 2026-07-16 |
 | Documented env boots the runtime | Final-tree smoke gate: server starts from `.env.example` variables with a generated key, authenticated MCP request succeeds, DB lands at the documented path, bridge round-trips on the same contract, compose ports are loopback-bound, and the untouched placeholder key fails startup | this repository, `internal/final-tree-smoke.mjs` | 2026-07-16 |
 | resume/checkpoint + conflict handling implemented | ENG-4 P0 contract suite (120 executable tests: CAS branching, conflict heads, idempotent replay, budget coverage closedness, scope-bound handles) | `tests/contract-eng4-p0.test.ts` | 2026-07-16 |
-| Install path works | CLI contract suite (9 tests: bin mapping, wizard key-gen + parseable configs, .env write-once, live demo round-trip verified server-side, bridge delegation) | `tests/contract-cli.test.ts` | 2026-07-16 |
+| Install path works | CLI contract suite (bin mapping, secret-free wizard configs, protected credential-file loading, .env write-once, live demo round-trip verified server-side, bridge delegation) | `tests/contract-cli.test.ts` | 2026-07-16 |
 | Closed-safe defaults | Placeholder key fails startup; compose ports loopback-bound; CORS grants no cross-origin access unless `CORS_ORIGINS` is set (tested) | `internal/final-tree-smoke.mjs`, `tests/contract-cli.test.ts` | 2026-07-16 |
 | Discovery is truthful | tools/list advertises the exact frozen schemas the handlers implement; retired legacy shapes are schema-rejected (regressions added after an adversarial review caught drift) | `tests/contract-eng4-p0.test.ts` | 2026-07-16 |
 | Published + installable from the registry | `npm publish` succeeded under 2FA (auth-and-writes, security key); `npm view @tomcat65/engram-mcp version` → `0.1.0`; clean-machine smoke: fresh npx cache, `npx -y @tomcat65/engram-mcp --help` and `… init` ran from the registry install | npm registry, post-publish smoke | 2026-07-16 |
 
 ## v1 surface (short)
 
-- **Install (two-component setup)**: server via `docker compose up`, then the `@hythe/mcp` stdio bridge per MCP client; first-run wizard generates the API key and prints ready-to-paste config for Claude Code / Codex / Cursor / Claude Desktop; optional namespaced (`demo-*`) demo seed on an otherwise empty DB.
+- **Install (two-component setup)**: server via `docker compose up`, then the `@hythe/mcp` stdio bridge per MCP client; first-run wizard stores the API key in a protected `.env` and prints secret-free file-referencing config for Claude Code / Codex / Cursor / Claude Desktop; optional namespaced (`demo-*`) demo seed on an otherwise empty DB.
 - **Knowledge graph**: entities, observations, relations, supersession, current-state resolution, conflict surfacing.
 - **Agent messaging**: direct, capability-based, superseding; tracked delivery lifecycle.
 - **`resume` / `checkpoint`**: budgeted one-call session rehydration with closed coverage accounting, and CAS-protected, branch-preserving structured state capture.

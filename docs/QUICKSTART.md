@@ -11,9 +11,10 @@ From the directory where you'll run the server:
 npx -y @hythe/mcp init --write-env
 ```
 
-This generates a fresh API key, writes `./.env` (mode 600, never
-overwrites an existing file), and prints ready-to-paste MCP config blocks
-for Claude Code, Codex, Cursor, and Claude Desktop. Keep the output handy.
+This generates a fresh API key and writes it only to `./.env` (mode 600,
+never overwriting an existing file). The printed MCP config blocks for Claude
+Code, Codex, Cursor, and Claude Desktop reference that protected file; the key
+itself is never printed or embedded in client config.
 
 ## 2. Start the server (2 min)
 
@@ -32,7 +33,7 @@ Paste the block `init` printed for your client. For Claude Code it's one
 command:
 
 ```bash
-claude mcp add hythe --env API_KEY=<your-key> --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp
+claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp
 ```
 
 Each MCP client spawns the stdio bridge; the bridge talks HTTP to the
@@ -42,7 +43,7 @@ server. Same pattern for Codex (`~/.codex/config.toml`), Cursor
 ## 4. Seed the demo (optional, 2 min)
 
 ```bash
-API_KEY=<your-key> npx -y @hythe/mcp demo
+HYTHE_API_KEY_FILE="$PWD/.env" npx -y @hythe/mcp demo
 ```
 
 This seeds a namespaced (`demo-*`) two-agent story: `demo-alice` writes a
@@ -83,9 +84,10 @@ store are in [CONCEPTS.md](./CONCEPTS.md).
 
 ## Troubleshooting
 
-- **Bridge connects but calls fail** — API key mismatch between `.env` and
-  the client block. The server also logs auth failures.
+- **Bridge connects but calls fail** — confirm `HYTHE_API_KEY_FILE` points to
+  the same mode-400 or mode-600 `.env` used by the server. The server also logs
+  auth failures.
 - **`.env` refuses to boot** — the placeholder `API_KEY=CHANGE_ME` is
-  deliberately rejected; run `npx -y @hythe/mcp init` for a real key.
+  deliberately rejected; run `npx -y @hythe/mcp init --write-env` for a real key.
 - **Port collision** — change `NEURAL_MCP_PORT` in `.env` and `MCP_PORT`
   in each client block together.
