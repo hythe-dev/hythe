@@ -1,6 +1,6 @@
 {
   "name": "@hythe/mcp",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "HYTHE — coordination bus + shared truth for AI agent fleets (MCP server + stdio bridge).",
   "mcpName": "dev.hythe/hythe",
   "repository": {
