@@ -51,6 +51,7 @@ A correction that merely *adds* leaves the wrong fact as a sibling. Always:
 
 ## Identity
 
-Your agentId comes from `HYTHE_AGENT_ID` (e.g. `claude-desktop`; legacy `ENGRAM_AGENT_ID` also honored). Never invent
-one; never write attributed memory under another agent's id except an
-explicitly authorized proxy write (say so in the content).
+Your agentId comes from `HYTHE_AGENT_ID` (e.g. `claude-desktop`; legacy
+`ENGRAM_AGENT_ID` is honored only when it agrees). Never invent one; never
+write attributed memory under another agent's id except an explicitly
+authorized proxy write (say so in the content).

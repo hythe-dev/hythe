@@ -21,6 +21,7 @@
  */
 export const ENGRAM_URI_PATTERN =
   '^engram://[a-z][a-z-]*(?:/(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)+$';
+const AGENT_ID_PATTERN = '^[A-Za-z0-9_.:-]+$';
 
 /** Scope: at least one of project/task is REQUIRED (both allowed). */
 const SCOPE_SCHEMA = {
@@ -150,7 +151,7 @@ export const RESUME_INPUT_SCHEMA = {
   additionalProperties: false,
   required: ['agentId', 'scope', 'budget'],
   properties: {
-    agentId: { type: 'string', minLength: 1, maxLength: 100, description: 'ASSERTED caller identity within the operator/API-key trust boundary (platform max 100). The resolver maps it to the CANONICAL agent family, which owns authorship, acks, and views.' },
+    agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'ASSERTED exact opaque caller identity within the operator/API-key trust boundary (platform max 100). Case and transport-looking suffixes are identity-significant; this principal owns authorship, acks, and views.' },
     scope: SCOPE_SCHEMA,
     budget: { type: 'integer', minimum: 256, description: 'Hard total token budget for the bundle.' },
     sections: {
@@ -365,7 +366,7 @@ export const CHECKPOINT_INPUT_SCHEMA = {
   additionalProperties: false,
   required: ['agentId', 'scope', 'expectedRevision', 'idempotencyKey', 'state'],
   properties: {
-    agentId: { type: 'string', minLength: 1, maxLength: 100, description: 'ASSERTED caller identity (platform max 100); authorship is recorded under the CANONICAL agent family, with the raw asserted id preserved in audit metadata.' },
+    agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'ASSERTED exact opaque caller identity (platform max 100); case and transport-looking suffixes are identity-significant, and the raw asserted id is preserved in audit metadata.' },
     scope: SCOPE_SCHEMA,
     expectedRevision: { type: ['integer', 'null'], description: 'CAS guard; null asserts first write in scope.' },
     idempotencyKey: { type: 'string', minLength: 8 },
@@ -542,7 +543,7 @@ export const BEGIN_SESSION_WRAPPER_INPUT_SCHEMA = {
   additionalProperties: false,
   required: ['agentId', 'scope', 'budget'],
   properties: {
-    agentId: { type: 'string', minLength: 1, maxLength: 100 },
+    agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN },
     scope: RESUME_INPUT_SCHEMA.properties.scope,
     budget: { type: 'integer', minimum: 256 },
     ackHandoffIds: {
@@ -567,7 +568,7 @@ export const BEGIN_SESSION_LEGACY_INPUT_SCHEMA = {
   required: ['agentId', 'projectId'],
   not: { anyOf: [{ required: ['scope'] }, { required: ['budget'] }, { required: ['ackHandoffIds'] }] },
   properties: {
-    agentId: { type: 'string', minLength: 1, maxLength: 100, description: 'Agent opening the session' },
+    agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'Agent opening the session' },
     projectId: { type: 'string', minLength: 1, description: 'Adapted to scope.project by the wrapper' },
     maxTokens: { type: 'integer', minimum: 1, description: 'Adapted to budget (omitted = 4000; explicit values below 256 are clamped to 256)' },
     userId: { type: 'string', description: 'DEPRECATED; honored outside resume until the v1 cut' },

@@ -64,6 +64,10 @@ payload hashes are verified on read.
 Every read and write is bound to a tenant (the security boundary) and most
 are bound to a scope. Handles are scope-bound: knowing a raw row id from
 another project does not make it dereferenceable through your scope.
+Oversized-message handles also encode the exact recipient and dereference
+only when tenant, scope, recipient, and message id all match the stored row.
+That is defense in depth, not per-agent authentication: on a shared-key
+transport the handle remains a bearer capability inside the trust domain.
 
 ## Security model — honest edition
 

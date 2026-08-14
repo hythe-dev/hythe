@@ -5,7 +5,7 @@
  * begin_session is an OPTIONAL wrapper over resume, never an alternate
  * bootstrap primitive (b2e6fc7c #2): it NEVER auto-consumes handoffs —
  * acknowledgement happens ONLY for the ids the caller explicitly lists in
- * ackHandoffIds, owned by the CANONICAL agent family. end_session is the
+ * ackHandoffIds, owned by the exact opaque agent principal. end_session is the
  * corresponding thin wrapper over checkpoint.
  *
  * Ack fail-closed contract (07b3906e #5): the ack write is preceded, in
@@ -25,7 +25,7 @@ export class HandoffAckError extends Error {
   }
 }
 
-/** Explicit, per-agent (canonical family), per-tenant handoff acks. Atomic. */
+/** Explicit, per-exact-opaque-principal, per-tenant handoff acks. Atomic. */
 export function ackHandoffs(
   db: DatabaseType.Database,
   tenantId: string,
@@ -58,7 +58,8 @@ export function performBeginSession(
   params: BeginSessionWrapperParams
 ): ResumeBundle {
   if (params.ackHandoffIds?.length) {
-    const canonical = directory.resolveCanonicalAgent(params.agentId).canonical;
+    const canonical = directory.resolveCanonicalAgent(params.agentId, tenantId).canonical;
+    if (!canonical) throw new Error('Invalid agent identity');
     ackHandoffs(db, tenantId, canonical, params.ackHandoffIds);
   }
   return performResume(db, directory, tenantId, {

@@ -21,7 +21,14 @@ HYTHE is an MCP server that lets multiple AI coding agents — Claude Code, Code
 
 ## Status
 
-**Published.** `@hythe/mcp@0.1.2` is the additive HYTHE distribution, with source at [github.com/hythe-dev/hythe](https://github.com/hythe-dev/hythe). New installs use `npx -y @hythe/mcp`. The predecessor `@tomcat65/engram-mcp` and `io.github.tomcat65/engram` remain available as compatibility history and point forward to HYTHE; they are never unpublished.
+**Release candidate.** `@hythe/mcp@0.1.3` is the currently published HYTHE
+distribution. This tree is the `0.1.4` release candidate: it requires an
+explicit per-client `HYTHE_AGENT_ID`, binds bridge actions to that exact lane,
+isolates exact mailboxes, and removes private message bodies from shared graph,
+search, export, and request-log paths. New installs use `npx -y @hythe/mcp`;
+pin `@0.1.3` until `0.1.4` is published. The predecessor
+`@tomcat65/engram-mcp` and `io.github.tomcat65/engram` remain available as
+compatibility history and are never unpublished.
 
 House rule: every claim in these docs must trace to a test or a measurement (see the evidence ledger below). Claims that don't are bugs.
 
@@ -29,13 +36,12 @@ House rule: every claim in these docs must trace to a test or a measurement (see
 
 | Claim | Evidence | Source | Date |
 |---|---|---|---|
-| Tree green, full gates | lock-verify (manifest-bound pin matched), clean `npm ci`, script-integrity, typecheck, build, tests (33 files, 408 passed \| 2 skipped \| 6 todo), schema-docs, final-tree smoke, docker build — all PASS, exit 0 | this repository, `internal/run-staged-proof.sh` | 2026-07-16 |
-| Documented env boots the runtime | Final-tree smoke gate: server starts from `.env.example` variables with a generated key, authenticated MCP request succeeds, DB lands at the documented path, bridge round-trips on the same contract, compose ports are loopback-bound, and the untouched placeholder key fails startup | this repository, `internal/final-tree-smoke.mjs` | 2026-07-16 |
-| resume/checkpoint + conflict handling implemented | ENG-4 P0 contract suite (120 executable tests: CAS branching, conflict heads, idempotent replay, budget coverage closedness, scope-bound handles) | `tests/contract-eng4-p0.test.ts` | 2026-07-16 |
-| Install path works | CLI contract suite (bin mapping, secret-free wizard configs, protected credential-file loading, .env write-once, live demo round-trip verified server-side, bridge delegation) | `tests/contract-cli.test.ts` | 2026-07-16 |
-| Closed-safe defaults | Placeholder key fails startup; compose ports loopback-bound; CORS grants no cross-origin access unless `CORS_ORIGINS` is set (tested) | `internal/final-tree-smoke.mjs`, `tests/contract-cli.test.ts` | 2026-07-16 |
-| Discovery is truthful | tools/list advertises the exact frozen schemas the handlers implement; retired legacy shapes are schema-rejected (regressions added after an adversarial review caught drift) | `tests/contract-eng4-p0.test.ts` | 2026-07-16 |
-| Published + installable from the registry | `npm publish` succeeded under 2FA (auth-and-writes, security key); `npm view @tomcat65/engram-mcp version` → `0.1.0`; clean-machine smoke: fresh npx cache, `npx -y @tomcat65/engram-mcp --help` and `… init` ran from the registry install | npm registry, post-publish smoke | 2026-07-16 |
+| Tree green, full gates | Clean `npm ci`; typecheck; build; schema parity; 41 Vitest files (458 passed, 2 skipped, 6 todo); 40 migration assertions; 31 agent-kit checks; 24 release checks; release-tree verifier; and diff check all passed. Production dependency audit: 0 findings. | `.github/workflows/ci.yml`, `tests/`, `src/migrations/007-private-message-residue.node-test.mjs`, `clients/agent-kit/tests/test-setup.sh`, `scripts/verify-hythe-release-tree.test.mjs` | 2026-08-13 |
+| Compaction identity fails closed | Startup and post-compaction hooks reject missing, conflicting, or invalid identity; the bridge binds acting tools and message-resource recipients to the configured exact lane before any HTTP request. | `clients/agent-kit/tests/test-setup.sh`, `tests/contract-bridge-identity.test.ts` | 2026-08-13 |
+| Exact mailboxes stay isolated | Houston/Hythe, case variants, display metadata, legacy identity history, cross-tenant poisoning, suffix handles, lifecycle changes, supersession, HTTP, and ENG-4 authorship have negative isolation coverage. | `tests/contract-message-identity-isolation.test.ts`, `tests/contract-eng4-p0.test.ts` | 2026-08-13 |
+| Private message bodies stay out of shared graph surfaces | Historical, oversized, malformed, alias-linked, relation-linked, imported, exported, searched, graphed, logged, and restored payload paths are covered; hidden children do not leak through counts. | `tests/contract-message-payload-isolation.test.ts`, `tests/contract-data-payload-isolation.test.ts`, `tests/contract-log-confidentiality.test.ts` | 2026-08-13 |
+| Cleanup is offline and fail-closed | Migration 007 is dry-run by default, binds execution to a reviewed fingerprint, creates a verified backup, refuses collisions/orphans/malformed rows, handles configured vector tables, and rolls back atomically. The packed command executes `dist/migrations/007-private-message-residue.mjs`. | `src/migrations/007-private-message-residue.mjs`, `src/migrations/007-private-message-residue.node-test.mjs`, `docs/PRIVATE-MESSAGE-RESIDUE-MIGRATION.md` | 2026-08-13 |
+| Install and discovery surfaces agree | CLI config generation requires `--agent-id`; registry metadata requires `HYTHE_AGENT_ID`; tools and resource templates served through HTTP match the published stdio bridge path. | `tests/contract-cli.test.ts`, `tests/contract-mcp-resources-http.test.ts`, `scripts/verify-hythe-release-tree.test.mjs` | 2026-08-13 |
 
 ## v1 surface (short)
 
@@ -44,6 +50,23 @@ House rule: every claim in these docs must trace to a test or a measurement (see
 - **Agent messaging**: direct, capability-based, superseding; tracked delivery lifecycle.
 - **`resume` / `checkpoint`**: budgeted one-call session rehydration with closed coverage accounting, and CAS-protected, branch-preserving structured state capture.
 - **ACP**: the coordination protocol as a versioned spec + real worked example.
+
+## Embedding runtime contract
+
+The published npm package does not install a transformer engine by default.
+Without one, HYTHE still provides deterministic 384-dimension token-hash
+vectors plus lexical ranking; it does not download a model or create a model
+cache. `@xenova/transformers@2.17.2` is an optional peer for operators who
+deliberately provide it from their own audited dependency root.
+
+The Docker image keeps semantic behavior stable through a separate, locked
+`/opt/hythe-transformers` runtime. Its startup preflight loads the configured
+`Xenova/all-MiniLM-L6-v2` q8 model and requires one finite 384-dimension
+embedding before the server starts. When
+`SQLITE_VEC_ALLOW_REMOTE_MODELS=false`, the configured
+`SQLITE_VEC_CACHE_DIR` must already contain that model. Do not switch between
+transformer and hash embeddings on a populated vector index: retain the same
+provider/model/dimensions or rebuild the vector index first.
 
 ## License
 

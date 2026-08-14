@@ -282,7 +282,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   },
   get_ai_messages: {
     name: 'get_ai_messages',
-    description: 'Retrieve messages for an AI agent with filtering and real offset pagination. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale. SHARED INBOX NOTE: When monitoring another agent\'s inbox (e.g. claude-desktop checking codex), use unreadOnly: false — the target agent marks its own messages read during execution, so unreadOnly: true returns 0.',
+    description: 'Retrieve messages for the calling agent\'s exact inbox with filtering and real offset pagination. Identity-bound client bridges require agentId to match the configured lane identity. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -296,7 +296,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
           description: 'Filter by message type'
         },
         since: { type: 'string', description: 'ADVANCED ONLY — ISO timestamp for time-range queries. Do NOT use for routine inbox checks; use unreadOnly instead. A stale timestamp will cause missed messages.' },
-        unreadOnly: { type: 'boolean', description: 'Only return unread messages (default: true). This is the recommended way to check your inbox. Set to false when monitoring a shared inbox — other agents mark their own messages read.', default: true },
+        unreadOnly: { type: 'boolean', description: 'Only return unread messages (default: true). This is the recommended way to check your own exact inbox.', default: true },
         compact: { type: 'boolean', description: 'Return summaries only without full content (use get_message_detail for full content)', default: true },
         markAsRead: { type: 'boolean', description: 'Mark returned messages as read after retrieval', default: false },
         includeArchived: { type: 'boolean', description: 'Include archived messages in results (excluded by default)', default: false },
@@ -353,7 +353,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   },
   set_agent_identity: {
     name: 'set_agent_identity',
-    description: 'Update an agent\'s public identity and optionally re-register the MCP bridge automatically',
+    description: 'Temporarily disabled during migration to tenant-scoped stable principals. Calls fail without changing identity history; register an exact handle with register_agent instead.',
     inputSchema: {
       type: 'object',
       properties: {

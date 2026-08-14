@@ -1,15 +1,5 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
 import express from 'express';
-import { createHash } from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
+import { createHash, randomUUID as uuidv4 } from 'node:crypto';
 import cors from 'cors';
 import helmet from 'helmet';
 import { MemoryManager } from './unified-server/memory/index.js';
@@ -39,7 +29,6 @@ import { NotificationPort, SlackNotificationAdapter } from './notifications/inde
 // Unified Neural AI Collaboration MCP Server
 // Exposes ALL system capabilities through a single MCP interface
 export class NeuralMCPServer {
-  private server: Server;
   private memoryManager: MemoryManager;
   private app!: express.Application;
   private agentId: string;
@@ -55,19 +44,6 @@ export class NeuralMCPServer {
     this.agentId = 'unified-neural-mcp-server';
     this.sessionId = 'neural-unified-session';
     
-    this.server = new Server(
-      {
-        name: 'neural-ai-collaboration',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-          resources: {},
-        },
-      }
-    );
-
     this.notificationPort = new SlackNotificationAdapter();
 
     // Initialize tenant resolver with DB reference for JWT auth
@@ -77,7 +53,6 @@ export class NeuralMCPServer {
     );
     setTenantResolver(resolver);
 
-    this.setupToolHandlers();
     this.setupExpressServer();
     this.registerWithUnifiedServer();
     this.initializeMessageHub();
@@ -376,7 +351,9 @@ export class NeuralMCPServer {
       res.setHeader('Cache-Control', 'no-cache');
 
       try {
-        console.log('🔗 Unified Neural MCP Request received:', req.body);
+        // Request arguments can contain private messages, search terms, credentials,
+        // and checkpoint state. Never serialize the MCP body into application logs.
+        console.log('🔗 Unified Neural MCP request received');
         
         const { jsonrpc = '2.0', id, method, params = {} } = req.body || {};
         const defaultProtocolVersion = '2024-11-05';
@@ -405,6 +382,7 @@ export class NeuralMCPServer {
           });
         }
 
+        const mcpContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
         switch (method) {
           case 'initialize':
             result = {
@@ -426,10 +404,23 @@ export class NeuralMCPServer {
             break;
             
           case 'tools/call': {
-            const mcpContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
             result = await this._handleToolCall(params.name, params.arguments, mcpContext);
             break;
           }
+
+          case 'resources/list':
+            result = { resources: [] };
+            break;
+
+          case 'resources/templates/list':
+            result = {
+              resourceTemplates: ENG4_RESOURCE_TEMPLATES.map((template) => ({ ...template })),
+            };
+            break;
+
+          case 'resources/read':
+            result = this._handleResourceRead(String(params.uri ?? ''), mcpContext);
+            break;
             
           default:
             return res.json({
@@ -504,32 +495,69 @@ export class NeuralMCPServer {
           parsedData = { from: 'unknown', to: 'unknown', message: 'Unknown body type', content: 'Unknown body type' };
         }
         
-        const { from, to, message, type, content } = parsedData;
+        const { from, to, message, messageType: requestedMessageType, type, priority, content } = parsedData;
         const actualMessage = message || content || parsedData.payload?.message || parsedData.payload?.content;
+        const reqContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
+
+        if (!to || typeof to !== 'string' || !to.trim()) {
+          res.status(400).json({ error: 'Message recipient is required' });
+          return;
+        }
+        if (!actualMessage || typeof actualMessage !== 'string') {
+          res.status(400).json({ error: 'Message content is required' });
+          return;
+        }
+        const allowedMessageTypes = new Set([
+          'direct', 'info', 'task', 'query', 'response', 'collaboration',
+        ]);
+        const messageType = requestedMessageType ?? type ?? 'direct';
+        if (typeof messageType !== 'string' || !allowedMessageTypes.has(messageType)) {
+          res.status(400).json({ error: 'Invalid message type' });
+          return;
+        }
+        const messagePriority = priority ?? 'normal';
+        if (!['low', 'normal', 'high', 'urgent'].includes(messagePriority)) {
+          res.status(400).json({ error: 'Invalid message priority' });
+          return;
+        }
 
         if (!from) {
           console.warn(`⚠️ HTTP /ai-message called without 'from' — attributing to 'system'. Callers should always include 'from'.`);
         }
-        console.log(`💬 AI Message: ${from || 'system'} → ${to}: ${actualMessage}`);
+        const requestedSender = from || 'system';
+        const senderAgentId = this.memoryManager.resolveMailboxAddress(requestedSender, reqContext.tenantId);
+        const targetAgentId = this.memoryManager.resolveMailboxAddress(to, reqContext.tenantId);
+        if (!senderAgentId || !targetAgentId) {
+          res.status(400).json({ error: 'Message sender and recipient must be valid agent identifiers' });
+          return;
+        }
+        console.log(
+          `💬 AI Message: ${senderAgentId} → ${targetAgentId} `
+          + `[${messageType}, ${actualMessage.length} chars]`
+        );
 
-        const reqContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
         const messageId = await this.memoryManager.storeMessage(
-          from || 'system',
-          to,
+          senderAgentId,
+          targetAgentId,
           actualMessage,
-          type || 'direct',
-          'normal',
-          undefined,
+          messageType,
+          messagePriority,
+          {
+            original: {
+              requestedFrom: requestedSender,
+              requestedTo: to,
+            },
+          },
           reqContext.tenantId,
           reqContext
         );
 
         await this.publishEventToUnified('ai.message', {
-          from,
-          to,
-          message: actualMessage,
-          type: type || 'direct',
-          messageId: messageId
+          from: senderAgentId,
+          to: targetAgentId,
+          type: messageType,
+          messageId: messageId,
+          contentLength: actualMessage.length,
         });
 
         res.json({
@@ -555,6 +583,14 @@ export class NeuralMCPServer {
         };
 
         const msgReqContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
+        if (this.memoryManager.resolveMailboxAddress(agentId, msgReqContext.tenantId) !== agentId) {
+          res.status(400).json({ error: 'Agent identity is invalid' });
+          return;
+        }
+        if (from && this.memoryManager.resolveMailboxAddress(from, msgReqContext.tenantId) !== from) {
+          res.status(400).json({ error: 'Sender filter identity is invalid' });
+          return;
+        }
         const rawMessages = this.memoryManager.getMessages(agentId, {
           messageType,
           since,
@@ -1518,29 +1554,6 @@ export class NeuralMCPServer {
     }
   }
 
-  private setupToolHandlers() {
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      return await this._handleToolsList();
-    });
-
-    // Handle tool calls (MCP SDK transport — no HTTP request, use default context)
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args = {} } = request.params;
-      return await this._handleToolCall(name, args, DEFAULT_REQUEST_CONTEXT);
-    });
-
-    // ENG-4: history is a RESOURCE, never a tool. Discovery via templates;
-    // reads go through the verified (tenant+scope-bound) fetch path.
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
-    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
-      resourceTemplates: ENG4_RESOURCE_TEMPLATES.map((t) => ({ ...t })),
-    }));
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      return this._handleResourceRead(String(request.params.uri), DEFAULT_REQUEST_CONTEXT);
-    });
-  }
-
   private _handleResourceRead(uri: string, context: RequestContext = DEFAULT_REQUEST_CONTEXT) {
     return readEng4Resource(this.memoryManager.getDb(), context.tenantId, uri);
   }
@@ -1653,6 +1666,17 @@ export class NeuralMCPServer {
 
           // NE-S6c fix: Sanitize entity observations
           for (const entity of entities) {
+            const entityReferences = [
+              entity.name,
+              ...(Array.isArray(entity.aliases) ? entity.aliases : []),
+            ];
+            if (
+              String(entity.entityType || entity.type || '').trim().toLowerCase() === 'message_detail'
+              || entityReferences.some((reference) =>
+                this.memoryManager.isConfidentialEntityReference(reference, tenantId))
+            ) {
+              throw new Error('message_detail is reserved for private mailbox compatibility');
+            }
             if (Array.isArray(entity.observations)) {
               for (const obs of entity.observations) {
                 const check = MemoryManager.sanitizeContent(obs);
@@ -2023,7 +2047,13 @@ export class NeuralMCPServer {
               }
             }
 
-            let filteredResults = Array.from(dedupMap.values());
+            let filteredResults = Array.from(dedupMap.values()).filter((result: any) =>
+              !this.memoryManager.isConfidentialGraphRow(
+                result.storageMemoryType || getStorageMemoryType(result),
+                getContentPayload(result),
+                tenantId,
+              )
+            );
             if (memoryType) {
               const filterLower = String(memoryType).toLowerCase();
               filteredResults = filteredResults.filter((r: any) =>
@@ -2711,6 +2741,9 @@ export class NeuralMCPServer {
 
           // NE-S6c: Sanitize observation contents
           for (const obs of observations) {
+            if (this.memoryManager.isConfidentialEntityReference(obs.entityName, tenantId)) {
+              throw new Error('message_detail is reserved for private mailbox compatibility');
+            }
             if (Array.isArray(obs.contents)) {
               for (const c of obs.contents) {
                 const check = MemoryManager.sanitizeContent(c);
@@ -2978,6 +3011,15 @@ export class NeuralMCPServer {
         case 'create_relations': {
           const { relations } = args;
 
+          for (const relation of relations) {
+            if (
+              this.memoryManager.isConfidentialEntityReference(relation.from, tenantId)
+              || this.memoryManager.isConfidentialEntityReference(relation.to, tenantId)
+            ) {
+              throw new Error('message_detail is reserved for private mailbox compatibility');
+            }
+          }
+
           const createdRelations = await Promise.all(relations.map(async (relation: any) => {
             const relationData = {
               from: relation.from,
@@ -3030,6 +3072,15 @@ export class NeuralMCPServer {
           const offset = Number.isFinite(Number(args.offset)) && Number(args.offset) > 0 ? Math.floor(Number(args.offset)) : 0;
           const since = typeof args.since === 'string' && args.since ? args.since : undefined;
           const includeObservations = args.includeObservations === true;
+          const publicEntityPredicate = ` AND NOT (
+            json_valid(content)
+            AND (
+              LOWER(TRIM(COALESCE(json_extract(content, '$.type'), ''))) = 'message_detail'
+              OR LOWER(TRIM(COALESCE(json_extract(content, '$.entityType'), ''))) = 'message_detail'
+              OR LOWER(TRIM(COALESCE(json_extract(content, '$.memoryType'), ''))) = 'message_detail'
+              OR LOWER(TRIM(COALESCE(json_extract(content, '$.memory_type'), ''))) = 'message_detail'
+            )
+          )`;
 
           const toEntry = (row: any) => {
             let content: any = {};
@@ -3048,37 +3099,47 @@ export class NeuralMCPServer {
             };
           };
 
-          const countFor = (memType: string): number => {
-            try {
-              let q = `SELECT COUNT(*) as cnt FROM shared_memory WHERE tenant_id = ? AND memory_type = ?`;
-              const p: any[] = [tenantId, memType];
-              if (since) { q += ' AND created_at >= ?'; p.push(since); }
-              return (db.prepare(q).get(...p) as any)?.cnt || 0;
-            } catch {
-              return 0;
-            }
-          };
-
-          const pageFor = (memType: string): any[] => {
+          const publicPageFor = (memType: string): { total: number; rows: any[] } => {
             try {
               let q = `SELECT id, memory_type, content, created_by, created_at FROM shared_memory WHERE tenant_id = ? AND memory_type = ?`;
               const p: any[] = [tenantId, memType];
+              if (memType === 'entity') q += publicEntityPredicate;
               if (since) { q += ' AND created_at >= ?'; p.push(since); }
-              q += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-              p.push(limit, offset);
-              return (db.prepare(q).all(...p) as any[]).map(toEntry);
+              q += ' ORDER BY created_at DESC';
+
+              // Confidential rows must be removed before applying the public
+              // offset and before calculating totals. SQL-level discriminator
+              // filters cannot recognize corrupt project-typed msg-detail-*
+              // entities, aliases, or materialized child references. Iterate
+              // rather than loading the whole graph, retaining only one public
+              // response page while calculating honest public counts.
+              const rows: any[] = [];
+              let total = 0;
+              const iterator = db.prepare(q).iterate(...p) as IterableIterator<any>;
+              for (const rawRow of iterator) {
+                if (this.memoryManager.isConfidentialGraphRow(memType, rawRow.content, tenantId)) {
+                  continue;
+                }
+                const entry = toEntry(rawRow);
+                if (total >= offset && rows.length < limit) rows.push(entry);
+                total++;
+              }
+              return { total, rows };
             } catch {
-              return [];
+              return { total: 0, rows: [] };
             }
           };
 
-          const entityTotal = countFor('entity');
-          const relationTotal = countFor('relation');
-          const observationTotal = countFor('observation');
+          const entityPage = publicPageFor('entity');
+          const relationPage = publicPageFor('relation');
+          const observationPage = publicPageFor('observation');
+          const entityTotal = entityPage.total;
+          const relationTotal = relationPage.total;
+          const observationTotal = observationPage.total;
 
-          const entitiesOnly = pageFor('entity');
-          const relationsOnly = pageFor('relation');
-          const observationsOnly = includeObservations ? pageFor('observation') : [];
+          const entitiesOnly = entityPage.rows;
+          const relationsOnly = relationPage.rows;
+          const observationsOnly = includeObservations ? observationPage.rows : [];
 
           const pageEnd = offset + limit;
           const graphData: any = {
@@ -3136,21 +3197,32 @@ export class NeuralMCPServer {
 
           const getEntityRow = (name: string): any => {
             try {
-              return db.prepare(
+              const row = db.prepare(
                 `SELECT id, content, created_at FROM shared_memory
-                 WHERE tenant_id = ? AND memory_type = 'entity' AND json_extract(content, '$.name') = ?
+                 WHERE tenant_id = ? AND memory_type = 'entity' AND json_valid(content)
+                   AND json_extract(content, '$.name') = ?
                  LIMIT 1`
               ).get(tenantId, name);
+              if (!row) return undefined;
+              let content: any;
+              try { content = JSON.parse((row as any).content || '{}'); } catch { return undefined; }
+              return this.memoryManager.isConfidentialMessageSearchItem('entity', content)
+                ? undefined
+                : row;
             } catch {
               return undefined;
             }
           };
           const obsCountFor = (name: string): number => {
             try {
-              return (db.prepare(
-                `SELECT COUNT(*) as cnt FROM shared_memory
-                 WHERE tenant_id = ? AND memory_type = 'observation' AND json_extract(content, '$.entityName') = ?`
-              ).get(tenantId, name) as any)?.cnt || 0;
+              const rows = db.prepare(
+                `SELECT content FROM shared_memory
+                 WHERE tenant_id = ? AND memory_type = 'observation' AND json_valid(content)
+                   AND json_extract(content, '$.entityName') = ?`
+              ).all(tenantId, name) as Array<{ content: string }>;
+              return rows.filter((row) =>
+                !this.memoryManager.isConfidentialGraphRow('observation', row.content, tenantId)
+              ).length;
             } catch {
               return 0;
             }
@@ -3187,12 +3259,15 @@ export class NeuralMCPServer {
             for (const nm of frontier) {
               let rels: any[] = [];
               try {
-                rels = db.prepare(
+                rels = (db.prepare(
                   `SELECT content FROM shared_memory
                    WHERE tenant_id = ? AND memory_type = 'relation'
+                   AND json_valid(content)
                    AND (json_extract(content, '$.from') = ? OR json_extract(content, '$.to') = ?)
                    LIMIT ?`
-                ).all(tenantId, nm, nm, cap) as any[];
+                ).all(tenantId, nm, nm, cap) as any[]).filter((row: any) =>
+                  !this.memoryManager.isConfidentialGraphRow('relation', row.content, tenantId)
+                );
               } catch {
                 rels = [];
               }
@@ -3237,14 +3312,17 @@ export class NeuralMCPServer {
             try {
               const allObs = db.prepare(
                 `SELECT id, content, created_at FROM shared_memory
-                 WHERE tenant_id = ? AND memory_type = 'observation' AND json_extract(content, '$.entityName') = ?
+                 WHERE tenant_id = ? AND memory_type = 'observation' AND json_valid(content)
+                   AND json_extract(content, '$.entityName') = ?
                  ORDER BY created_at DESC LIMIT ?`
               ).all(tenantId, centerName, cap) as any[];
               observations = allObs.map((row: any) => {
                 let content: any = {};
                 try { content = JSON.parse(row.content || '{}'); } catch { content = { raw: row.content, parseError: true }; }
                 return { id: row.id, content, timestamp: new Date(row.created_at) };
-              });
+              }).filter((entry: any) =>
+                !this.memoryManager.isConfidentialGraphRow('observation', entry.content, tenantId)
+              );
             } catch {
               observations = [];
             }
@@ -3290,28 +3368,39 @@ export class NeuralMCPServer {
           const cap = Math.max(1, Math.min(Number.isFinite(Number(args.limit)) ? Math.floor(Number(args.limit)) : 50, 200));
           const includeOutgoing = args.includeOutgoing === true;
 
-          const entityRow = db.prepare(
+          let entityRow = db.prepare(
             `SELECT id, content, created_at FROM shared_memory
-             WHERE tenant_id = ? AND memory_type = 'entity' AND LOWER(json_extract(content, '$.name')) = LOWER(?)
+             WHERE tenant_id = ? AND memory_type = 'entity' AND json_valid(content)
+               AND LOWER(json_extract(content, '$.name')) = LOWER(?)
              LIMIT 1`
           ).get(tenantId, entityName) as any | undefined;
 
           let entityContent: any = {};
           if (entityRow) {
             try { entityContent = JSON.parse(entityRow.content || '{}'); } catch { entityContent = {}; }
+            if (this.memoryManager.isConfidentialMessageSearchItem('entity', entityContent)) {
+              entityRow = undefined;
+              entityContent = {};
+            }
           }
           const canonicalName = entityContent.name || entityName;
 
-          const incomingRows = db.prepare(
+          const incomingRows = (db.prepare(
             `SELECT id, content, created_by, created_at FROM shared_memory
-             WHERE tenant_id = ? AND memory_type = 'relation' AND LOWER(json_extract(content, '$.to')) = LOWER(?)
+             WHERE tenant_id = ? AND memory_type = 'relation' AND json_valid(content)
+               AND LOWER(json_extract(content, '$.to')) = LOWER(?)
              ORDER BY created_at DESC LIMIT ?`
-          ).all(tenantId, canonicalName, cap) as any[];
-          const outgoingRows = includeOutgoing ? db.prepare(
+          ).all(tenantId, canonicalName, cap) as any[]).filter((row: any) =>
+            !this.memoryManager.isConfidentialGraphRow('relation', row.content, tenantId)
+          );
+          const outgoingRows = includeOutgoing ? (db.prepare(
             `SELECT id, content, created_by, created_at FROM shared_memory
-             WHERE tenant_id = ? AND memory_type = 'relation' AND LOWER(json_extract(content, '$.from')) = LOWER(?)
+             WHERE tenant_id = ? AND memory_type = 'relation' AND json_valid(content)
+               AND LOWER(json_extract(content, '$.from')) = LOWER(?)
              ORDER BY created_at DESC LIMIT ?`
-          ).all(tenantId, canonicalName, cap) as any[] : [];
+          ).all(tenantId, canonicalName, cap) as any[]).filter((row: any) =>
+            !this.memoryManager.isConfidentialGraphRow('relation', row.content, tenantId)
+          ) : [];
 
           const parseRelation = (row: any) => {
             let content: any = {};
@@ -3360,7 +3449,10 @@ export class NeuralMCPServer {
           if (!args.from) {
             console.warn(`⚠️ send_ai_message called without 'from' — attributing to server. Callers should always pass 'from'.`);
           }
-          const senderAgentId = this.memoryManager.resolvePreferredAgentId(requestedSenderAgentId);
+          const senderAgentId = this.memoryManager.resolveMailboxAddress(requestedSenderAgentId, tenantId);
+          if (!senderAgentId) {
+            throw new Error('Sender identity is invalid');
+          }
           const content = args.content ?? args.message;
           const messageType = args.messageType ?? 'info';
           const priority = args.priority ?? 'normal';
@@ -3368,8 +3460,14 @@ export class NeuralMCPServer {
           const excludeSelf = args.excludeSelf !== false; // default true
           const capSelector: string[] | undefined = args.toCapabilities || args.capabilities;
 
-          if (!content) {
+          if (typeof content !== 'string' || !content) {
             throw new Error('Missing required field: `content` (or `message` alias)');
+          }
+          if (!['info', 'task', 'query', 'response', 'collaboration'].includes(messageType)) {
+            throw new Error('Invalid message type');
+          }
+          if (!['low', 'normal', 'high', 'urgent'].includes(priority)) {
+            throw new Error('Invalid message priority');
           }
 
           // NE-S6c: Sanitize message content
@@ -3383,33 +3481,54 @@ export class NeuralMCPServer {
           // Resolve recipients
           let recipients: string[] = [];
           if (!broadcast && explicitTarget) {
-            recipients = [this.memoryManager.resolvePreferredAgentId(explicitTarget)];
+            const resolvedTarget = this.memoryManager.resolveMailboxAddress(explicitTarget, tenantId);
+            if (!resolvedTarget) {
+              throw new Error('Recipient identity is invalid');
+            }
+            recipients = [resolvedTarget];
           } else if (broadcast) {
-            const regs = await this.memoryManager.search('agent_registration', { shared: true });
-            recipients = regs
-              .map((r: any) => r?.content?.agentId)
+            const rows = this.memoryManager.getDb().prepare(
+              `SELECT agent_id, metadata_json
+               FROM agent_registrations
+               WHERE tenant_id = ? AND status = 'active'`
+            ).all(tenantId) as any[];
+            recipients = rows
+              .filter((row: any) => effectiveRegistrationStatus(
+                'active',
+                parseRegistrationJson(row.metadata_json, {})
+              ) === 'active')
+              .map((row: any) => row.agent_id)
               .filter((id: any) => typeof id === 'string' && id.length > 0)
-              .map((id: string) => this.memoryManager.resolvePreferredAgentId(id));
+              .map((id: string) => this.memoryManager.resolveMailboxAddress(id, tenantId));
             if (excludeSelf) recipients = recipients.filter(id => id !== senderAgentId);
           } else if (capSelector && capSelector.length > 0) {
             const want = capSelector.map((c: string) => String(c).toLowerCase());
-            const regs = await this.memoryManager.search('agent_registration', { shared: true });
-            recipients = regs
-              .filter((r: any) => Array.isArray(r?.content?.capabilities))
-              .filter((r: any) => {
-                const caps = r.content.capabilities.map((c: any) => String(c).toLowerCase());
+            const rows = this.memoryManager.getDb().prepare(
+              `SELECT agent_id, capabilities_json, metadata_json
+               FROM agent_registrations
+               WHERE tenant_id = ? AND status = 'active'`
+            ).all(tenantId) as any[];
+            recipients = rows
+              .filter((row: any) => effectiveRegistrationStatus(
+                'active',
+                parseRegistrationJson(row.metadata_json, {})
+              ) === 'active')
+              .filter((row: any) => {
+                const parsedCapabilities = parseRegistrationJson(row.capabilities_json, []);
+                const caps = (Array.isArray(parsedCapabilities) ? parsedCapabilities : [])
+                  .map((c: any) => String(c).toLowerCase());
                 return want.every(w => caps.includes(w));
               })
-              .map((r: any) => r.content.agentId)
+              .map((row: any) => row.agent_id)
               .filter((id: any) => typeof id === 'string' && id.length > 0)
-              .map((id: string) => this.memoryManager.resolvePreferredAgentId(id));
+              .map((id: string) => this.memoryManager.resolveMailboxAddress(id, tenantId));
             if (excludeSelf) recipients = recipients.filter(id => id !== senderAgentId);
           } else {
             throw new Error('Missing recipient: provide `to`, `broadcast: true`, or `toCapabilities`.');
           }
 
           // De-duplicate recipients
-          recipients = Array.from(new Set(recipients));
+          recipients = Array.from(new Set(recipients.filter(Boolean)));
 
           const results: { to: string; messageId: string; deliveryStatus: 'queued' | 'delivered'; clientsNotified: number }[] = [];
 
@@ -3487,6 +3606,12 @@ export class NeuralMCPServer {
 
         case 'get_ai_messages': {
           const { agentId: targetAgentId, messageType, since, markAsRead, includeArchived, includeSuperseded, from } = args;
+          if (!targetAgentId || this.memoryManager.resolveMailboxAddress(targetAgentId, tenantId) !== targetAgentId) {
+            throw new Error('Agent identity is invalid');
+          }
+          if (from && this.memoryManager.resolveMailboxAddress(from, tenantId) !== from) {
+            throw new Error('Sender filter identity is invalid');
+          }
           const compact = args.compact !== false; // default true
           const unreadOnly = args.unreadOnly !== false; // default true
           // Server-side hard cap: 20 messages max, floor of 1
@@ -3594,9 +3719,12 @@ export class NeuralMCPServer {
           if (!detailAgentId) {
             throw new Error('Missing required field: agentId (recipient identity required)');
           }
+          if (this.memoryManager.resolveMailboxAddress(detailAgentId, tenantId) !== detailAgentId) {
+            throw new Error('Agent identity is invalid');
+          }
 
           // Tenant + agent scoping to prevent cross-boundary reads
-          const msg = await this.memoryManager.getMessageById(detailMsgId, detailMarkRead, tenantId, detailAgentId);
+          const msg = await this.memoryManager.getMessageById(detailMsgId, detailAgentId, detailMarkRead, tenantId);
           if (!msg) {
             return {
               content: [{ type: 'text', text: JSON.stringify({ error: 'Message not found', messageId: detailMsgId }) }],
@@ -3681,6 +3809,9 @@ export class NeuralMCPServer {
         // === MESSAGE LIFECYCLE (Task 1200) ===
         case 'mark_messages_read': {
           const { agentId: markAgentId, messageIds } = args;
+          if (!markAgentId || this.memoryManager.resolveMailboxAddress(markAgentId, tenantId) !== markAgentId) {
+            throw new Error('Agent identity is invalid');
+          }
           const markedCount = this.memoryManager.markMessagesRead(markAgentId, messageIds, tenantId);
           return {
             content: [{
@@ -3697,6 +3828,9 @@ export class NeuralMCPServer {
 
         case 'archive_messages': {
           const { agentId: archiveAgentId, olderThanDays, messageIds: archiveIds, markAsRead } = args;
+          if (!archiveAgentId || this.memoryManager.resolveMailboxAddress(archiveAgentId, tenantId) !== archiveAgentId) {
+            throw new Error('Agent identity is invalid');
+          }
           const byId = Array.isArray(archiveIds) && archiveIds.length > 0;
           const archiveResult = this.memoryManager.archiveMessagesDetailed(
             archiveAgentId,
@@ -3725,6 +3859,9 @@ export class NeuralMCPServer {
 
         case 'register_agent': {
           const { agentId: newAgentId, name, capabilities, endpoint } = args;
+          if (!newAgentId || this.memoryManager.resolveMailboxAddress(newAgentId, tenantId) !== newAgentId) {
+            throw new Error('agentId must be a valid exact agent identifier');
+          }
           const metadata = args.metadata && typeof args.metadata === 'object' ? args.metadata : {};
           const capabilityList = Array.isArray(capabilities) ? capabilities : [];
           const ttlSeconds = typeof args.ttlSeconds === 'undefined' || args.ttlSeconds === null
@@ -3831,9 +3968,9 @@ export class NeuralMCPServer {
         }
 
         case 'unregister_agent': {
-          const targetAgentId = String(args.agentId || '').trim();
-          if (!targetAgentId) {
-            throw new Error('Missing required field: agentId');
+          const targetAgentId = typeof args.agentId === 'string' ? args.agentId : '';
+          if (!targetAgentId || this.memoryManager.resolveMailboxAddress(targetAgentId, tenantId) !== targetAgentId) {
+            throw new Error('agentId must be a valid exact agent identifier');
           }
 
           const now = new Date().toISOString();
@@ -3967,78 +4104,9 @@ export class NeuralMCPServer {
         }
 
         case 'set_agent_identity': {
-          const {
-            currentAgentId,
-            newAgentId,
-            newName,
-            capabilities = [],
-            metadata = {},
-            autoRegister = true
-          } = args;
-
-          if (!newAgentId || typeof newAgentId !== 'string' || newAgentId.trim().length === 0) {
-            throw new Error('Missing required field: `newAgentId`');
-          }
-
-          const updatedAgentId = newAgentId.trim();
-          const previousAgentId = (currentAgentId && String(currentAgentId).trim().length > 0)
-            ? String(currentAgentId).trim()
-            : updatedAgentId;
-
-          const now = new Date().toISOString();
-          const identityId = uuidv4();
-
-          // Write to canonical agent_identity_changes table
-          const db = this.memoryManager.getDb();
-          db.prepare(`
-            INSERT INTO agent_identity_changes (id, previous_agent_id, updated_agent_id, updated_name, capabilities_json, metadata_json, updated_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(
-            identityId,
-            previousAgentId,
-            updatedAgentId,
-            newName || updatedAgentId,
-            JSON.stringify(capabilities),
-            JSON.stringify(metadata),
-            args.agentId || this.agentId,
-            now
+          throw new Error(
+            'set_agent_identity is temporarily disabled while HYTHE migrates to tenant-scoped stable principals; use register_agent for an exact handle without mailbox-history transfer.'
           );
-
-          console.log(`🪪 Agent identity update recorded: ${previousAgentId} → ${updatedAgentId}`);
-
-          const responsePayload = {
-            status: 'identity_updated',
-            recordId: identityId,
-            previousAgentId,
-            agentId: updatedAgentId,
-            name: newName || updatedAgentId,
-            capabilitiesApplied: capabilities.length,
-            autoRegister: autoRegister === true,
-            metadata
-          };
-
-          const response: any = {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(responsePayload, null, 2)
-              }
-            ]
-          };
-
-          if (autoRegister === true) {
-            response.bridgeCommand = {
-              type: 'update_identity',
-              agentId: updatedAgentId,
-              name: newName || updatedAgentId,
-              previousAgentId,
-              capabilities,
-              metadata,
-              autoRegister: true
-            };
-          }
-
-          return response;
         }
 
         case 'get_agent_status': {
@@ -4060,7 +4128,7 @@ export class NeuralMCPServer {
             const metadata = row ? parseRegistrationJson(row.metadata_json, {}) : {};
             const canonicalAgentId = row
               ? this.memoryManager.inferCanonicalAgentId(row.agent_id, row.name, metadata)
-              : this.memoryManager.resolvePreferredAgentId(targetAgentId);
+              : this.memoryManager.resolvePreferredAgentId(targetAgentId, tenantId);
             const expiresAt = registrationExpiresAt(metadata);
 
             statusData = {
@@ -4074,7 +4142,7 @@ export class NeuralMCPServer {
               ttlSeconds: metadata.ttlSeconds,
               lifecycleStatus: metadata.lifecycleStatus || metadata.status,
               capabilities: row ? parseRegistrationJson(row.capabilities_json, []) : [],
-              aliases: this.memoryManager.getAgentAliases(targetAgentId)
+              aliases: this.memoryManager.getAgentAliases(targetAgentId, tenantId)
             };
           } else {
             // All rows feed the canonical rollup (deduped, naturally bounded by
@@ -4223,6 +4291,10 @@ export class NeuralMCPServer {
             };
           }
 
+          if (this.memoryManager.isConfidentialEntityReference(entityName, tenantId)) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
+          }
+
           // Find targets (tenant-scoped)
           const entityRows = this.memoryManager.findEntitiesByName(entityName, tenantId);
           if (entityRows.length === 0) {
@@ -4230,6 +4302,11 @@ export class NeuralMCPServer {
               content: [{ type: 'text', text: JSON.stringify({ error: 'Not Found', message: `Entity "${entityName}" not found in tenant ${tenantId}` }) }],
               isError: true,
             };
+          }
+          if (entityRows.some((row: any) =>
+            this.memoryManager.isConfidentialGraphRow('entity', row.content, tenantId)
+          )) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
           }
 
           const observationRows = this.memoryManager.findObservationsByEntity(entityName, tenantId);
@@ -4315,11 +4392,17 @@ export class NeuralMCPServer {
             };
           }
 
+          if (this.memoryManager.isConfidentialEntityReference(entityName, tenantId)) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
+          }
+
           // Find targets based on selector
           let targetRows: any[] = [];
           if (observationIds && observationIds.length > 0) {
-            // Find by entity + filter to specified IDs
-            const allObs = this.memoryManager.findObservationsByEntity(entityName, tenantId);
+            // Mutation selection uses raw rows. Read helpers omit private
+            // children, which would turn an explicit mixed/private target into
+            // a misleading partial success instead of a fail-closed rejection.
+            const allObs = this.memoryManager.findObservationRowsForMutation(entityName, tenantId);
             const idSet = new Set(observationIds);
             targetRows = allObs.filter((r: any) => idSet.has(r.id));
           } else if (containsAny && containsAny.length > 0) {
@@ -4329,6 +4412,12 @@ export class NeuralMCPServer {
               content: [{ type: 'text', text: JSON.stringify({ error: 'Bad Request', message: 'Provide observationIds or containsAny selector' }) }],
               isError: true,
             };
+          }
+
+          if (targetRows.some((row: any) =>
+            this.memoryManager.isConfidentialGraphRow('observation', row.content, tenantId)
+          )) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
           }
 
           if (targetRows.length === 0) {
@@ -4397,6 +4486,11 @@ export class NeuralMCPServer {
             };
           }
 
+          const obsRow = this.memoryManager.getObservationRow(observationId, tenantId);
+          if (obsRow && this.memoryManager.isConfidentialGraphRow('observation', obsRow.content, tenantId)) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
+          }
+
           // Sanitizer parity (codex finding #3)
           const sanitizeResult = MemoryManager.sanitizeContent(newContent);
           if (!sanitizeResult.safe) {
@@ -4409,7 +4503,6 @@ export class NeuralMCPServer {
 
           // Phase B: member_provenance → fetch row and check ownership before updating
           if (authResult.reason === 'member_provenance') {
-            const obsRow = this.memoryManager.getObservationRow(observationId, tenantId);
             if (obsRow) {
               const ownerCheck = this.memoryManager.checkMemberOwnership([obsRow], context);
               if (!ownerCheck.allowed) {
@@ -4455,7 +4548,17 @@ export class NeuralMCPServer {
             };
           }
 
-          const observationRows = this.memoryManager.findObservationsByEntity(entityName, tenantId);
+          if (this.memoryManager.isConfidentialEntityReference(entityName, tenantId)) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
+          }
+
+          const observationRows = this.memoryManager.findObservationRowsForMutation(entityName, tenantId);
+
+          if (observationRows.some((row: any) =>
+            this.memoryManager.isConfidentialGraphRow('observation', row.content, tenantId)
+          )) {
+            throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
+          }
 
           if (observationRows.length === 0) {
             return {

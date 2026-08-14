@@ -1,20 +1,21 @@
 # Quickstart — two coordinating agents in ~15 minutes
 
 This walks a clean machine from zero to two AI agents sharing state through
-HYTHE. Prerequisites: Docker (with compose) and Node.js ≥ 18.
+HYTHE. Prerequisites: Docker (with compose) and Node.js ≥ 20.9.
 
 ## 1. Generate config (1 min)
 
 From the directory where you'll run the server:
 
 ```bash
-npx -y @hythe/mcp init --write-env
+npx -y @hythe/mcp init --write-env --agent-id agent-a
 ```
 
 This generates a fresh API key and writes it only to `./.env` (mode 600,
 never overwriting an existing file). The printed MCP config blocks for Claude
-Code, Codex, Cursor, and Claude Desktop reference that protected file; the key
-itself is never printed or embedded in client config.
+Code, Codex, Cursor, and Claude Desktop reference that protected file and bind
+this client lane to `HYTHE_AGENT_ID=agent-a`; the key itself is never printed
+or embedded in client config.
 
 ## 2. Start the server (2 min)
 
@@ -25,19 +26,31 @@ curl -s http://127.0.0.1:6174/health
 
 The server binds to loopback by default and refuses to boot with the
 placeholder key — an untouched `.env.example` cannot go live. The database
-starts **empty** (SQLite file on the `engram_data` volume).
+starts **empty** (SQLite file on the `engram_data` volume). On a new volume,
+the image downloads the q8 embedding model into `/app/data/models` and proves
+it can produce a finite 384-dimension vector before serving; later starts use
+that cache. Set `SQLITE_VEC_ALLOW_REMOTE_MODELS=false` only after the complete
+model is cached. If the first health request is early, follow progress with
+`docker compose -f docker/docker-compose.yml logs -f engram`.
 
 ## 3. Connect your first client (3 min)
 
-Paste the block `init` printed for your client. For Claude Code it's one
-command:
+Paste the block `init` printed for your client. For Claude Code, install the
+hook plugin, add the bridge, then launch the identity-bound lane:
 
 ```bash
-claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp
+claude plugin marketplace add hythe-dev/hythe
+claude plugin install hythe
+claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env HYTHE_AGENT_ID=agent-a --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp
+HYTHE_AGENT_ID=agent-a claude
 ```
 
 Each MCP client spawns the stdio bridge; the bridge talks HTTP to the
-server. Same pattern for Codex (`~/.codex/config.toml`), Cursor
+server. Claude's plugin hooks are separate child processes: the `--env`
+flags on `claude mcp add` configure the bridge only, while the launch-time
+`HYTHE_AGENT_ID` is inherited by session-start and post-compaction hooks.
+Both values must be the same exact lane identity; missing or conflicting hook
+identity fails closed. Same pattern for Codex (`~/.codex/config.toml`), Cursor
 (`.cursor/mcp.json`), and Claude Desktop.
 
 ## 4. Seed the demo (optional, 2 min)
@@ -55,8 +68,17 @@ down -v`.
 
 ## 5. Two real agents (5 min)
 
-Connect a second harness (say Codex next to Claude Code) with the same
-config block and a different agent identity. Then, from harness A:
+Generate a second block from the same directory without rewriting the shared
+credential, then paste it into the second harness (say Codex next to Claude
+Code):
+
+```bash
+npx -y @hythe/mcp init --agent-id agent-b
+```
+
+Each client lane needs a stable, distinct identity. The bridge rejects a
+`send_ai_message.from` that differs from its configured `HYTHE_AGENT_ID`
+instead of forwarding it. Then, from harness A:
 
 ```
 register_agent({agentId: "agent-a", name: "A", capabilities: ["builder"]})
@@ -88,6 +110,13 @@ store are in [CONCEPTS.md](./CONCEPTS.md).
   the same mode-400 or mode-600 `.env` used by the server. The server also logs
   auth failures.
 - **`.env` refuses to boot** — the placeholder `API_KEY=CHANGE_ME` is
-  deliberately rejected; run `npx -y @hythe/mcp init --write-env` for a real key.
+  deliberately rejected; run `npx -y @hythe/mcp init --write-env --agent-id agent-a`
+  for a real key and identity-bound client config.
+- **Bridge exits with an identity error** — set `HYTHE_AGENT_ID` to one stable
+  1-100 character id for that client lane. If the legacy `ENGRAM_AGENT_ID`,
+  `FROM`, or `MCP_FROM` aliases are also set, they must resolve to the same id.
+- **Claude hooks emit no recovery context** — the identity in `claude mcp add
+  --env HYTHE_AGENT_ID=...` reaches the bridge, not plugin hook processes.
+  Restart that Claude lane as `HYTHE_AGENT_ID=<same-id> claude`.
 - **Port collision** — change `NEURAL_MCP_PORT` in `.env` and `MCP_PORT`
   in each client block together.

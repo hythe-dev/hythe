@@ -6,7 +6,14 @@
 #
 # Pattern adapted from Gentleman-Programming/engram (MIT) — see NOTICE.
 
-AGENT_ID="${HYTHE_AGENT_ID:-${ENGRAM_AGENT_ID:-}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=resolve-agent-id.sh
+source "$SCRIPT_DIR/resolve-agent-id.sh"
+if ! hythe_resolve_agent_id; then
+  hythe_identity_error >&2
+  exit 2
+fi
+AGENT_ID="$HYTHE_RESOLVED_AGENT_ID"
 
 INPUT=$(cat)
 if command -v jq >/dev/null 2>&1; then
@@ -24,16 +31,8 @@ You have HYTHE MCP memory tools. This protocol is MANDATORY.
 ### SESSION START — do these FIRST, before the user's task:
 PROTOCOL
 
-if [ -n "$AGENT_ID" ]; then
-  printf '1. Call mcp__hythe__resume with agentId: "%s" to recover prior session state and recent context.\n' "$AGENT_ID"
-  printf '2. Call mcp__hythe__get_ai_messages with agentId: "%s" (defaults: unreadOnly) — other agents may have left you messages. Address or acknowledge anything urgent.\n' "$AGENT_ID"
-else
-  cat <<'NOID'
-1. HYTHE_AGENT_ID is not set on this machine. Ask the user which agent
-   identity to use (e.g. claude-desktop) before writing anything to memory.
-2. Once known, call mcp__hythe__resume and mcp__hythe__get_ai_messages with it.
-NOID
-fi
+printf '1. Call mcp__hythe__resume with agentId: "%s" to recover prior session state and recent context.\n' "$AGENT_ID"
+printf '2. Call mcp__hythe__get_ai_messages with agentId: "%s" (defaults: unreadOnly) — other agents may have left you messages. Address or acknowledge anything urgent.\n' "$AGENT_ID"
 
 cat <<'PROTOCOL'
 

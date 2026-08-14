@@ -155,11 +155,15 @@ describe('ENG-4 P0 — schema invariants (executable)', () => {
     // 07b3906e #3: bound asserted ids to the platform convention.
     expect(validResume({ agentId: 'x'.repeat(101), scope: { project: 'engram' }, budget: 1024 })).toBe(false);
     expect(validResume({ agentId: 'x'.repeat(100), scope: { project: 'engram' }, budget: 1024 })).toBe(true);
+    for (const invalid of ['agent with spaces', 'agent/other', 'agent\nsmuggled']) {
+      expect(validResume({ agentId: invalid, scope: { project: 'engram' }, budget: 1024 }), invalid).toBe(false);
+    }
     // 07b3906e #2: the ack path is now schema-visible on the wrapper.
     expect(validBeginSession({ agentId: 'agent-a', scope: { project: 'engram' }, budget: 1024 })).toBe(true);
     expect(validBeginSession({ agentId: 'agent-a', scope: { project: 'engram' }, budget: 1024, ackHandoffIds: ['h1', 'h2'] })).toBe(true);
     expect(validBeginSession({ agentId: 'agent-a', scope: { project: 'engram' }, budget: 1024, ackHandoffIds: [''] })).toBe(false);
     expect(validBeginSession({ agentId: 'agent-a', scope: { project: 'engram' }, budget: 1024, ackHandoffIds: 'h1' })).toBe(false);
+    expect(validBeginSession({ agentId: 'agent with spaces', scope: { project: 'engram' }, budget: 1024 })).toBe(false);
   });
 
   it('RFC 8785 canonicalization: conformance, reorder-invariance, content sensitivity', () => {
@@ -221,8 +225,7 @@ describe('ENG-4 P0 — schema invariants (executable)', () => {
     // Same key/content + DIFFERENT expectedRevision/parent => different
     // fingerprint (no replaying the wrong branch).
     expect(requestFingerprint({ ...base, expectedRevision: 4, resolvedParentStateId: 's4' })).not.toBe(fp);
-    // Aliases resolved to the SAME canonical family fingerprint identically
-    // (both callers pass the canonical id post-resolution).
+    // An exact principal repeated verbatim fingerprints identically.
     expect(requestFingerprint({ ...base })).toBe(fp);
     // Fingerprint and resource content hash are DISTINCT values by design.
     expect(fp).not.toBe(envelopeContentHash(envelope));
@@ -297,8 +300,8 @@ describe('ENG-4 P0 — schema invariants (executable)', () => {
         messages: [{ itemType: 'message', messageId: 'm1', from: 'a', priority: 'normal', recordedAt: 't', body, handle }],
       });
     expect(validBundle(withMsg('inline text', null))).toBe(true);
-    expect(validBundle(withMsg(null, { kind: 'message', uri: 'engram://message/m1' }))).toBe(true);
-    expect(validBundle(withMsg('inline text', { kind: 'message', uri: 'engram://message/m1' }))).toBe(false);
+    expect(validBundle(withMsg(null, { kind: 'message', uri: 'engram://message/p/agent-a/m1' }))).toBe(true);
+    expect(validBundle(withMsg('inline text', { kind: 'message', uri: 'engram://message/p/agent-a/m1' }))).toBe(false);
     expect(validBundle(withMsg(null, null))).toBe(false);
   });
 
@@ -634,7 +637,7 @@ describe('ENG-4 2(a) — schema init boundary (executable)', () => {
 describe('ENG-4 2(a) — exact scope resolver (executable, injected directory)', () => {
   const directory = (rows: Record<string, Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }>>): EntityDirectory => ({
     resolveEntityCandidatesExact: (name) => rows[name] ?? [],
-    resolveCanonicalAgent: (agentId) => ({ canonical: agentId.replace(/-cli$|-ide-agent$/, ''), aliases: [agentId] }),
+    resolveCanonicalAgent: (agentId) => ({ canonical: agentId, aliases: [agentId] }),
   });
 
   it('resolves a canonical project name to a stable entity UUID and a deterministic scopeKey', () => {
@@ -708,7 +711,7 @@ describe('ENG-4 P0 — legacy repro fixtures', () => {
 // ---------------------------------------------------------------------------
 
 // Scope resolution against the real store: resolver logic is EXECUTABLE in
-// the 2(a) suites; repro fixture #1 and the canonical-agent family mapping
+// the 2(a) suites; repro fixture #1 and exact agent-principal mapping
 // are EXECUTABLE in the 2(c) real-store suite.
 
 // REGRESSION (sol review 2a3980bc): the graph_lookup_keys index matches
@@ -800,7 +803,7 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
       if (name === 'OtherProj') return [{ id: 'u-other', name: 'OtherProj', matchedBy: 'canonical_name' }];
       return [];
     },
-    resolveCanonicalAgent: (agentId) => ({ canonical: agentId.replace(/-cli$/, ''), aliases: [agentId] }),
+    resolveCanonicalAgent: (agentId) => ({ canonical: agentId, aliases: [agentId] }),
   };
 
   const freshDb = () => {
@@ -839,11 +842,11 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
     expect(payload.byte_length).toBe(payload.body.length);
   });
 
-  it('ONE AUTHOR RULE: author = canonical family, asserted_agent_id = raw asserted id (audit only)', () => {
+  it('ONE AUTHOR RULE: author = exact opaque principal and asserted_agent_id preserves the audit input', () => {
     const db = freshDb();
     const res = performCheckpoint(db, directory, TENANT, cp()) as any;
     const row = db.prepare(`SELECT author, asserted_agent_id FROM eng4_state_snapshots WHERE tenant_id=? AND state_id=?`).get(TENANT, res.stateId) as any;
-    expect(row).toEqual({ author: 'fable-engram', asserted_agent_id: 'fable-engram-cli' });
+    expect(row).toEqual({ author: 'fable-engram-cli', asserted_agent_id: 'fable-engram-cli' });
   });
 
   it('extending the current head writes a linear child (new per-scope revision)', () => {
@@ -903,7 +906,7 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
     const res = performCheckpoint(db, directory, TENANT, cp({ expectedRevision: 99, idempotencyKey: 'k-x' })) as any;
     expect(res.outcome).toBe('conflict');
     expect(res.heads.map((h: any) => h.stateId).sort()).toEqual([a.stateId, b.stateId].sort());
-    expect(res.heads.every((h: any) => h.author === 'fable-engram')).toBe(true);
+    expect(res.heads.every((h: any) => h.author === 'fable-engram-cli')).toBe(true);
   });
 
   it('a revision existing only in ANOTHER scope is unreachable: empty target scope fails CLOSED as a typed error — conflict cannot carry heads:[] (frozen schema minItems 1)', () => {
@@ -972,12 +975,13 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
     expect(snapCount(db)).toBe(1);
   });
 
-  it('aliases in one canonical family fingerprint identically: -cli retry replays cleanly', () => {
+  it('transport-looking suffixes are distinct principals and cannot replay another handle idempotently', () => {
     const db = freshDb();
     const first = performCheckpoint(db, directory, TENANT, cp({ agentId: 'fable-engram' })) as any;
-    const replay = performCheckpoint(db, directory, TENANT, cp({ agentId: 'fable-engram-cli' })) as any;
-    expect(replay.outcome).toBe('idempotent-replay');
-    expect(replay.stateId).toBe(first.stateId);
+    const mismatch = performCheckpoint(db, directory, TENANT, cp({ agentId: 'fable-engram-cli' })) as any;
+    expect(mismatch.outcome).toBe('idempotency-mismatch');
+    expect(mismatch.stateId).toBe(first.stateId);
+    expect(snapCount(db)).toBe(1);
   });
 
   it('stored request_fingerprint is the EXACT RFC 8785 requestFingerprint; payload binds the exact canonical bytes', () => {
@@ -991,7 +995,7 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
     };
     const row = db.prepare(`SELECT request_fingerprint, content_hash FROM eng4_state_snapshots WHERE tenant_id=? AND state_id=?`).get(TENANT, res.stateId) as any;
     expect(row.request_fingerprint).toBe(requestFingerprint({
-      canonicalAgentId: 'fable-engram', scopeKey: 'p:u-proj',
+      canonicalAgentId: 'fable-engram-cli', scopeKey: 'p:u-proj',
       expectedRevision: null, resolvedParentStateId: null, envelope,
     }));
     expect(row.content_hash).toBe(envelopeContentHash(envelope));
@@ -1049,7 +1053,7 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
     }));
     const fact = db.prepare(`SELECT * FROM eng4_facts WHERE tenant_id=?`).get(TENANT) as any;
     expect(fact.subject).toBe('engram');
-    expect(fact.author).toBe('fable-engram');
+    expect(fact.author).toBe('fable-engram-cli');
     expect(fact.effective_at).toBe('2026-07-15T00:00:00Z');
     const snap = db.prepare(`SELECT recorded_at FROM eng4_state_snapshots WHERE tenant_id=?`).get(TENANT) as any;
     expect(fact.recorded_at).toBe(snap.recorded_at); // server-owned, same txn timestamp
@@ -1076,7 +1080,7 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
       loopChanges: [{ status: 'open', nextAction: 'ship 2(c)' }],
     }));
     const loop = db.prepare(`SELECT * FROM eng4_open_loops WHERE tenant_id=?`).get(TENANT) as any;
-    expect(loop.owner).toBe('fable-engram');
+    expect(loop.owner).toBe('fable-engram-cli');
     expect(loop.revision).toBe(0);
     performCheckpoint(db, directory, TENANT, cp({
       expectedRevision: 1, idempotencyKey: 'k-2',
@@ -1121,7 +1125,7 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
       if (name === 'Proj') return [{ id: 'u-proj', name: 'Proj', matchedBy: 'canonical_name' }];
       return [];
     },
-    resolveCanonicalAgent: (agentId) => ({ canonical: agentId.replace(/-cli$/, ''), aliases: [agentId] }),
+    resolveCanonicalAgent: (agentId) => ({ canonical: agentId, aliases: [agentId] }),
     getEntityDefinition: (entityId) => DEFINITIONS[entityId] ?? null,
   };
 
@@ -1168,9 +1172,9 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
       evidenceRefs: ['commit:52656c6'],
     }));
     db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
-                VALUES ('m-scoped', 'engram-sol', 'fable-engram', 'scoped body', 'high', '2026-07-16T01:00:00Z', 'u-proj', 't1')`).run();
+                VALUES ('m-scoped', 'engram-sol', 'fable-engram-cli', 'scoped body', 'high', '2026-07-16T01:00:00Z', 'u-proj', 't1')`).run();
     db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, tenant_id)
-                VALUES ('m-unscoped', 'someone', 'fable-engram', 'unscoped body', 'normal', '2026-07-16T01:01:00Z', 't1')`).run();
+                VALUES ('m-unscoped', 'someone', 'fable-engram-cli', 'unscoped body', 'normal', '2026-07-16T01:01:00Z', 't1')`).run();
   };
 
   it('a fully-populated bundle validates against the FROZEN resume output schema (no runtime/contract drift)', () => {
@@ -1275,7 +1279,7 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
       // left on the fixture default tenant would be excluded and the walk
       // would silently stop exercising multi-message pagination.
       db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
-                  VALUES (?, 'engram-sol', 'fable-engram', ?, 'normal', ?, 'u-proj', 't1')`)
+                  VALUES (?, 'engram-sol', 'fable-engram-cli', ?, 'normal', ?, 'u-proj', 't1')`)
         .run(`m-extra-${i}`, `body ${i} ${'x'.repeat(120)}`, `2026-07-16T01:0${i + 2}:00Z`);
     }
     const seen = new Map<string, number>();
@@ -1330,6 +1334,24 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
     }
   });
 
+  it('messages are selected for the exact resolved recipient only, even inside the same tenant and scope', () => {
+    const db = freshDb();
+    const insert = db.prepare(
+      `INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
+       VALUES (?, 'engram-sol', ?, ?, 'normal', ?, 'u-proj', 't1')`
+    );
+    insert.run('m-cli', 'fable-engram-cli', 'for cli only', '2026-07-16T03:00:00Z');
+    insert.run('m-bare', 'fable-engram', 'for bare only', '2026-07-16T03:01:00Z');
+
+    const cli = performResume(db, directory, TENANT, rz({ agentId: 'fable-engram-cli' }));
+    expect(cli.messages.map((item: any) => item.messageId)).toEqual(['m-cli']);
+    expect(JSON.stringify(cli)).not.toContain('for bare only');
+
+    const bare = performResume(db, directory, TENANT, rz({ agentId: 'fable-engram' }));
+    expect(bare.messages.map((item: any) => item.messageId)).toEqual(['m-bare']);
+    expect(JSON.stringify(bare)).not.toContain('for cli only');
+  });
+
   it("tenant isolation: tenant2 knowing tenant1's scopeKey (even resolving the same UUIDs) reads NOTHING of tenant1", () => {
     const db = freshDb();
     seedFull(db); // all under t1
@@ -1347,7 +1369,7 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
   it("REGRESSION (sol 95eba75a): tenant2 resolving tenant1's project UUID receives ZERO tenant1 messages", () => {
     const db = freshDb();
     db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
-                VALUES ('m-t1', 'engram-sol', 'fable-engram', 't1 secret', 'high', '2026-07-16T01:00:00Z', 'u-proj', 't1')`).run();
+                VALUES ('m-t1', 'engram-sol', 'fable-engram-cli', 't1 secret', 'high', '2026-07-16T01:00:00Z', 'u-proj', 't1')`).run();
     const t1 = performResume(db, directory, 't1', rz());
     expect(t1.messages.map((m: any) => m.messageId)).toEqual(['m-t1']);
     const t2 = performResume(db, directory, 't2', rz());
@@ -1408,11 +1430,17 @@ describe('ENG-4 2(c) — resume against the REAL store (legacy repro #1 flip)', 
     expect(bundle.asOf.stale).toBe(false);
   });
 
-  it('canonical-agent real store: fable-engram-cli and fable-engram resolve to ONE canonical family', () => {
-    const cli = manager.resolveCanonicalAgent('fable-engram-cli');
-    const bare = manager.resolveCanonicalAgent('fable-engram');
-    expect(cli.canonical).toBe(bare.canonical);
-    expect(cli.canonical).toBe('fable-engram');
+  it('canonical-agent real store: an active base registration never binds a transport-looking suffix', () => {
+    manager.getDb().prepare(
+      `INSERT INTO agent_registrations
+         (agent_id, tenant_id, name, capabilities_json, metadata_json, status, registered_by)
+       VALUES ('fable-engram', 'default', 'Fable Engram', '[]', '{}', 'active', 'contract-test')`
+    ).run();
+    const cli = manager.resolveCanonicalAgent('fable-engram-cli', 'default');
+    const bare = manager.resolveCanonicalAgent('fable-engram', 'default');
+    expect(cli.canonical).toBe('fable-engram-cli');
+    expect(bare.canonical).toBe('fable-engram');
+    expect(cli.canonical).not.toBe(bare.canonical);
   });
 });
 
@@ -1428,7 +1456,7 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
       if (name === 'Task') return [{ id: 'u-task', name: 'Task', matchedBy: 'canonical_name' }];
       return [];
     },
-    resolveCanonicalAgent: (agentId) => ({ canonical: agentId.replace(/-cli$/, ''), aliases: [agentId] }),
+    resolveCanonicalAgent: (agentId) => ({ canonical: agentId, aliases: [agentId] }),
     getEntityDefinition: () => null,
   };
 
@@ -1471,7 +1499,7 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     const byId = fetchSnapshot(db, directory, TENANT, { scope: { project: 'Proj' }, stateId: written.stateId });
     expect(byId.snapshot).toMatchObject({
       stateId: written.stateId, scopeKey: 'p:u-proj', revision: 1, parentStateId: null,
-      contentHash: written.contentHash, author: 'fable-engram', assertedAgentId: 'fable-engram-cli',
+      contentHash: written.contentHash, author: 'fable-engram-cli', assertedAgentId: 'fable-engram-cli',
     });
     expect(byId.snapshot.recordedAt).toBeTruthy();
     expect(byId.snapshot.state.status).toBe('working');
@@ -1538,11 +1566,15 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     performCheckpoint(db, directory, TENANT, cp());
     const bigBody = 'B'.repeat(3000);
     db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
-                VALUES ('m-big', 'engram-sol', 'fable-engram', ?, 'normal', '2026-07-16T02:00:00Z', 'u-proj', 't1')`).run(bigBody);
+                VALUES ('m-big', 'engram-sol', 'fable-engram-cli', ?, 'normal', '2026-07-16T02:00:00Z', 'u-proj', 't1')`).run(bigBody);
     const bundle = performResume(db, directory, TENANT, rz());
     const item = bundle.messages.find((m: any) => m.messageId === 'm-big') as any;
     expect(item.body).toBeNull();
     expect(item.handle.kind).toBe('message');
+    expect(parseEngramUri(item.handle.uri)).toEqual({
+      kind: 'message',
+      segments: ['p:u-proj', 'fable-engram-cli', 'm-big'],
+    });
     expect(validBundle(bundle), JSON.stringify(validBundle.errors)).toBe(true);
     const fetched = fetchResourceByUri(db, TENANT, item.handle.uri) as any;
     expect(fetched.body).toBe(bigBody);
@@ -1578,12 +1610,14 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     expect((db.prepare(`SELECT COUNT(*) AS n FROM eng4_handoff_acks`).get() as any).n).toBe(0);
   });
 
-  it('aliases share ONE ack view: acked as -cli, seen as acked by the bare canonical id', () => {
+  it('transport-looking suffixes have distinct acknowledgement views', () => {
     const db = freshDb();
     seedHandoff(db);
     ackHandoffs(db, TENANT, directory.resolveCanonicalAgent('fable-engram-cli').canonical, ['h-1']);
-    const bundle = performResume(db, directory, TENANT, rz({ agentId: 'fable-engram' }));
-    expect((bundle.messages.find((m: any) => m.itemType === 'handoff') as any).ackedByMe).toBe(true);
+    const cliBundle = performResume(db, directory, TENANT, rz({ agentId: 'fable-engram-cli' }));
+    expect((cliBundle.messages.find((m: any) => m.itemType === 'handoff') as any).ackedByMe).toBe(true);
+    const bareBundle = performResume(db, directory, TENANT, rz({ agentId: 'fable-engram' }));
+    expect((bareBundle.messages.find((m: any) => m.itemType === 'handoff') as any).ackedByMe).toBe(false);
   });
 
   it('acking a nonexistent handoffId fails CLOSED and the whole batch rolls back (atomic)', () => {
@@ -1623,11 +1657,28 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     const db = freshDb();
     db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
                 VALUES ('m-secret', 'x', 'y', 'other-project-secret', 'normal', '2026-07-16T02:00:00Z', 'u-other', 't1')`).run();
-    expect(() => fetchResourceByUri(db, TENANT, buildMessageUri('p:u-proj', 'm-secret')))
+    expect(() => fetchResourceByUri(db, TENANT, buildMessageUri('p:u-proj', 'y', 'm-secret')))
       .toThrow(ResourceNotFoundError);
     // Sanity: reachable under ITS OWN scope binding.
-    expect((fetchResourceByUri(db, TENANT, buildMessageUri('p:u-other', 'm-secret')) as any).body)
+    expect((fetchResourceByUri(db, TENANT, buildMessageUri('p:u-other', 'y', 'm-secret')) as any).body)
       .toBe('other-project-secret');
+  });
+
+  it('same-tenant CROSS-RECIPIENT message dereference fails CLOSED, while the exact recipient handle works', () => {
+    const db = freshDb();
+    db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, project_id, tenant_id)
+                VALUES ('m-recipient', 'x', 'agent-y', 'recipient-secret', 'normal', '2026-07-16T02:00:00Z', 'u-proj', 't1')`).run();
+    // The old scope+id shape would have exposed this existing row before the
+    // recipient segment became mandatory. It is no longer dereferenceable.
+    expect(() => fetchResourceByUri(
+      db,
+      TENANT,
+      `engram://message/${encodeURIComponent('p:u-proj')}/${encodeURIComponent('m-recipient')}`
+    )).toThrow(ResourceNotFoundError);
+    expect(() => fetchResourceByUri(db, TENANT, buildMessageUri('p:u-proj', 'agent-x', 'm-recipient')))
+      .toThrow(ResourceNotFoundError);
+    expect((fetchResourceByUri(db, TENANT, buildMessageUri('p:u-proj', 'agent-y', 'm-recipient')) as any).body)
+      .toBe('recipient-secret');
   });
 
   it('same-tenant CROSS-PROJECT handoff dereference fails CLOSED; task-only scope binds no project and dereferences nothing', () => {
@@ -1646,7 +1697,7 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     const db = freshDb();
     const bigBody = 'T'.repeat(3000);
     db.prepare(`INSERT INTO ai_messages (id, from_agent, to_agent, content, priority, created_at, task_id, tenant_id)
-                VALUES ('m-task', 's', 'r', ?, 'normal', '2026-07-16T02:00:00Z', 'u-task', 't1')`).run(bigBody);
+                VALUES ('m-task', 's', 'fable-engram-cli', ?, 'normal', '2026-07-16T02:00:00Z', 'u-task', 't1')`).run(bigBody);
     const taskOnly = performResume(db, directory, TENANT, rz({ scope: { task: 'Task' } }));
     const taskItem = taskOnly.messages.find((m: any) => m.messageId === 'm-task') as any;
     expect(taskItem.body).toBeNull();
@@ -1656,9 +1707,9 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     expect((fetchResourceByUri(db, TENANT, bothItem.handle.uri) as any).body).toBe(bigBody);
   });
 
-  it('a malformed scope segment in a message/handoff handle fails CLOSED', () => {
+  it('malformed scope segments in message/handoff handles fail CLOSED', () => {
     const db = freshDb();
-    expect(() => fetchResourceByUri(db, TENANT, `engram://message/${encodeURIComponent('not-a-scope')}/${encodeURIComponent('m-1')}`))
+    expect(() => fetchResourceByUri(db, TENANT, `engram://message/${encodeURIComponent('not-a-scope')}/agent-a/${encodeURIComponent('m-1')}`))
       .toThrow(ResourceNotFoundError);
     expect(() => fetchResourceByUri(db, TENANT, `engram://handoff/${encodeURIComponent('not-a-scope')}/${encodeURIComponent('h-1')}`))
       .toThrow(ResourceNotFoundError);
@@ -1961,7 +2012,7 @@ describe('STEP-3 B — registration, tool diet, resources (executable)', () => {
   it('engram:// resources are DISCOVERABLE via templates and READABLE via the verified scope-bound path; history is never a tool', async () => {
     expect(ENG4_RESOURCE_TEMPLATES.map((t) => t.uriTemplate)).toEqual([
       'engram://snapshot/{scopeKey}/{stateId}',
-      'engram://message/{scopeKey}/{messageId}',
+      'engram://message/{scopeKey}/{recipientAgentId}/{messageId}',
       'engram://handoff/{scopeKey}/{handoffId}',
     ]);
     const rz = await call('resume', { agentId: 'fable-engram', scope: { project: 'step3-proj' }, budget: 4000 });
@@ -2002,7 +2053,7 @@ describe('STEP-3 B — registration, tool diet, resources (executable)', () => {
 // handoff items with caller-specific ackedByMe) is EXECUTABLE in the 2(d)
 // suite.
 
-// Asserted identity (distinct per-agent ack views; aliases = one view),
+// Asserted identity (exact opaque per-agent author and ack views),
 // handoff ack fail-closed (atomic same-tenant existence check, cross-tenant
 // denial), and the remaining tenant-isolation cases (stateId/revision/URI
 // resource fetches) are all EXECUTABLE in the 2(d) suite.

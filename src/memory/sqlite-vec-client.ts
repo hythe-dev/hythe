@@ -39,6 +39,7 @@ export class SqliteVecClient {
   private readonly dimensions: number;
   private readonly embeddingModel: string;
   private readonly embeddingCacheDir?: string;
+  private readonly transformerRequired: boolean;
   private readonly fallbackCandidateLimit: number;
 
   private initialized = false;
@@ -54,6 +55,7 @@ export class SqliteVecClient {
     this.dimensions = this.parsePositiveInt(process.env.SQLITE_VEC_DIMENSIONS, 384);
     this.embeddingModel = process.env.SQLITE_VEC_MODEL || process.env.TRANSFORMERS_MODEL || 'Xenova/all-MiniLM-L6-v2';
     this.embeddingCacheDir = process.env.SQLITE_VEC_CACHE_DIR || process.env.TRANSFORMERS_CACHE_DIR;
+    this.transformerRequired = process.env.SQLITE_VEC_REQUIRE_TRANSFORMERS === 'true';
     this.fallbackCandidateLimit = this.parsePositiveInt(process.env.SQLITE_VEC_FALLBACK_CANDIDATES, 300);
   }
 
@@ -502,6 +504,7 @@ export class SqliteVecClient {
           return this.ensureDimensions(vector);
         }
       } catch (error: any) {
+        if (this.transformerRequired) throw error;
         console.warn(`⚠️ Transformer embedding failed, using hash fallback: ${error?.message || error}`);
       }
     }
@@ -516,6 +519,9 @@ export class SqliteVecClient {
     this.pipelinePromise = (async () => {
       const module = await this.dynamicImportTransformers();
       if (!module) {
+        if (this.transformerRequired) {
+          throw new Error('Required transformers runtime is unavailable');
+        }
         this.transformerUnavailable = true;
         return null;
       }
@@ -528,14 +534,23 @@ export class SqliteVecClient {
 
       const pipelineFactory = module.pipeline || module.default?.pipeline;
       if (typeof pipelineFactory !== 'function') {
+        if (this.transformerRequired) {
+          throw new Error('Required transformers runtime has no pipeline() export');
+        }
         this.transformerUnavailable = true;
         console.warn('⚠️ Transformers module loaded but no pipeline() export found');
         return null;
       }
 
       try {
-        return await pipelineFactory('feature-extraction', this.embeddingModel);
+        // The production cache contains the 384-dimension quantized ONNX model.
+        // Hugging Face Transformers v4 defaults Node to fp32 (`model.onnx`),
+        // while the maintained Xenova cache artifact is
+        // `model_quantized.onnx`. Selecting q8 preserves that cache contract and
+        // avoids an unexpected second model download during an upgrade.
+        return await pipelineFactory('feature-extraction', this.embeddingModel, { dtype: 'q8' });
       } catch (error: any) {
+        if (this.transformerRequired) throw error;
         this.transformerUnavailable = true;
         console.warn(`⚠️ Failed to initialize transformer model "${this.embeddingModel}": ${error?.message || error}`);
         return null;
@@ -546,19 +561,28 @@ export class SqliteVecClient {
   }
 
   private async dynamicImportTransformers(): Promise<any | null> {
-    const importer = new Function('m', 'return import(m);') as (moduleName: string) => Promise<any>;
-    const candidates = ['@xenova/transformers', '@huggingface/transformers'];
+    const configuredModule = process.env.SQLITE_VEC_TRANSFORMERS_MODULE?.trim();
+    const candidates = configuredModule
+      ? [configuredModule]
+      : ['@xenova/transformers', '@huggingface/transformers'];
 
     for (const candidate of candidates) {
       try {
-        return await importer(candidate);
+        return await this.importTransformerModule(candidate);
       } catch {
         // Keep trying candidates.
       }
     }
 
-    console.warn('⚠️ No transformers runtime found (@xenova/transformers or @huggingface/transformers)');
+    console.warn(configuredModule
+      ? `⚠️ Configured transformers runtime could not be imported: ${configuredModule}`
+      : '⚠️ No transformers runtime found (@xenova/transformers or @huggingface/transformers)');
     return null;
+  }
+
+  private async importTransformerModule(moduleName: string): Promise<any> {
+    const importer = new Function('m', 'return import(m);') as (specifier: string) => Promise<any>;
+    return importer(moduleName);
   }
 
   private extractVector(result: any): number[] | null {

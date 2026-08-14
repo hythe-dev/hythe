@@ -1,7 +1,7 @@
 # HYTHE CI — mirrors the local staged-proof gates that a runner can carry:
 # typecheck, build, schema-drift, the full single-fork contract suite, and
-# the docker image build. The lock-verify/script-integrity/final-tree-smoke
-# gates remain local (they bind to internal/, which never ships publicly).
+# the docker image build and an isolated npm-tarball consumer smoke. Registry
+# authentication and production backup/cutover canaries remain operator gates.
 name: CI
 
 on:
@@ -17,17 +17,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 20.9.0
           cache: npm
       - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm run typecheck
       - run: npm run build
       - run: npm run ci:schemas
       # P2 release verification remains explicit and contains no publish step.
       - run: node scripts/verify-hythe-release-tree.mjs
+      - run: npm run test:release
+      # Install the actual tarball in an independent consumer. Package-level
+      # overrides are deliberately not trusted as downstream protection.
+      - run: npm run test:packed-consumer
+      - run: npm run test:agent-kit
       # Single-fork matches the proven local invocation; the contract suite
       # boots its own hermetic server (tests/global-setup.ts).
       - run: npx vitest run --pool=forks --poolOptions.forks.singleFork
+      - run: npm run test:migrations
 
   docker:
     runs-on: ubuntu-latest

@@ -162,9 +162,9 @@ export const ENG4_RESOURCE_TEMPLATES = [
     mimeType: 'application/json',
   },
   {
-    uriTemplate: 'engram://message/{scopeKey}/{messageId}',
+    uriTemplate: 'engram://message/{scopeKey}/{recipientAgentId}/{messageId}',
     name: 'engram-message',
-    description: 'Full body of a scoped message handle (scope-bound; tenant is the security boundary).',
+    description: 'Full body of a recipient- and scope-bound message handle. Caller authentication remains a transport responsibility.',
     mimeType: 'text/plain',
   },
   {

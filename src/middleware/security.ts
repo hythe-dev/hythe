@@ -936,7 +936,8 @@ export const ValidationSchemas = {
     agentId: Joi.string().min(1).max(100).optional(), // legacy alias
     content: Joi.string().max(100000).optional(),
     message: Joi.string().max(100000).optional(), // legacy alias
-    messageType: Joi.string().valid('info', 'task', 'query', 'response', 'collaboration').optional(),
+    messageType: Joi.string().valid('direct', 'info', 'task', 'query', 'response', 'collaboration').optional(),
+    type: Joi.string().valid('direct', 'info', 'task', 'query', 'response', 'collaboration').optional(), // legacy alias
     priority: Joi.string().valid('low', 'normal', 'high', 'urgent').optional(),
     broadcast: Joi.boolean().optional(),
     toCapabilities: Joi.array().items(Joi.string().max(50)).max(20).optional(),

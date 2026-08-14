@@ -1,7 +1,7 @@
 // Hierarchical Memory Manager Implementation
 import Database from 'better-sqlite3';
 import { createHash, randomBytes } from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID as uuidv4 } from 'node:crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -97,12 +97,25 @@ export class MemoryManager {
   public weaviateClient?: SqliteVecClient;
   private isAdvancedSystemsEnabled: boolean = false;
   private isDualWriteEnabled: boolean = false;
+  private confidentialEntityReferenceCache = new Map<string, Set<string>>();
   readonly contentSizeThreshold: number = parseInt(process.env.CONTENT_SIZE_THRESHOLD || '51200', 10); // 50KB default
 
   constructor(dbPath: string = './data/unified-platform.db') {
     this.db = new Database(dbPath);
     this.dbPath = dbPath;
-    this.memorySystem = {
+    this.memorySystem = this.createEmptyMemorySystem();
+
+    this.initializeDatabase();
+    // ENG-4 control plane (2a): per-connection FK pragma + atomic idempotent
+    // DDL from the single-source migration; isolated DB only.
+    applyEng4Schema(this.db);
+    this.loadMemoryFromDatabase();
+    this.initializeAdvancedSystems();
+    this.initializeDualWrite();
+  }
+
+  private createEmptyMemorySystem(): MemorySystem {
+    return {
       individual: new Map(),
       shared: {
         project: {} as ProjectContext,
@@ -112,14 +125,10 @@ export class MemoryManager {
         artifacts: []
       }
     };
+  }
 
-    this.initializeDatabase();
-    // ENG-4 control plane (2a): per-connection FK pragma + atomic idempotent
-    // DDL from the single-source migration; isolated DB only.
-    applyEng4Schema(this.db);
-    this.loadMemoryFromDatabase();
-    this.initializeAdvancedSystems();
-    this.initializeDualWrite();
+  private resetServedMemoryCaches(): void {
+    this.memorySystem = this.createEmptyMemorySystem();
   }
 
   private initializeDualWrite(): void {
@@ -1122,8 +1131,11 @@ export class MemoryManager {
       }
     }
 
-    // 2. Store in advanced systems if available (skip ai_message — stored in dedicated table)
-    if (this.isAdvancedSystemsEnabled && type !== 'ai_message') {
+    // Direct-message payloads are private mailbox data, never part of the
+    // shared semantic corpus. `message_detail` is retained only as a legacy
+    // read representation for messages written before the dedicated table
+    // stored full bodies.
+    if (this.isAdvancedSystemsEnabled && !this.isConfidentialGraphRow(type, memory, tenantId)) {
       await this.storeInAdvancedSystems(id, agentId, memory, scope, type, tenantId);
     }
 
@@ -1454,18 +1466,82 @@ export class MemoryManager {
       try {
         // Phase 1: Query with content size to identify large rows
         const sizeStmt = this.db.prepare(`
-          SELECT id, memory_type, LENGTH(content) as content_size, created_by, created_at
+          SELECT id, memory_type, LENGTH(content) as content_size, created_by, created_at,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.name') END AS probe_name,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.aliases') END AS probe_aliases,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.entityName') END AS probe_entity_name,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.metadata.entityId') END AS probe_entity_id,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.from') END AS probe_from,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.to') END AS probe_to,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.type') END AS probe_type,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.entityType') END AS probe_entity_type,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.memoryType') END AS probe_memory_type,
+            CASE WHEN json_valid(content) THEN json_extract(content, '$.memory_type') END AS probe_memory_type_legacy,
+            CASE WHEN json_valid(content)
+              THEN CASE WHEN json_type(content) = 'object' THEN 1 ELSE 0 END
+              ELSE 0
+            END AS probe_json_object
           FROM shared_memory
-          WHERE tenant_id = ? AND LOWER(content) LIKE ?
+          WHERE tenant_id = ?
+            AND LOWER(memory_type) NOT IN ('ai_message', 'message_detail')
+            AND NOT (
+              json_valid(content)
+              AND (
+                LOWER(TRIM(COALESCE(json_extract(content, '$.type'), ''))) = 'message_detail'
+                OR LOWER(TRIM(COALESCE(json_extract(content, '$.entityType'), ''))) = 'message_detail'
+                OR LOWER(TRIM(COALESCE(json_extract(content, '$.memoryType'), ''))) = 'message_detail'
+                OR LOWER(TRIM(COALESCE(json_extract(content, '$.memory_type'), ''))) = 'message_detail'
+              )
+            )
+            AND LOWER(content) LIKE ?
           ORDER BY created_at DESC
           LIMIT ?
         `);
         const sizeRows = sizeStmt.all(tenantId, `%${searchTerm}%`, queryLimit) as any[];
 
+        // Classify graph rows before any lossy preview is constructed. For an
+        // oversized JSON row the first 50 KiB is normally incomplete; parsing
+        // that preview falls back to { raw }, which erases entityName,
+        // metadata.entityId, from/to, and reserved entity aliases. The compact
+        // JSON extracts above retain exactly the fields needed by the central
+        // confidentiality policy without loading the full large body.
+        const parseProbeAliases = (value: unknown): unknown[] => {
+          if (Array.isArray(value)) return value;
+          if (typeof value !== 'string') return [];
+          try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        };
+        const visibleSizeRows = sizeRows.filter((row) => {
+          const normalizedMemoryType = String(row.memory_type || '').trim().toLowerCase();
+          if (
+            ['entity', 'observation', 'relation'].includes(normalizedMemoryType)
+            && row.probe_json_object !== 1
+          ) {
+            return false;
+          }
+          const probe = {
+            name: row.probe_name,
+            aliases: parseProbeAliases(row.probe_aliases),
+            entityName: row.probe_entity_name,
+            metadata: { entityId: row.probe_entity_id },
+            from: row.probe_from,
+            to: row.probe_to,
+            type: row.probe_type,
+            entityType: row.probe_entity_type,
+            memoryType: row.probe_memory_type,
+            memory_type: row.probe_memory_type_legacy,
+          };
+          return !this.isConfidentialGraphRow(row.memory_type, probe, tenantId);
+        });
+
         // Phase 2: Fetch full content for small rows, truncated for large rows
         const threshold = this.contentSizeThreshold;
-        const smallIds = sizeRows.filter(r => r.content_size <= threshold).map(r => r.id);
-        const largeRows = sizeRows.filter(r => r.content_size > threshold);
+        const smallIds = visibleSizeRows.filter(r => r.content_size <= threshold).map(r => r.id);
+        const largeRows = visibleSizeRows.filter(r => r.content_size > threshold);
 
         // Batch-fetch small rows with full content
         if (smallIds.length > 0) {
@@ -1592,6 +1668,9 @@ export class MemoryManager {
     // Remove duplicates based on ID and sort by relevance
     const uniqueResults = new Map<string, SearchResult>();
     for (const result of results) {
+      if (this.isConfidentialGraphRow(result.memoryType || result.type, result.content, tenantId)) {
+        continue;
+      }
       if (!uniqueResults.has(result.id) || uniqueResults.get(result.id)!.relevance < result.relevance) {
         uniqueResults.set(result.id, result);
       }
@@ -1606,7 +1685,9 @@ export class MemoryManager {
     try {
       // 1. Semantic search with sqlite-vec (post-filtered by tenant)
       if (this.vectorClient && scope.shared) {
-        console.log(`🔍 Performing semantic search with sqlite-vec: "${query}" (tenant: ${tenantId})`);
+        // Search terms may contain private message text or other sensitive user
+        // content. Keep operational metadata while excluding the query itself.
+        console.log(`🔍 Performing semantic search with sqlite-vec (tenant: ${tenantId}, queryLength: ${query.length})`);
         const vectorResults = await this.vectorClient.searchMemories({
           query,
           tenantId,
@@ -1614,6 +1695,9 @@ export class MemoryManager {
         });
 
         for (const wResult of vectorResults) {
+          if (this.isConfidentialGraphRow(wResult.type, wResult.content, tenantId)) {
+            continue;
+          }
           // Propagate the vec0 distance so the caller can rank by semantic
           // similarity. Without this the distance computed in rowToMemoryItem
           // is dropped here, every semantic hit collapses to a flat score, and
@@ -1713,51 +1797,52 @@ export class MemoryManager {
     }
   }
 
-  private getRegisteredAgentRows(): Array<{ agentId: string; name: string; metadataJson: string; updatedAt: string }> {
+  private isAgentRegistrationLive(metadataJson?: string | null, now: number = Date.now()): boolean {
+    const metadata = this.parseAgentMetadata(metadataJson);
+    const expiresAt = metadata?.expiresAt || metadata?.expires_at;
+    if (typeof expiresAt !== 'string' || !expiresAt.trim()) return true;
+    const expiresAtMs = Date.parse(expiresAt);
+    return !Number.isFinite(expiresAtMs) || expiresAtMs > now;
+  }
+
+  private getRegisteredAgentRows(tenantId: string = 'default'): Array<{ agentId: string; name: string; metadataJson: string; updatedAt: string }> {
     try {
-      return this.db.prepare(
+      const rows = this.db.prepare(
         `SELECT agent_id as agentId, name, metadata_json as metadataJson, updated_at as updatedAt
          FROM agent_registrations
-         WHERE status = 'active'
+         WHERE tenant_id = ? AND status = 'active'
          ORDER BY updated_at DESC`
-      ).all() as Array<{ agentId: string; name: string; metadataJson: string; updatedAt: string }>;
+      ).all(tenantId) as Array<{ agentId: string; name: string; metadataJson: string; updatedAt: string }>;
+
+      const now = Date.now();
+      return rows.filter((row) => this.isAgentRegistrationLive(row.metadataJson, now));
     } catch {
       return [];
     }
   }
 
-  private getAgentIdentityRows(): Array<{ previousAgentId: string; updatedAgentId: string; updatedAt: string }> {
-    try {
-      return this.db.prepare(
-        `SELECT
-           previous_agent_id as previousAgentId,
-           updated_agent_id as updatedAgentId,
-           created_at as updatedAt
-         FROM agent_identity_changes
-         ORDER BY created_at DESC`
-      ).all() as Array<{ previousAgentId: string; updatedAgentId: string; updatedAt: string }>;
-    } catch {
-      return [];
-    }
-  }
-
-  private resolveAgentFamily(agentId: string): { aliases: string[]; canonical: string } {
+  /**
+   * Registration-derived grouping for status and presentation only; mailbox
+   * authorization and ENG-4 authorship use resolveMailboxIdentity instead. Historical
+   * identity-change rows are an unscoped audit log, not a live alias registry:
+   * treating them as an
+   * undirected transitive graph permanently joined reused handles and allowed
+   * the newest registration heartbeat to change another agent's canonical id.
+   */
+  private resolveAgentFamily(agentId: string, tenantId: string = 'default'): { aliases: string[]; canonical: string } {
     const requested = this.comparableAgentId(agentId);
     if (!requested) {
       return { aliases: [], canonical: '' };
     }
 
-    const registrations = this.getRegisteredAgentRows();
-    const identities = this.getAgentIdentityRows();
+    const registrations = this.getRegisteredAgentRows(tenantId);
     const normalized = this.normalizeAgentId(requested);
     const aliases = new Set<string>(this.getHeuristicAgentAliases(requested));
-    const queue = Array.from(aliases);
 
     const addAlias = (candidate?: string | null) => {
       const comparable = this.comparableAgentId(candidate || '');
       if (!comparable || aliases.has(comparable)) return;
       aliases.add(comparable);
-      queue.push(comparable);
     };
 
     for (const row of registrations) {
@@ -1781,28 +1866,6 @@ export class MemoryManager {
       }
     }
 
-    for (const row of identities) {
-      if (
-        this.normalizeAgentId(row.previousAgentId) === normalized ||
-        this.normalizeAgentId(row.updatedAgentId) === normalized
-      ) {
-        addAlias(row.previousAgentId);
-        addAlias(row.updatedAgentId);
-      }
-    }
-
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      for (const row of identities) {
-        if (this.comparableAgentId(row.previousAgentId) === current) {
-          addAlias(row.updatedAgentId);
-        }
-        if (this.comparableAgentId(row.updatedAgentId) === current) {
-          addAlias(row.previousAgentId);
-        }
-      }
-    }
-
     let canonical = requested;
     const aliasList = Array.from(aliases);
     const registeredMatches = registrations
@@ -1820,17 +1883,6 @@ export class MemoryManager {
     if (registeredMatches.length > 0) {
       const row = registeredMatches[0];
       canonical = this.inferCanonicalAgentId(row.agentId, row.name, this.parseAgentMetadata(row.metadataJson));
-    } else {
-      const identityMatches = identities
-        .filter((row) =>
-          aliasList.includes(this.comparableAgentId(row.previousAgentId)) ||
-          aliasList.includes(this.comparableAgentId(row.updatedAgentId))
-        )
-        .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-
-      if (identityMatches.length > 0) {
-        canonical = this.comparableAgentId(identityMatches[0].updatedAgentId) || requested;
-      }
     }
 
     if (!aliases.has(canonical)) {
@@ -1840,12 +1892,171 @@ export class MemoryManager {
     return { aliases: Array.from(aliases), canonical };
   }
 
-  public getAgentAliases(agentId: string): string[] {
-    return this.resolveAgentFamily(agentId).aliases;
+  public getAgentAliases(agentId: string, tenantId: string = 'default'): string[] {
+    return this.resolveAgentFamily(agentId, tenantId).aliases;
   }
 
-  public resolvePreferredAgentId(agentId: string): string {
-    return this.resolveAgentFamily(agentId).canonical || this.comparableAgentId(agentId);
+  public resolvePreferredAgentId(agentId: string, tenantId: string = 'default'): string {
+    return this.resolveAgentFamily(agentId, tenantId).canonical || this.comparableAgentId(agentId);
+  }
+
+  /**
+   * Resolve an address for mailbox authorization, delivery, and ENG-4
+   * authorship. Agent ids are opaque, exact handles: case, transport-looking
+   * suffixes, and every other character are identity-significant. Display
+   * aliases, registration metadata, and registration lifecycle must never
+   * change who can read an existing mailbox or own an existing checkpoint.
+   */
+  public resolveMailboxIdentity(
+    agentId: string,
+    _tenantId: string = 'default'
+  ): { aliases: string[]; canonical: string } {
+    if (typeof agentId !== 'string') return { aliases: [], canonical: '' };
+    const requested = agentId;
+    if (
+      requested.length < 1
+      || requested.length > 100
+      || !/^[A-Za-z0-9_.:-]+$/.test(requested)
+    ) {
+      return { aliases: [], canonical: '' };
+    }
+    return { aliases: [requested], canonical: requested };
+  }
+
+  public getMailboxAliases(agentId: string, tenantId: string = 'default'): string[] {
+    return this.resolveMailboxIdentity(agentId, tenantId).aliases;
+  }
+
+  public resolveMailboxAddress(agentId: string, tenantId: string = 'default'): string {
+    return this.resolveMailboxIdentity(agentId, tenantId).canonical;
+  }
+
+  /**
+   * Return whether a shared/search result contains private direct-message
+   * material. Kept public so the MCP search adapter can apply the same policy
+   * to graph-index exact matches, which bypass the broad SQL/vector search.
+   */
+  public isConfidentialMessageSearchItem(memoryType: unknown, content: unknown): boolean {
+    const normalizedMemoryType = String(memoryType || '').trim().toLowerCase();
+    const isGraphType = normalizedMemoryType === 'entity'
+      || normalizedMemoryType === 'observation'
+      || normalizedMemoryType === 'relation';
+    if (normalizedMemoryType === 'ai_message' || normalizedMemoryType === 'message_detail') {
+      return true;
+    }
+
+    let payload = content;
+    if (typeof payload === 'string') {
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        // Shared graph rows are JSON objects by contract. A malformed legacy
+        // row cannot be proven public, and returning its raw bytes would turn
+        // corruption into a confidentiality bypass.
+        return isGraphType;
+      }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return isGraphType;
+    }
+
+    const candidate = payload as Record<string, any>;
+    if ([candidate.entityType, candidate.type, candidate.memoryType, candidate.memory_type]
+      .some((domainType) => String(domainType || '').trim().toLowerCase() === 'message_detail')) {
+      return true;
+    }
+
+    // Historical private payload entities used msg-detail-* as a reserved
+    // canonical namespace. A damaged/imported row must not become public just
+    // because its domain discriminator was rewritten to `project` (or any
+    // other value). An alias in the reserved namespace makes the whole entity
+    // private too, because graph children can address the entity by that alias.
+    if (normalizedMemoryType === 'entity') {
+      const entityReferences = [
+        candidate.name,
+        ...(Array.isArray(candidate.aliases) ? candidate.aliases : []),
+      ];
+      if (entityReferences.some((reference) =>
+        typeof reference === 'string'
+        && this.normalizeEntityLookup(reference).startsWith('msg-detail-')
+      )) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private getConfidentialEntityReferences(tenantId: string): Set<string> {
+    const cached = this.confidentialEntityReferenceCache.get(tenantId);
+    if (cached) return cached;
+
+    const references = new Set<string>();
+    const rows = this.db.prepare(`
+      SELECT id, content, memory_type
+      FROM shared_memory
+      WHERE tenant_id = ?
+        AND LOWER(memory_type) IN ('entity', 'message_detail')
+    `).all(tenantId) as Array<{ id: string; memory_type: string; content: string }>;
+    for (const row of rows) {
+      let content: any;
+      try {
+        content = JSON.parse(row.content || '{}');
+      } catch {
+        // The row itself is fail-closed by isConfidentialGraphRow. Retain its
+        // opaque ID too so a still-valid child observation cannot expose bytes
+        // merely because its corrupt parent no longer yields a name or alias.
+        references.add(`id:${row.id}`);
+        continue;
+      }
+      if (!this.isConfidentialMessageSearchItem(row.memory_type, content)) continue;
+      references.add(`id:${row.id}`);
+      for (const value of [content.name, ...(Array.isArray(content.aliases) ? content.aliases : [])]) {
+        for (const variant of this.entityQueryVariants(value)) references.add(`name:${variant}`);
+      }
+    }
+    this.confidentialEntityReferenceCache.set(tenantId, references);
+    return references;
+  }
+
+  /** Resolve a private historical message-detail entity by exact ID/name/alias. */
+  public isConfidentialEntityReference(entityRef: unknown, tenantId: string = 'default'): boolean {
+    if (typeof entityRef !== 'string' || !entityRef.trim()) return false;
+    // Historical oversized-message entities used this reserved canonical
+    // namespace. Keep orphan child rows private even when the parent was
+    // already lost or cannot be safely reconstructed by migration 007.
+    if (this.normalizeEntityLookup(entityRef).startsWith('msg-detail-')) return true;
+    const references = this.getConfidentialEntityReferences(tenantId);
+    if (references.has(`id:${entityRef}`)) return true;
+    return this.entityQueryVariants(entityRef).some((variant) => references.has(`name:${variant}`));
+  }
+
+  /**
+   * Private-message confidentiality follows materialized child observations.
+   * Those rows must not become public merely because their storage type is
+   * `observation` rather than `entity`.
+   */
+  public isConfidentialGraphRow(
+    memoryType: unknown,
+    content: unknown,
+    tenantId: string = 'default'
+  ): boolean {
+    if (this.isConfidentialMessageSearchItem(memoryType, content)) return true;
+    const normalizedMemoryType = String(memoryType || '').trim().toLowerCase();
+    if (normalizedMemoryType !== 'observation' && normalizedMemoryType !== 'relation') return false;
+
+    let payload = content;
+    if (typeof payload === 'string') {
+      try { payload = JSON.parse(payload); } catch { return true; }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return true;
+    const graphRow = payload as Record<string, any>;
+    if (normalizedMemoryType === 'relation') {
+      return this.isConfidentialEntityReference(graphRow.from, tenantId)
+        || this.isConfidentialEntityReference(graphRow.to, tenantId);
+    }
+    if (this.isConfidentialEntityReference(graphRow.metadata?.entityId, tenantId)) return true;
+    return this.isConfidentialEntityReference(graphRow.entityName, tenantId);
   }
 
   getSharedMemory(): SharedMemory {
@@ -2148,7 +2359,9 @@ export class MemoryManager {
          WHERE tenant_id = ? AND memory_type = 'entity' AND LOWER(content) LIKE '%"type":"guardrail"%'
          ORDER BY created_at DESC LIMIT 10`
       ).all(tenantId) as any[];
-      bundle.guardrails = guardrailRows.map((r: any) => {
+      bundle.guardrails = guardrailRows
+        .filter((r: any) => !this.isConfidentialGraphRow('entity', r.content, tenantId))
+        .map((r: any) => {
         try {
           const parsed = JSON.parse(r.content);
           return { _wrapped: MemoryManager.wrapContent(JSON.stringify(parsed), 'guardrail', parsed.name || 'guardrail') };
@@ -2165,7 +2378,9 @@ export class MemoryManager {
       ).all(tenantId) as any[];
       if (hotRows.length > 0) {
         if (!bundle.project) bundle.project = {};
-        bundle.project.hotObservations = hotRows.map((r: any) => {
+      bundle.project.hotObservations = hotRows
+        .filter((r: any) => !this.isConfidentialGraphRow('observation', r.content, tenantId))
+        .map((r: any) => {
           try {
             const parsed = JSON.parse(r.content);
             return { _wrapped: MemoryManager.wrapContent(JSON.stringify(parsed), 'observation', parsed.entityName || 'hot', 'agent') };
@@ -2200,14 +2415,25 @@ export class MemoryManager {
         const projRow = this.db.prepare(
           `SELECT id, content, created_at FROM shared_memory
            WHERE tenant_id = ? AND memory_type = 'entity' AND LOWER(content) LIKE ?
+           AND NOT (
+             json_valid(content)
+             AND (
+               LOWER(TRIM(COALESCE(json_extract(content, '$.type'), ''))) = 'message_detail'
+               OR LOWER(TRIM(COALESCE(json_extract(content, '$.entityType'), ''))) = 'message_detail'
+               OR LOWER(TRIM(COALESCE(json_extract(content, '$.memoryType'), ''))) = 'message_detail'
+               OR LOWER(TRIM(COALESCE(json_extract(content, '$.memory_type'), ''))) = 'message_detail'
+             )
+           )
            ORDER BY created_at DESC LIMIT 1`
         ).get(tenantId, `%"name":"${projectId.toLowerCase()}"%`) as any;
         if (projRow) {
           try {
             const projData = JSON.parse(projRow.content);
-            const summaryText = projData.observations?.join('; ') || projData.name || projectId;
-            bundle.project._summaryWrapped = MemoryManager.wrapContent(summaryText, 'project_summary', projectId!, 'agent');
-            bundle.project._entityWrapped = MemoryManager.wrapContent(JSON.stringify(projData), 'entity', projectId!, 'agent');
+            if (!this.isConfidentialGraphRow('entity', projData, tenantId)) {
+              const summaryText = projData.observations?.join('; ') || projData.name || projectId;
+              bundle.project._summaryWrapped = MemoryManager.wrapContent(summaryText, 'project_summary', projectId!, 'agent');
+              bundle.project._entityWrapped = MemoryManager.wrapContent(JSON.stringify(projData), 'entity', projectId!, 'agent');
+            }
           } catch { /* ok */ }
         }
       } catch { /* ok */ }
@@ -2220,7 +2446,9 @@ export class MemoryManager {
            WHERE tenant_id = ? AND memory_type = 'observation' AND LOWER(content) LIKE ?
            AND created_at >= ? ORDER BY created_at DESC LIMIT 3`
         ).all(tenantId, `%${projectId.toLowerCase()}%`, thirtyDaysAgo) as any[];
-        bundle.project.recentObservations = obsRows.map((r: any) => {
+        bundle.project.recentObservations = obsRows
+          .filter((r: any) => !this.isConfidentialGraphRow('observation', r.content, tenantId))
+          .map((r: any) => {
           try {
             const parsed = JSON.parse(r.content);
             return { _wrapped: MemoryManager.wrapContent(JSON.stringify(parsed), 'observation', parsed.entityName || projectId!, 'agent') };
@@ -2248,7 +2476,9 @@ export class MemoryManager {
            WHERE tenant_id = ? AND memory_type = 'observation' AND LOWER(content) LIKE ?
            ORDER BY created_at DESC LIMIT 100`
         ).all(tenantId, `%${projectId.toLowerCase()}%`) as any[];
-        bundle.project.allObservations = allObs.map((r: any) => {
+        bundle.project.allObservations = allObs
+          .filter((r: any) => !this.isConfidentialGraphRow('observation', r.content, tenantId))
+          .map((r: any) => {
           try {
             const parsed = JSON.parse(r.content);
             return { _wrapped: MemoryManager.wrapContent(JSON.stringify(parsed), 'observation', parsed.entityName || projectId!, 'agent') };
@@ -2260,9 +2490,20 @@ export class MemoryManager {
         const allEntities = this.db.prepare(
           `SELECT id, content, created_at FROM shared_memory
            WHERE tenant_id = ? AND memory_type = 'entity' AND LOWER(content) LIKE ?
+           AND NOT (
+             json_valid(content)
+             AND (
+               LOWER(TRIM(COALESCE(json_extract(content, '$.type'), ''))) = 'message_detail'
+               OR LOWER(TRIM(COALESCE(json_extract(content, '$.entityType'), ''))) = 'message_detail'
+               OR LOWER(TRIM(COALESCE(json_extract(content, '$.memoryType'), ''))) = 'message_detail'
+               OR LOWER(TRIM(COALESCE(json_extract(content, '$.memory_type'), ''))) = 'message_detail'
+             )
+           )
            ORDER BY created_at DESC LIMIT 50`
         ).all(tenantId, `%${projectId.toLowerCase()}%`) as any[];
-        bundle.project.allEntities = allEntities.map((r: any) => {
+        bundle.project.allEntities = allEntities
+          .filter((r: any) => !this.isConfidentialGraphRow('entity', r.content, tenantId))
+          .map((r: any) => {
           try {
             const parsed = JSON.parse(r.content);
             return { _wrapped: MemoryManager.wrapContent(JSON.stringify(parsed), 'entity', parsed.name || projectId!, 'agent') };
@@ -2553,27 +2794,6 @@ export class MemoryManager {
     const fromActorId = context?.userId || context?.apiKeyId || null;
     const summary = MemoryManager.generateSummary(content);
 
-    // Write-side auto-split: offload large messages to entity observation
-    let storedContent = content;
-    if (content.length > 3000) {
-      const entityName = `msg-detail-${id}`;
-      try {
-        await this.store(from, {
-          name: entityName,
-          type: 'message_detail',
-          observations: [content],
-          createdBy: from,
-          timestamp: new Date().toISOString(),
-        }, 'shared', 'entity', tenantId, context);
-        const detailAgentId = to && to !== '*' ? to : '<your-agent-id>';
-        storedContent = `Full content stored as entity "${entityName}". To read the full message, call: get_message_detail({ messageId: "${id}", agentId: "${detailAgentId}" }). You can also inspect the entity via search_entities("${entityName}").`;
-        console.log(`📦 Auto-split oversized message (${content.length} chars) → entity ${entityName}`);
-      } catch {
-        // If entity creation fails, store full content as fallback
-        storedContent = content;
-      }
-    }
-
     try {
       this.ensureSummaryColumn();
       this.ensureMessageSupersessionColumns();
@@ -2589,10 +2809,10 @@ export class MemoryManager {
       const requestedSupersedes = Array.from(new Set(
         supersedes.filter((candidate) => typeof candidate === 'string' && candidate.trim()).map((candidate) => candidate.trim())
       )).slice(0, 100);
-      const senderAliases = this.getAgentAliases(from);
-      const recipientAliases = this.getAgentAliases(to);
+      const senderAliases = this.getMailboxAliases(from, tenantId);
+      const recipientAliases = this.getMailboxAliases(to, tenantId);
       const write = this.db.transaction(() => {
-        stmt.run(id, from, to, storedContent, messageType, priority, JSON.stringify(storedMetadata), tenantId, fromActorType, fromActorId, summary);
+        stmt.run(id, from, to, content, messageType, priority, JSON.stringify(storedMetadata), tenantId, fromActorType, fromActorId, summary);
         if (requestedSupersedes.length === 0) return;
 
         const idPlaceholders = requestedSupersedes.map(() => '?').join(',');
@@ -2640,26 +2860,6 @@ export class MemoryManager {
       throw err;
     }
 
-    // Also store in vector index for semantic search if available.
-    if (this.isAdvancedSystemsEnabled && this.vectorClient) {
-      try {
-        await this.vectorClient.storeMemory({
-          id,
-          agentId: from,
-          tenantId,
-          type: 'ai_message' as any,
-          content: content,
-          timestamp: Date.now(),
-          tags: ['message', messageType],
-          priority: priority === 'urgent' ? 10 : priority === 'high' ? 7 : 5,
-          relationships: [],
-          metadata: { to, messageType, priority },
-        });
-      } catch {
-        // Non-critical: vector write failure shouldn't break messaging.
-      }
-    }
-
     console.log(`💬 Stored message: ${from} → ${to} [${messageType}]`);
     return id;
   }
@@ -2688,8 +2888,12 @@ export class MemoryManager {
       : 0;
     const tenantId = options.tenantId || 'default';
     const compact = options.compact !== false; // default true
-    const recipientAliases = this.getAgentAliases(agentId);
-    const senderAliases = options.from ? this.getAgentAliases(options.from) : [];
+    const recipientAliases = this.getMailboxAliases(agentId, tenantId);
+    const senderAliases = options.from ? this.getMailboxAliases(options.from, tenantId) : [];
+
+    if (recipientAliases.length === 0) {
+      return { messages: [], totalMatching: 0, limit, offset };
+    }
 
     try {
       // Ensure read_at + archived_at + summary columns exist (idempotent migration)
@@ -2794,23 +2998,27 @@ export class MemoryManager {
       ? Math.max(0, Math.floor(options.offset!))
       : 0;
     const tenantId = options.tenantId || 'default';
-    const recipientAliases = this.getAgentAliases(agentId);
-    const senderAliases = options.from ? this.getAgentAliases(options.from) : [];
+    const recipientAliases = this.getMailboxAliases(agentId, tenantId);
+    const senderAliases = options.from ? this.getMailboxAliases(options.from, tenantId) : [];
+
+    if (recipientAliases.length === 0) {
+      return { messages: [], totalMatching: 0, limit, offset };
+    }
 
     try {
       const safeContent = `CASE WHEN json_valid(content) THEN content ELSE '{}' END`;
-      const recipientExpression = `LOWER(TRIM(COALESCE(
+      const recipientExpression = `COALESCE(
         json_extract(${safeContent}, '$.to'),
         json_extract(${safeContent}, '$.target'),
         json_extract(${safeContent}, '$.to_agent'),
         ''
-      )))`;
-      const senderExpression = `LOWER(TRIM(COALESCE(
+      )`;
+      const senderExpression = `COALESCE(
         json_extract(${safeContent}, '$.from'),
         json_extract(${safeContent}, '$.from_agent'),
         created_by,
         ''
-      )))`;
+      )`;
       const messageTypeExpression = `COALESCE(
         json_extract(${safeContent}, '$.messageType'),
         json_extract(${safeContent}, '$.type'),
@@ -2882,11 +3090,12 @@ export class MemoryManager {
    */
   async getMessageById(
     messageId: string,
+    agentId: string,
     markAsRead: boolean = true,
-    tenantId: string = 'default',
-    agentId?: string
+    tenantId: string = 'default'
   ): Promise<any | null> {
-    const recipientAliases = agentId ? this.getAgentAliases(agentId) : [];
+    const recipientAliases = this.getMailboxAliases(agentId, tenantId);
+    if (recipientAliases.length === 0) return null;
     try {
       this.ensureReadAtColumn();
       this.ensureSummaryColumn();
@@ -2912,15 +3121,31 @@ export class MemoryManager {
           .run(now, messageId);
         msg.read_at = now;
       }
-      // Resolve auto-split pointer: if content references an entity, fetch the full content
+      // Historical compatibility only: resolve pre-containment auto-split
+      // pointers through a direct tenant-scoped lookup. Generic entity search
+      // deliberately excludes these private payload entities.
       const pointerMatch = msg.content?.match(/^Full content stored as entity "([^"]+)"/);
       if (pointerMatch) {
         const entityName = pointerMatch[1];
         try {
-          const results = await this.search(entityName, 'shared', tenantId);
-          const entity = results.find((r: any) => r?.content?.name === entityName);
-          if (entity?.content?.observations?.length) {
-            msg.content = entity.content.observations[0];
+          const entityRow = this.db.prepare(`
+            SELECT content
+            FROM shared_memory
+            WHERE tenant_id = ?
+              AND memory_type = 'entity'
+              AND json_valid(content)
+              AND LOWER(json_extract(content, '$.name')) = LOWER(?)
+              AND LOWER(TRIM(COALESCE(
+                json_extract(content, '$.type'),
+                json_extract(content, '$.entityType'),
+                ''
+              ))) = 'message_detail'
+            ORDER BY created_at DESC
+            LIMIT 1
+          `).get(tenantId, entityName) as { content: string } | undefined;
+          const entity = entityRow ? JSON.parse(entityRow.content) : null;
+          if (entity?.observations?.length) {
+            msg.content = entity.observations[0];
             msg._resolvedFrom = entityName;
           }
         } catch {
@@ -2946,7 +3171,7 @@ export class MemoryManager {
         }
 
         const toAgent = payload.to || payload.target || payload.to_agent;
-        if (recipientAliases.length > 0 && !recipientAliases.includes(this.comparableAgentId(toAgent))) return null;
+        if (!recipientAliases.includes(toAgent)) return null;
 
         const fromAgent = payload.from || payload.from_agent || row.created_by;
         const content = String(payload.content ?? payload.message ?? '');
@@ -3001,6 +3226,18 @@ export class MemoryManager {
     const canonicalKey = this.normalizeEntityLookup(entityName);
     const maxWindow = 100;
     const boundedWindow = Math.max(1, Math.min(Number(windowSize) || 25, maxWindow));
+    if (this.isConfidentialEntityReference(entityName, tenantId)) {
+      return {
+        entity: entityName,
+        canonicalKey,
+        current: null,
+        resolution: {
+          windowSize: boundedWindow,
+          candidatesInWindow: 0,
+          supersededSkipped: 0,
+        },
+      };
+    }
 
     const fetchWindow = (limit: number) => {
       const rows = this.db.prepare(`
@@ -3023,7 +3260,9 @@ export class MemoryManager {
         let content: any;
         try { content = JSON.parse(row.content); } catch { content = { raw: row.content }; }
         return { row, content };
-      });
+      }).filter(({ row }) =>
+        !this.isConfidentialGraphRow('observation', row.content, tenantId)
+      );
 
       const supersededIds = new Set<string>();
       for (const { content } of parsed) {
@@ -3109,6 +3348,9 @@ export class MemoryManager {
         `SELECT id, memory_type, content, created_by, created_at FROM shared_memory WHERE id = ? AND tenant_id = ?`
       ).get(entityId, tenantId) as any;
       if (row) {
+        if (this.isConfidentialGraphRow(row.memory_type, row.content, tenantId)) {
+          return null;
+        }
         let content: any;
         try { content = JSON.parse(row.content); } catch { content = { raw: row.content, type: row.memory_type }; }
         return { id: row.id, sourceTable: 'shared_memory', type: 'shared', memoryType: row.memory_type, content, source: row.created_by, createdAt: row.created_at };
@@ -3154,7 +3396,8 @@ export class MemoryManager {
    * Count unread, non-archived messages for an agent within a tenant.
    */
   countUnreadMessages(agentId: string, tenantId: string = 'default'): number {
-    const recipientAliases = this.getAgentAliases(agentId);
+    const recipientAliases = this.getMailboxAliases(agentId, tenantId);
+    if (recipientAliases.length === 0) return 0;
     try {
       this.ensureReadAtColumn();
       this.ensureArchivedAtColumn();
@@ -3178,7 +3421,7 @@ export class MemoryManager {
           try {
             const payload = JSON.parse(row.content || '{}');
             const toAgent = payload.to || payload.target || payload.to_agent;
-            if (recipientAliases.includes(this.comparableAgentId(toAgent))) count += 1;
+            if (recipientAliases.includes(toAgent)) count += 1;
           } catch {
             // ignore malformed row
           }
@@ -3249,7 +3492,8 @@ export class MemoryManager {
     this.ensureReadAtColumn();
     this.ensureMessageDeliveryColumn();
     const now = new Date().toISOString();
-    const recipientAliases = this.getAgentAliases(agentId);
+    const recipientAliases = this.getMailboxAliases(agentId, tenantId);
+    if (recipientAliases.length === 0) return 0;
     const recipientPlaceholders = recipientAliases.map(() => '?').join(',');
 
     if (messageIds && messageIds.length > 0) {
@@ -3315,7 +3559,10 @@ export class MemoryManager {
     this.ensureMessageDeliveryColumn();
     this.ensureMessageSupersessionColumns();
     const now = new Date().toISOString();
-    const recipientAliases = this.getAgentAliases(agentId);
+    const recipientAliases = this.getMailboxAliases(agentId, tenantId);
+    if (recipientAliases.length === 0) {
+      return { archived: 0, markedAsRead: 0, remainingUnarchived: 0, remainingUnread: 0 };
+    }
     const recipientPlaceholders = recipientAliases.map(() => '?').join(',');
     const scopedIds = Array.isArray(messageIds) ? messageIds : [];
     const byId = scopedIds.length > 0;
@@ -3534,9 +3781,13 @@ export class MemoryManager {
 
     // entityName mode: observations-only
     if (entityName) {
+      if (this.isConfidentialEntityReference(entityName, tenantId)) {
+        return { observations: [], nextCursor: null, totals: { observations: 0 } };
+      }
       let obsQuery = `SELECT id, content, created_at, updated_at FROM shared_memory
         WHERE tenant_id = ? AND memory_type = 'observation'
-        AND json_extract(content, '$.entityName') = ?`;
+        AND CASE WHEN json_valid(content)
+          THEN json_extract(content, '$.entityName') END = ?`;
       const obsParams: any[] = [tenantId, entityName];
       if (updatedSince) {
         obsQuery += ' AND updated_at >= ?';
@@ -3545,7 +3796,7 @@ export class MemoryManager {
       obsQuery += ' ORDER BY created_at ASC';
 
       const allObs = this.db.prepare(obsQuery).all(...obsParams) as any[];
-      const filtered = this.filterAndMapObservations(allObs, canSeeSensitive);
+      const filtered = this.filterAndMapObservations(allObs, canSeeSensitive, tenantId);
 
       // Apply pagination to filtered observations
       const paged = filtered.observations.slice(offset, offset + limit);
@@ -3565,7 +3816,16 @@ export class MemoryManager {
     // Full mode: nodes + links + optional observations
     // Nodes (entities)
     let entityQuery = `SELECT id, content, created_at, updated_at FROM shared_memory
-      WHERE tenant_id = ? AND memory_type = 'entity'`;
+      WHERE tenant_id = ? AND memory_type = 'entity'
+      AND NOT (
+        json_valid(content)
+        AND (
+          LOWER(TRIM(COALESCE(json_extract(content, '$.type'), ''))) = 'message_detail'
+          OR LOWER(TRIM(COALESCE(json_extract(content, '$.entityType'), ''))) = 'message_detail'
+          OR LOWER(TRIM(COALESCE(json_extract(content, '$.memoryType'), ''))) = 'message_detail'
+          OR LOWER(TRIM(COALESCE(json_extract(content, '$.memory_type'), ''))) = 'message_detail'
+        )
+      )`;
     const entityParams: any[] = [tenantId];
     if (updatedSince) {
       entityQuery += ' AND updated_at >= ?';
@@ -3573,17 +3833,26 @@ export class MemoryManager {
     }
     entityQuery += ' ORDER BY created_at ASC';
 
-    const entityRows = this.db.prepare(entityQuery).all(...entityParams) as any[];
+    const entityRows = (this.db.prepare(entityQuery).all(...entityParams) as any[]).filter((row: any) =>
+      !this.isConfidentialGraphRow('entity', row.content, tenantId)
+    );
     const updTracker = { max: undefined as string | undefined };
 
     const nodes = entityRows.map((row: any) => {
       const content = JSON.parse(row.content);
-      // Count observations for this entity
+      // Count only public observations for this entity. A corrupt historical
+      // child can carry a public-looking entityName while metadata.entityId
+      // still points at private mailbox data; including it in this aggregate
+      // would leak private-row existence even when the body is filtered.
       const obsCount = (this.db.prepare(
-        `SELECT COUNT(*) as cnt FROM shared_memory
+        `SELECT content FROM shared_memory
          WHERE tenant_id = ? AND memory_type = 'observation'
-         AND json_extract(content, '$.entityName') = ?`
-      ).get(tenantId, content.name) as any)?.cnt || 0;
+         AND CASE WHEN json_valid(content)
+           THEN json_extract(content, '$.entityName') END = ?`
+      ).all(tenantId, content.name) as Array<{ content: string }>)
+        .filter((observation) =>
+          !this.isConfidentialGraphRow('observation', observation.content, tenantId)
+        ).length;
 
       // Track max updated_at from included entity rows
       if (row.updated_at && (!updTracker.max || row.updated_at > updTracker.max)) {
@@ -3609,7 +3878,9 @@ export class MemoryManager {
     }
     relQuery += ' ORDER BY created_at ASC';
 
-    const relRows = this.db.prepare(relQuery).all(...relParams) as any[];
+    const relRows = (this.db.prepare(relQuery).all(...relParams) as any[]).filter((row: any) =>
+      !this.isConfidentialGraphRow('relation', row.content, tenantId)
+    );
     const links = relRows.map((row: any) => {
       const content = JSON.parse(row.content);
       // Track max updated_at from included relation rows
@@ -3637,7 +3908,7 @@ export class MemoryManager {
       obsQuery += ' ORDER BY created_at ASC';
 
       const allObs = this.db.prepare(obsQuery).all(...obsParams) as any[];
-      const filtered = this.filterAndMapObservations(allObs, canSeeSensitive);
+      const filtered = this.filterAndMapObservations(allObs, canSeeSensitive, tenantId);
       totalObs = filtered.observations.length;
       observations = filtered.observations;
       // Include observation max in overall max
@@ -3670,11 +3941,23 @@ export class MemoryManager {
   /**
    * Filter observations by sensitivity and map to export shape.
    */
-  private filterAndMapObservations(rows: any[], canSeeSensitive: boolean): { observations: any[]; maxUpdatedAt: string | null } {
+  private filterAndMapObservations(
+    rows: any[],
+    canSeeSensitive: boolean,
+    tenantId: string
+  ): { observations: any[]; maxUpdatedAt: string | null } {
     const result: any[] = [];
     let maxUpdatedAt: string | null = null;
     for (const row of rows) {
-      const content = JSON.parse(row.content);
+      if (this.isConfidentialGraphRow('observation', row.content, tenantId)) continue;
+      let content: any;
+      try {
+        content = JSON.parse(row.content);
+      } catch {
+        // The classifier above rejects malformed graph rows. Keep this guard
+        // for concurrent/corrupt storage rather than failing the whole export.
+        continue;
+      }
       const isSensitive = MemoryManager.classifyObservationSensitivity(content);
       if (isSensitive && !canSeeSensitive) continue;
       result.push({
@@ -3846,6 +4129,13 @@ export class MemoryManager {
   ): void {
     if (!this.isGraphMemoryType(memoryType)) return;
 
+    // Entity writes can create, remove, or rename a historical private
+    // message-detail reference (including its aliases). Invalidate before any
+    // caller can classify materialized observations against stale state.
+    if (memoryType === 'entity') {
+      this.confidentialEntityReferenceCache.delete(tenantId);
+    }
+
     try {
       const replace = this.db.transaction(() => {
         this.replaceGraphLookupIndexForMemory(memoryId, tenantId, memoryType, content);
@@ -3857,6 +4147,16 @@ export class MemoryManager {
   }
 
   public rebuildGraphLookupIndex(tenantId?: string): { rowsIndexed: number; keysIndexed: number } {
+    // A rebuild is also a synchronization boundary for the private-entity
+    // reference cache. Direct database maintenance can change an entity's
+    // name/aliases without passing through store(), so never classify child
+    // observations against references captured before the rebuild.
+    if (tenantId) {
+      this.confidentialEntityReferenceCache.delete(tenantId);
+    } else {
+      this.confidentialEntityReferenceCache.clear();
+    }
+
     const params: any[] = [];
     let where = "WHERE memory_type IN ('entity', 'observation', 'relation')";
     if (tenantId) {
@@ -3914,6 +4214,12 @@ export class MemoryManager {
     });
     rebuild();
 
+    if (tenantId) {
+      this.confidentialEntityReferenceCache.delete(tenantId);
+    } else {
+      this.confidentialEntityReferenceCache.clear();
+    }
+
     return { rowsIndexed, keysIndexed };
   }
 
@@ -3926,6 +4232,12 @@ export class MemoryManager {
     context?: RequestContext
   ): Promise<any[]> {
     if (!Array.isArray(observations) || observations.length === 0) return [];
+    if (
+      this.isConfidentialEntityReference(entityId, tenantId)
+      || this.isConfidentialEntityReference(entityName, tenantId)
+    ) {
+      throw new Error('message_detail is reserved for private mailbox compatibility');
+    }
 
     const materialized: any[] = [];
     let validInlineObservationCount = 0;
@@ -3941,6 +4253,7 @@ export class MemoryManager {
          FROM shared_memory
          WHERE tenant_id = ?
            AND memory_type = 'observation'
+           AND json_valid(content)
            AND json_extract(content, '$.metadata.inlineKey') = ?
          LIMIT 1`
       ).get(tenantId, inlineKey) as any;
@@ -4364,20 +4677,14 @@ export class MemoryManager {
   }
 
   /**
-   * ENG-4 narrow surface (2a): canonical agent family for an ASSERTED agent
-   * id — authorship/acks/views belong to the canonical id; the raw asserted
-   * id is audit-only (approved contract @ 89fc422).
+   * ENG-4 narrow surface (2a): tenant-scoped mailbox identity for an ASSERTED
+   * agent id. Authorship/acks/views must never use the broader status family,
+   * where display names and metadata aliases are intentionally presentation
+   * inputs. The raw asserted id remains audit-only (approved contract @
+   * 89fc422).
    */
-  resolveCanonicalAgent(agentId: string): { canonical: string; aliases: string[] } {
-    const family = this.resolveAgentFamily(agentId);
-    const comparable = this.comparableAgentId(agentId);
-    let canonical = family.canonical || comparable || agentId;
-    // Bare-store fallback: with no registration/identity mapping,
-    // resolveAgentFamily returns the requested id verbatim — but the
-    // ONE-AUTHOR rule requires suffix aliases (-cli, -ide-agent) to share
-    // one canonical id, so apply the store's own heuristic normalization.
-    if (canonical === comparable) canonical = this.normalizeAgentId(comparable);
-    return { canonical, aliases: family.aliases };
+  resolveCanonicalAgent(agentId: string, tenantId: string = 'default'): { canonical: string; aliases: string[] } {
+    return this.resolveMailboxIdentity(agentId, tenantId);
   }
 
   /**
@@ -4393,6 +4700,7 @@ export class MemoryManager {
     if (!row) return null;
     try {
       const content = JSON.parse(row.content || '{}');
+      if (this.isConfidentialMessageSearchItem('entity', content)) return null;
       if (typeof content?.description === 'string' && content.description.trim()) return content.description;
       if (typeof content?.definition === 'string' && content.definition.trim()) return content.definition;
       const founding = Array.isArray(content?.observations)
@@ -4410,7 +4718,13 @@ export class MemoryManager {
 
     const indexed = this.findRowsByLookupIndexValues(queryVariants, tenantId, ['entity']);
     if (indexed.usedIndex) {
-      return indexed.rows;
+      return indexed.rows.filter((row: any) => {
+        try {
+          return !this.isConfidentialMessageSearchItem('entity', JSON.parse(row.content || '{}'));
+        } catch {
+          return false;
+        }
+      });
     }
 
     const rows = this.db.prepare(
@@ -4422,6 +4736,7 @@ export class MemoryManager {
     return rows.filter((row: any) => {
       try {
         const content = JSON.parse(row.content || '{}');
+        if (this.isConfidentialMessageSearchItem('entity', content)) return false;
         return this.entityNameAndAliasLookupValues(content).some((value) => queryVariants.has(value));
       } catch {
         return false;
@@ -4442,7 +4757,9 @@ export class MemoryManager {
 
     const indexed = this.findRowsByLookupIndexValues(indexedLookupValues, tenantId, ['observation']);
     if (indexed.usedIndex) {
-      return indexed.rows;
+      return indexed.rows.filter((row: any) =>
+        !this.isConfidentialGraphRow('observation', row.content, tenantId)
+      );
     }
 
     const rows = this.db.prepare(
@@ -4454,6 +4771,7 @@ export class MemoryManager {
     return rows.filter((row: any) => {
       try {
         const content = JSON.parse(row.content || '{}');
+        if (this.isConfidentialGraphRow('observation', content, tenantId)) return false;
         const values = this.entityLookupValues(content);
         const entityValues = this.entityLookupValues({ entityName: content.entityName });
         return values.some((value) => queryVariants.has(value)) ||
@@ -4475,7 +4793,9 @@ export class MemoryManager {
 
     const indexed = this.findRowsByLookupIndexValues(indexedLookupValues, tenantId, ['relation']);
     if (indexed.usedIndex) {
-      return indexed.rows;
+      return indexed.rows.filter((row: any) =>
+        !this.isConfidentialGraphRow('relation', row.content, tenantId)
+      );
     }
 
     const rows = this.db.prepare(
@@ -4487,6 +4807,7 @@ export class MemoryManager {
     return rows.filter((row: any) => {
       try {
         const content = JSON.parse(row.content || '{}');
+        if (this.isConfidentialGraphRow('relation', content, tenantId)) return false;
         const values = [
           ...this.entityLookupValues(content),
           ...this.entityLookupValues({ entityName: content.from }),
@@ -4507,6 +4828,7 @@ export class MemoryManager {
     return this.db.prepare(
       `SELECT id, content, created_by, created_at, owner_actor_type, owner_actor_id FROM shared_memory
        WHERE tenant_id = ? AND memory_type = 'entity'
+       AND json_valid(content)
        AND LOWER(json_extract(content, '$.name')) = LOWER(?)`
     ).all(tenantId, entityName) as any[];
   }
@@ -4515,9 +4837,28 @@ export class MemoryManager {
    * Find observation rows for an entity (case-insensitive, tenant-scoped).
    */
   findObservationsByEntity(entityName: string, tenantId: string): any[] {
+    const rows = this.db.prepare(
+      `SELECT id, content, created_by, created_at, owner_actor_type, owner_actor_id FROM shared_memory
+       WHERE tenant_id = ? AND memory_type = 'observation'
+       AND json_valid(content)
+       AND LOWER(json_extract(content, '$.entityName')) = LOWER(?)`
+    ).all(tenantId, entityName) as any[];
+    return rows.filter((row: any) =>
+      !this.isConfidentialGraphRow('observation', row.content, tenantId)
+    );
+  }
+
+  /**
+   * Fetch raw observation mutation candidates. Read helpers intentionally
+   * hide private children; mutation handlers instead need to see them so an
+   * explicitly targeted private row causes the whole operation to fail closed
+   * rather than being silently omitted from a partial delete.
+   */
+  findObservationRowsForMutation(entityName: string, tenantId: string): any[] {
     return this.db.prepare(
       `SELECT id, content, created_by, created_at, owner_actor_type, owner_actor_id FROM shared_memory
        WHERE tenant_id = ? AND memory_type = 'observation'
+       AND json_valid(content)
        AND LOWER(json_extract(content, '$.entityName')) = LOWER(?)`
     ).all(tenantId, entityName) as any[];
   }
@@ -4526,12 +4867,16 @@ export class MemoryManager {
    * Find relation rows involving an entity (case-insensitive, tenant-scoped).
    */
   findRelationsByEntity(entityName: string, tenantId: string): any[] {
-    return this.db.prepare(
+    const rows = this.db.prepare(
       `SELECT id, content, created_by, created_at, owner_actor_type, owner_actor_id FROM shared_memory
        WHERE tenant_id = ? AND memory_type = 'relation'
+       AND json_valid(content)
        AND (LOWER(json_extract(content, '$.from')) = LOWER(?)
             OR LOWER(json_extract(content, '$.to')) = LOWER(?))`
     ).all(tenantId, entityName, entityName) as any[];
+    return rows.filter((row: any) =>
+      !this.isConfidentialGraphRow('relation', row.content, tenantId)
+    );
   }
 
   /**
@@ -4581,6 +4926,7 @@ export class MemoryManager {
 
     const sql = `SELECT id, content, created_by, created_at, owner_actor_type, owner_actor_id FROM shared_memory
        WHERE tenant_id = ? AND memory_type = 'observation'
+       AND json_valid(content)
        AND LOWER(json_extract(content, '$.entityName')) = LOWER(?)
        AND (${likeConditions})`;
 
@@ -4602,6 +4948,22 @@ export class MemoryManager {
       return { deleted: 0, vectorCleanup: 0, vectorFailures: 0, weaviateCleanup: 0, weaviateFailures: 0 };
     }
 
+    // This is the common sink for generic graph mutation handlers. Inspect the
+    // original, full rows before deleting anything so a filtered private
+    // entity/observation/relation cannot be mutated by ID. Migration tooling
+    // that deliberately removes legacy private residue uses its own audited
+    // transaction rather than this public graph-mutation path.
+    const guardPlaceholders = ids.map(() => '?').join(',');
+    const targetRows = this.db.prepare(
+      `SELECT id, memory_type, content FROM shared_memory
+       WHERE tenant_id = ? AND id IN (${guardPlaceholders})`
+    ).all(tenantId, ...ids) as Array<{ id: string; memory_type: string; content: string }>;
+    if (targetRows.some((row) =>
+      this.isConfidentialGraphRow(row.memory_type, row.content, tenantId)
+    )) {
+      throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
+    }
+
     // SQLite transaction delete
     const placeholders = ids.map(() => '?').join(',');
     const txn = this.db.transaction(() => {
@@ -4609,8 +4971,8 @@ export class MemoryManager {
         `DELETE FROM graph_lookup_keys WHERE tenant_id = ? AND memory_id IN (${placeholders})`
       ).run(tenantId, ...ids);
       return this.db.prepare(
-        `DELETE FROM shared_memory WHERE id IN (${placeholders})`
-      ).run(...ids);
+        `DELETE FROM shared_memory WHERE tenant_id = ? AND id IN (${placeholders})`
+      ).run(tenantId, ...ids);
     });
     const result = txn();
 
@@ -4671,6 +5033,10 @@ export class MemoryManager {
       updatedContentObj = JSON.parse(row.content);
     } catch {
       throw new Error(`Failed to parse observation content for ${obsId}`);
+    }
+
+    if (this.isConfidentialGraphRow('observation', updatedContentObj, tenantId)) {
+      throw new Error('message_detail graph rows are private mailbox data and cannot be mutated generically');
     }
 
     // Replace at contentIndex within contents array, or replace entire content field
@@ -4813,6 +5179,7 @@ export class MemoryManager {
       `SELECT id, content, created_by, tags, created_at, updated_at, owner_actor_type, owner_actor_id
        FROM shared_memory
        WHERE tenant_id = ? AND memory_type = 'entity'
+       AND json_valid(content)
        AND LOWER(json_extract(content, '$.name')) LIKE LOWER(? || '%')
        ORDER BY created_at ASC`
     ).all(tenantId, prefix) as any[];
@@ -4826,6 +5193,7 @@ export class MemoryManager {
       `SELECT DISTINCT SUBSTR(json_extract(content, '$.name'), 1,
         INSTR(json_extract(content, '$.name'), '-') - 1) as prefix
        FROM shared_memory WHERE tenant_id = ? AND memory_type = 'entity'
+       AND json_valid(content)
        AND json_extract(content, '$.name') LIKE '%-%'
        ORDER BY prefix ASC`
     ).all(tenantId) as any[];
@@ -4852,6 +5220,13 @@ export class MemoryManager {
       throw new Error('Must provide namePrefix or entityNames');
     }
 
+    // Data-management exports are portable shared-graph backups, not mailbox
+    // backups. Historical message_detail entities contain direct-message
+    // bodies and must never cross this generic boundary.
+    entities = entities.filter((row) =>
+      !this.isConfidentialGraphRow('entity', row.content, tenantId)
+    );
+
     // Extract entity names from results
     const entityNameSet = new Set<string>();
     for (const e of entities) {
@@ -4866,12 +5241,17 @@ export class MemoryManager {
     for (const name of entityNameSet) {
       observations.push(...this.findObservationsByEntity(name, tenantId));
     }
+    const publicObservations = observations.filter((row) =>
+      !this.isConfidentialGraphRow('observation', row.content, tenantId)
+    );
 
     // Collect relations (deduplicate by id)
     const relationMap = new Map<string, any>();
     for (const name of entityNameSet) {
       for (const rel of this.findRelationsByEntity(name, tenantId)) {
-        relationMap.set(rel.id, rel);
+        if (!this.isConfidentialGraphRow('relation', rel.content, tenantId)) {
+          relationMap.set(rel.id, rel);
+        }
       }
     }
     const relations = Array.from(relationMap.values());
@@ -4881,9 +5261,9 @@ export class MemoryManager {
       exportedAt: new Date().toISOString(),
       source: 'neural-ai-collaboration',
       filter: { namePrefix: namePrefix || null, entityNames: explicitNames || null, tenantId },
-      counts: { entities: entities.length, observations: observations.length, relations: relations.length },
+      counts: { entities: entities.length, observations: publicObservations.length, relations: relations.length },
       entities,
-      observations,
+      observations: publicObservations,
       relations,
     };
   }
@@ -4906,15 +5286,110 @@ export class MemoryManager {
       errors: [] as string[],
     };
 
+    // Import validation must see the current database, even if an operator or
+    // maintenance job changed entity rows without going through store().
+    this.confidentialEntityReferenceCache.delete(tenantId);
+
+    const privateReferences = new Set(this.getConfidentialEntityReferences(tenantId));
+    const parseRowContent = (row: any, memoryType: string): Record<string, any> => {
+      if (!row || typeof row.content !== 'string') {
+        throw new Error(`${memoryType} content must be a JSON string`);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.content);
+      } catch {
+        throw new Error(`${memoryType} content must be valid JSON`);
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`${memoryType} content must be a JSON object`);
+      }
+      return parsed as Record<string, any>;
+    };
+    const addPrivateEntityReferences = (row: any, content: Record<string, any>) => {
+      if (typeof row?.id === 'string' && row.id) {
+        privateReferences.add(`id:${row.id}`);
+      }
+      const names = [
+        content.name,
+        ...(Array.isArray(content.aliases) ? content.aliases : []),
+      ];
+      for (const name of names) {
+        if (typeof name !== 'string') continue;
+        for (const variant of this.entityQueryVariants(name)) {
+          privateReferences.add(`name:${variant}`);
+        }
+      }
+    };
+    const isPrivateReference = (value: unknown): boolean => {
+      if (typeof value !== 'string' || !value.trim()) return false;
+      if (this.isConfidentialEntityReference(value, tenantId)) return true;
+      if (privateReferences.has(`id:${value}`)) return true;
+      return this.entityQueryVariants(value)
+        .some((variant) => privateReferences.has(`name:${variant}`));
+    };
+
+    // Pre-scan the entire payload so observations cannot evade the boundary by
+    // preceding a private entity, or by referring to a private entity that is
+    // itself rejected rather than inserted.
+    for (const row of (backup.entities || [])) {
+      try {
+        const content = parseRowContent(row, 'entity');
+        if (this.isConfidentialMessageSearchItem('entity', content)) {
+          addPrivateEntityReferences(row, content);
+        }
+      } catch {
+        // The row-level importer below reports malformed content consistently.
+      }
+    }
+
     const insertStmt = this.db.prepare(
       `INSERT OR IGNORE INTO shared_memory (id, tenant_id, memory_type, content, created_by, tags, created_at, updated_at, owner_actor_type, owner_actor_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
+    const deleteLookupStmt = this.db.prepare(
+      'DELETE FROM graph_lookup_keys WHERE tenant_id = ? AND memory_id = ?'
+    );
+    const insertLookupStmt = this.db.prepare(`
+      INSERT INTO graph_lookup_keys (tenant_id, lookup_key, memory_type, memory_id, key_kind, weight, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(tenant_id, lookup_key, memory_type, memory_id) DO UPDATE SET
+        key_kind = excluded.key_kind,
+        weight = excluded.weight,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    const insertedEntityRows: any[] = [];
 
     const importRows = (rows: any[], memoryType: string, countKey: 'entities' | 'observations' | 'relations') => {
       for (const row of rows) {
+        let content: Record<string, any>;
+        let info: any;
         try {
-          const info = insertStmt.run(
+          content = parseRowContent(row, memoryType);
+          if (
+            memoryType === 'entity'
+            && this.isConfidentialMessageSearchItem('entity', content)
+          ) {
+            throw new Error('message_detail is reserved for private mailbox compatibility');
+          }
+          if (
+            memoryType === 'observation'
+            && (
+              this.isConfidentialMessageSearchItem('observation', content)
+              || isPrivateReference(content.metadata?.entityId)
+              || isPrivateReference(content.entityName)
+            )
+          ) {
+            throw new Error('observation references a private message_detail entity');
+          }
+          if (
+            memoryType === 'relation'
+            && (isPrivateReference(content.from) || isPrivateReference(content.to))
+          ) {
+            throw new Error('relation references a private message_detail entity');
+          }
+
+          info = insertStmt.run(
             row.id,
             tenantId,
             memoryType,
@@ -4936,6 +5411,22 @@ export class MemoryManager {
           // Atomic mode (used by trash restore): re-throw so the surrounding
           // db.transaction rolls back ALL inserts — never a partial restore.
           if (opts.atomic) throw err;
+          continue;
+        }
+
+        if (info.changes > 0) {
+          // Keep deterministic graph reads in sync with imported SQLite rows.
+          // This runs inside the same transaction as the row insert so an
+          // indexing failure cannot leave a committed but undiscoverable row.
+          this.replaceGraphLookupIndexForMemory(
+            row.id,
+            tenantId,
+            memoryType as GraphMemoryType,
+            content,
+            deleteLookupStmt,
+            insertLookupStmt
+          );
+          if (memoryType === 'entity') insertedEntityRows.push(row);
         }
       }
     };
@@ -4946,11 +5437,18 @@ export class MemoryManager {
       importRows(backup.observations || [], 'observation', 'observations');
       importRows(backup.relations || [], 'relation', 'relations');
     });
-    txn();
+    try {
+      txn();
+    } finally {
+      // Imported entities can change which ID/name/alias references are
+      // confidential. Force the next classifier to rebuild from committed DB
+      // state; on rollback this also discards the pre-import snapshot.
+      this.confidentialEntityReferenceCache.delete(tenantId);
+    }
 
     // Vector re-indexing for inserted entities (best-effort)
-    if (this.vectorClient && result.inserted.entities > 0) {
-      for (const entity of (backup.entities || [])) {
+    if (this.vectorClient && insertedEntityRows.length > 0) {
+      for (const entity of insertedEntityRows) {
         try {
           await this.vectorClient.storeMemory({
             id: entity.id,
@@ -5363,19 +5861,33 @@ export class MemoryManager {
     // Create pre-restore safety backup
     const preRestoreBackup = await this.createSnapshot('pre-restore');
 
-    // Close current DB
-    this.db.close();
+    // A snapshot replaces every tenant's entity set. Drop both the old cache
+    // before the file swap and any references populated during reinitialization
+    // after it, so no request can classify observations using the wrong DB.
+    this.confidentialEntityReferenceCache.clear();
+    try {
+      // All cache branches are served directly by getAgentMemory(),
+      // getSharedMemory(), and legacy context builders. Clear the entire
+      // object before swapping the database so rows created after the snapshot
+      // cannot survive solely in individual/shared/task caches.
+      this.resetServedMemoryCaches();
 
-    // Copy snapshot over live DB
-    fs.copyFileSync(snapshotPath, this.dbPath);
+      // Close current DB
+      this.db.close();
 
-    // Reopen — the FK pragma is PER CONNECTION, so the eng4 apply (pragma +
-    // idempotent DDL) must run again on this fresh handle.
-    this.db = new Database(this.dbPath);
-    this.initializeDatabase();
-    applyEng4Schema(this.db);
-    this.loadMemoryFromDatabase();
-    this.initializeAdvancedSystems();
+      // Copy snapshot over live DB
+      fs.copyFileSync(snapshotPath, this.dbPath);
+
+      // Reopen — the FK pragma is PER CONNECTION, so the eng4 apply (pragma +
+      // idempotent DDL) must run again on this fresh handle.
+      this.db = new Database(this.dbPath);
+      this.initializeDatabase();
+      applyEng4Schema(this.db);
+      this.loadMemoryFromDatabase();
+      this.initializeAdvancedSystems();
+    } finally {
+      this.confidentialEntityReferenceCache.clear();
+    }
 
     return {
       restoredFrom: snapshot.filename,
@@ -5635,8 +6147,11 @@ export class MemoryManager {
     // incident; the CTE variant still measured 300s+ on a live snapshot).
     const markerRows = this.db.prepare(`
       SELECT je.value AS superseded_id, MAX(m.created_at) AS by_created
-      FROM shared_memory m, json_each(m.content, '$.metadata.supersedes') je
+      FROM shared_memory m,
+           json_each(CASE WHEN json_valid(m.content) THEN m.content ELSE '{}' END,
+                     '$.metadata.supersedes') je
       WHERE m.memory_type = 'observation' AND m.tenant_id = ?
+        AND json_valid(m.content)
         AND json_type(m.content, '$.metadata.supersedes') = 'array'
       GROUP BY je.value
     `).all(tenantId) as Array<{ superseded_id: string; by_created: string }>;
@@ -5652,6 +6167,7 @@ export class MemoryManager {
              COALESCE(json_extract(content, '$.entityName'), '') AS entity_name
       FROM shared_memory
       WHERE id = ? AND tenant_id = ? AND memory_type = 'observation'
+        AND json_valid(content)
     `);
     const rawCandidates: Array<{ id: string; created_at: string; bytes: number; entity_name: string }> = [];
     for (const [supersededId, byCreated] of markedBy) {
@@ -5681,6 +6197,7 @@ export class MemoryManager {
       SELECT id, COALESCE(json_extract(content, '$.entityName'), '') AS entity_name
       FROM shared_memory
       WHERE memory_type = 'observation' AND tenant_id = ?
+        AND json_valid(content)
         AND json_extract(content, '$.metadata.supersedes') IS NOT NULL
         AND json_type(content, '$.metadata.supersedes') <> 'array'
     `).all(tenantId) as Array<{ id: string; entity_name: string }>)

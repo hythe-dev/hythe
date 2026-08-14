@@ -11,7 +11,8 @@
  *   resolved scope; the fetched payload is hash+size VERIFIED on every
  *   fetch (fail closed on corruption — never serve unverifiable bytes).
  * - Every query is tenant-keyed: knowing another tenant's stateId,
- *   revision, or URI grants nothing (fail closed as not-found).
+ *   revision, or URI grants nothing (fail closed as not-found). Message
+ *   handles additionally bind the exact recipient stored on the row.
  * - changes-since is a cursor-backed, complete, revision-ordered view.
  */
 import type DatabaseType from 'better-sqlite3';
@@ -36,10 +37,14 @@ export function buildSnapshotUri(scopeKey: string, stateId: string): string {
  * Message/handoff handles are SCOPE-BOUND (sol review 037cfc22): the URI
  * carries the originating resolved scopeKey, and dereference applies the
  * SAME tenant+scope selection predicate resume used — a same-tenant agent
- * knowing a raw row id cannot read another project's content.
+ * knowing a raw row id cannot read another project's content. Message
+ * handles also carry the exact recipient so dereference can bind
+ * tenant+scope+recipient+message id. This is a bearer-capability check at
+ * the server; authenticating the caller as that recipient is a transport
+ * responsibility.
  */
-export function buildMessageUri(scopeKey: string, messageId: string): string {
-  return `engram://message/${encodeURIComponent(scopeKey)}/${encodeURIComponent(messageId)}`;
+export function buildMessageUri(scopeKey: string, recipientAgentId: string, messageId: string): string {
+  return `engram://message/${encodeURIComponent(scopeKey)}/${encodeURIComponent(recipientAgentId)}/${encodeURIComponent(messageId)}`;
 }
 
 export function buildHandoffUri(scopeKey: string, handoffId: string): string {
@@ -151,16 +156,20 @@ export function fetchResourceByUri(
       body: fetched.body,
     };
   }
-  if (kind === 'message' && segments.length === 2) {
+  if (kind === 'message' && segments.length === 3) {
     const scope = parseScopeKey(segments[0]);
     if (!scope) throw new ResourceNotFoundError('eng4: malformed message handle scope');
-    // Same predicate as resume's scoped selection — tenant AND scope bound.
+    const recipientAgentId = segments[1];
+    if (!recipientAgentId) throw new ResourceNotFoundError('eng4: malformed message handle recipient');
+    // Same predicate as resume's scoped selection — tenant, exact recipient,
+    // and resolved scope all bind the row id. Two-segment legacy message
+    // handles fall through and fail closed rather than widening access.
     const row = db.prepare(
       `SELECT content FROM ai_messages
-        WHERE tenant_id = ? AND id = ?
+        WHERE tenant_id = ? AND id = ? AND to_agent = ?
           AND ((project_id IS NOT NULL AND project_id = ?) OR (task_id IS NOT NULL AND task_id = ?))`
-    ).get(tenantId, segments[1], scope.projectId, scope.taskId) as { content: string } | undefined;
-    if (!row) throw new ResourceNotFoundError('eng4: message not found in this scope');
+    ).get(tenantId, segments[2], recipientAgentId, scope.projectId, scope.taskId) as { content: string } | undefined;
+    if (!row) throw new ResourceNotFoundError('eng4: message not found for this recipient and scope');
     return { kind: 'message', body: String(row.content ?? '') };
   }
   if (kind === 'handoff' && segments.length === 2) {

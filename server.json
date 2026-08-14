@@ -6,19 +6,26 @@
     "url": "https://github.com/hythe-dev/hythe",
     "source": "github"
   },
-  "version": "0.1.2",
+  "version": "0.1.4",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@hythe/mcp",
-      "version": "0.1.2",
+      "version": "0.1.4",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
+          "name": "HYTHE_AGENT_ID",
+          "description": "Stable exact agent identity for this client lane; required so restarts and compaction cannot adopt another principal",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
           "name": "API_KEY",
-          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (generate with: npx -y @hythe/mcp init)",
+          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (create a protected .env with: npx -y @hythe/mcp init --write-env --agent-id <agent-id>)",
           "isRequired": true,
           "format": "string",
           "isSecret": true

@@ -10,7 +10,7 @@
     {
       "name": "hythe",
       "description": "Session memory that survives compaction: auto-resume on start, checkpoint-on-compact, Memory Protocol skill, agent inbox awareness.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "tomcat65"
       },

@@ -20,7 +20,7 @@
  *   better-sqlite3 transaction — there is no read-then-write window, and a
  *   mid-write failure leaves no partial scope/payload/snapshot/idempotency
  *   rows.
- * - ONE AUTHOR RULE (5868b61b #2): author = canonical agent family;
+ * - ONE AUTHOR RULE (5868b61b #2): author = exact opaque agent principal;
  *   assertedAgentId is audit metadata only. recordedAt is server-owned.
  * - Payload integrity is verified against the persisted bytes on replay and
  *   on within-tenant dedup (sha256(body) must equal content_hash and
@@ -260,7 +260,8 @@ export function performCheckpoint(
     );
   }
   const scopeKey = resolved.scopeKey;
-  const canonicalAgentId = directory.resolveCanonicalAgent(params.agentId).canonical;
+  const canonicalAgentId = directory.resolveCanonicalAgent(params.agentId, tenantId).canonical;
+  if (!canonicalAgentId) throw new Error('Invalid agent identity');
 
   const envelope = {
     scopeKey,

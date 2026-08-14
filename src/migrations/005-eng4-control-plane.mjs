@@ -52,7 +52,7 @@ export const DDL = [
 
   // 2. Checkpoint snapshots (immutable rows). Tenant + scope identity live
   // ONLY in the composite FK. ONE AUTHOR RULE (5868b61b #2): author is the
-  // CANONICAL agent family; asserted_agent_id preserves the raw asserted
+  // exact opaque agent principal; asserted_agent_id preserves the raw asserted
   // caller id as audit metadata only. request_fingerprint stores the
   // operation-idempotency fingerprint (canonical author + CAS position +
   // content); content_hash stays the resource-content hash — distinct.

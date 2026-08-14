@@ -23,6 +23,9 @@ services:
       - SQLITE_VEC_CACHE_DIR=/app/data/models
       - SQLITE_VEC_DIMENSIONS=384
       - SQLITE_VEC_MODEL=Xenova/all-MiniLM-L6-v2
+      # The image binds an independently locked module path and fails startup
+      # rather than mixing token-hash vectors into a transformer-built index.
+      - SQLITE_VEC_REQUIRE_TRANSFORMERS=true
     volumes:
       - engram_data:/app/data
     healthcheck:

@@ -7,7 +7,7 @@ Protocol the agent actually follows.
 
 > Transition note: during the server's phased migration, the working MCP
 > config key and tool prefix remain the legacy names; new installs should
-> use the config printed by `npx -y @hythe/mcp init`.
+> use the config printed by `npx -y @hythe/mcp init --agent-id <agent-id>`.
 
 Nothing in this kit touches the server. It is hooks, prompt files, and setup
 glue on the client side only.
@@ -16,11 +16,16 @@ glue on the client side only.
 
 ```bash
 claude plugin marketplace add hythe-dev/hythe && claude plugin install hythe
+HYTHE_AGENT_ID=claude-desktop claude
 ```
 
 That installs the `hythe` plugin (session-start resume, compaction recovery,
-Memory Protocol skill). For other agent CLIs, see the per-agent files below
-and `setup.sh` for instruction-file wiring.
+Memory Protocol skill) and starts one explicitly bound lane. The
+`HYTHE_AGENT_ID` configured on `claude mcp add` belongs to the stdio bridge;
+Claude plugin hooks are separate children and inherit identity from the Claude
+process. Launch Claude with the same exact value or the hooks fail closed. For
+other agent CLIs, see the per-agent files below and `setup.sh` for
+instruction-file wiring.
 
 ## Contents
 
@@ -39,10 +44,17 @@ and `setup.sh` for instruction-file wiring.
   steps to stdout (Claude Code `additionalContext`); the agent itself performs
   memory calls through its MCP tools. No credentials in hooks by default.
   The bridge connection itself comes from the standard `@hythe/mcp` env
-  set (`API_KEY`, `MCP_HOST`, `MCP_PORT`) — generate it with
-  `npx -y @hythe/mcp init`.
+  set (`HYTHE_API_KEY_FILE`, `HYTHE_AGENT_ID`, `MCP_HOST`, `MCP_PORT`) —
+  generate it with `npx -y @hythe/mcp init --agent-id <agent-id>`.
 - **Name-agnostic where possible.** Directory and script names avoid the
   product name; new installs use the `hythe` MCP server key and
-  `mcp__hythe__*` tool names (printed by `npx -y @hythe/mcp init`).
-- **Agent identity** comes from `HYTHE_AGENT_ID` (legacy `ENGRAM_AGENT_ID` honored; e.g. `claude-desktop`);
-  hooks refuse to guess.
+  `mcp__hythe__*` tool names (printed by `npx -y @hythe/mcp init --agent-id <agent-id>`).
+- **Agent identity** comes from `HYTHE_AGENT_ID` (e.g. `claude-desktop`);
+  the legacy `ENGRAM_AGENT_ID` alias is honored only when it agrees. Hooks
+  reject conflicting aliases and refuse to guess a missing identity. For
+  Claude Code, both the bridge config and the ambient environment of the
+  launched `claude` process must carry that same value.
+- **Codex instructions never infer identity.** MCP config env binds the bridge
+  but is not automatically model-visible. A trusted Codex session hook or
+  launcher must inject the same exact value into session context; otherwise
+  startup and post-compaction recovery remain fail closed.

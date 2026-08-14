@@ -31,6 +31,7 @@ const PRODUCT_NAME = HYTHE_DISTRIBUTION ? 'HYTHE' : 'Engram';
 const CLI_NAME = HYTHE_DISTRIBUTION ? 'hythe-mcp' : 'engram-mcp';
 const SERVER_KEY = HYTHE_DISTRIBUTION ? 'hythe' : 'engram';
 const KEY_FILE_ENV = HYTHE_DISTRIBUTION ? 'HYTHE_API_KEY_FILE' : 'ENGRAM_API_KEY_FILE';
+const AGENT_ID_ENV = HYTHE_DISTRIBUTION ? 'HYTHE_AGENT_ID' : 'ENGRAM_AGENT_ID';
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = '6174';
 
@@ -39,8 +40,9 @@ function helpText() {
     `${PKG_NAME} — ${PRODUCT_NAME} stdio bridge + first-run wizard`,
     '',
     'Usage:',
-    `  ${CLI_NAME}             run the stdio bridge (env: API_KEY or ${KEY_FILE_ENV})`,
+    `  ${CLI_NAME}             run the stdio bridge (env: ${AGENT_ID_ENV} + API_KEY or ${KEY_FILE_ENV})`,
     `  ${CLI_NAME} init        print secret-free MCP client config blocks`,
+    `    --agent-id <agent-id> stable client-lane identity (${HYTHE_DISTRIBUTION ? 'required' : 'recommended'})`,
     '    --write-env          generate an API key + write ./.env (mode 600; write-once)',
     '    --host <host>        bridge target host in printed configs (default 127.0.0.1)',
     '    --port <port>        bridge target port in printed configs (default 6174)',
@@ -49,7 +51,7 @@ function helpText() {
     `  ${CLI_NAME} --help      show this help`,
     '',
     'Typical first run:',
-    `  1. npx -y ${PKG_NAME} init --write-env`,
+    `  1. npx -y ${PKG_NAME} init --write-env --agent-id my-agent`,
     '  2. docker compose -f docker/docker-compose.yml up -d',
     '  3. paste the printed block into your MCP client config',
   ].join('\n');
@@ -86,8 +88,13 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function configBlocks(keyFilePath, host, port) {
-  const env = { [KEY_FILE_ENV]: keyFilePath, MCP_HOST: host, MCP_PORT: String(port) };
+function configBlocks(keyFilePath, host, port, agentId) {
+  const env = {
+    [KEY_FILE_ENV]: keyFilePath,
+    ...(agentId ? { [AGENT_ID_ENV]: agentId } : {}),
+    MCP_HOST: host,
+    MCP_PORT: String(port),
+  };
   const clientJson = JSON.stringify(
     { mcpServers: { [SERVER_KEY]: { command: 'npx', args: ['-y', PKG_NAME], env } } },
     null,
@@ -97,7 +104,14 @@ function configBlocks(keyFilePath, host, port) {
   return [
     '─── Claude Code ─────────────────────────────────────────────────────',
     'Run:',
-    `  claude mcp add ${SERVER_KEY} --env ${KEY_FILE_ENV}=${shellQuote(keyFilePath)} --env MCP_HOST=${shellQuote(host)} --env MCP_PORT=${shellQuote(port)} -- npx -y ${PKG_NAME}`,
+    `  claude mcp add ${SERVER_KEY} --env ${KEY_FILE_ENV}=${shellQuote(keyFilePath)}`
+      + (agentId ? ` --env ${AGENT_ID_ENV}=${shellQuote(agentId)}` : '')
+      + ` --env MCP_HOST=${shellQuote(host)} --env MCP_PORT=${shellQuote(port)} -- npx -y ${PKG_NAME}`,
+    ...(agentId ? [
+      '',
+      'Claude plugin hooks are separate child processes; bind the same identity when launching this lane:',
+      `  ${AGENT_ID_ENV}=${shellQuote(agentId)} claude`,
+    ] : []),
     '',
     'Or add to .mcp.json / ~/.claude.json:',
     clientJson,
@@ -106,7 +120,9 @@ function configBlocks(keyFilePath, host, port) {
     `[mcp_servers.${SERVER_KEY}]`,
     'command = "npx"',
     `args = ["-y", "${PKG_NAME}"]`,
-    `env = { ${KEY_FILE_ENV} = ${JSON.stringify(keyFilePath)}, MCP_HOST = ${JSON.stringify(host)}, MCP_PORT = ${JSON.stringify(String(port))} }`,
+    `env = { ${KEY_FILE_ENV} = ${JSON.stringify(keyFilePath)}, `
+      + (agentId ? `${AGENT_ID_ENV} = ${JSON.stringify(agentId)}, ` : '')
+      + `MCP_HOST = ${JSON.stringify(host)}, MCP_PORT = ${JSON.stringify(String(port))} }`,
     '',
     '─── Cursor (.cursor/mcp.json) ───────────────────────────────────────',
     clientJson,
@@ -114,6 +130,36 @@ function configBlocks(keyFilePath, host, port) {
     '─── Claude Desktop (claude_desktop_config.json) ─────────────────────',
     clientJson,
   ].join('\n');
+}
+
+function normalizeAgentId(value) {
+  const normalized = typeof value === 'string' ? value : '';
+  if (
+    normalized.length < 1
+    || normalized.length > 100
+    || !/^[A-Za-z0-9_.:-]+$/.test(normalized)
+  ) {
+    throw new Error('--agent-id must be 1-100 characters from A-Z, a-z, 0-9, _, ., :, or -');
+  }
+  return normalized;
+}
+
+function parseInitAgentId(argv) {
+  const positions = argv
+    .map((value, index) => value === '--agent-id' ? index : -1)
+    .filter((index) => index !== -1);
+  if (positions.length > 1) {
+    throw new Error('--agent-id may be specified only once');
+  }
+  if (positions.length === 0) {
+    if (HYTHE_DISTRIBUTION) throw new Error('--agent-id is required');
+    return null;
+  }
+  const value = argv[positions[0] + 1];
+  if (value == null || value.startsWith('--')) {
+    throw new Error('--agent-id needs a value');
+  }
+  return normalizeAgentId(value);
 }
 
 function runInit(argv) {
@@ -124,6 +170,14 @@ function runInit(argv) {
   const port = portIdx !== -1 ? argv[portIdx + 1] : DEFAULT_PORT;
   if (!host || !port) {
     process.stderr.write(`${CLI_NAME} init: --host/--port need a value\n`);
+    process.exit(2);
+  }
+
+  let agentId;
+  try {
+    agentId = parseInitAgentId(argv);
+  } catch (error) {
+    process.stderr.write(`${CLI_NAME} init: ${error.message}\n`);
     process.exit(2);
   }
 
@@ -158,7 +212,7 @@ function runInit(argv) {
   lines.push('Start the server:  docker compose -f docker/docker-compose.yml up -d');
   lines.push('Then paste the block for your client:');
   lines.push('');
-  lines.push(configBlocks(envPath, host, port));
+  lines.push(configBlocks(envPath, host, port, agentId));
   lines.push('');
   process.stdout.write(lines.join('\n') + '\n');
 }

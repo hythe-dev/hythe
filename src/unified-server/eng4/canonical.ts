@@ -125,8 +125,8 @@ export function envelopeContentHash(envelope: CheckpointContentEnvelope): string
 /**
  * OPERATION idempotency fingerprint (review 5868b61b #3, option a) — kept
  * DISTINCT from the resource content hash. The fingerprint binds the full
- * semantic intent of the write: WHO (canonical agent family — aliases in
- * one family fingerprint identically), WHERE in history (expectedRevision +
+ * semantic intent of the write: WHO (the exact opaque agent principal),
+ * WHERE in history (expectedRevision +
  * resolved parent identity), and WHAT (the canonical content envelope).
  * Same (tenant, scope, idempotencyKey) with a differing fingerprint =>
  * outcome 'idempotency-mismatch'. Resource contentHash stays bound to the
