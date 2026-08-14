@@ -4,6 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { MemoryManager } from './unified-server/memory/index.js';
 import { MessageHubIntegration } from './message-hub/hub-integration.js';
+import { resolveMessageHubPort } from './message-hub/config.js';
 import { UnifiedToolSchemas } from './shared/toolSchemas.js';
 import { ENG4_TOOLS, RETAINED_LEGACY_TOOLS, handleEng4Tool, ENG4_RESOURCE_TEMPLATES, readEng4Resource } from './unified-server/eng4/register.js';
 import { validateEng4Output } from './unified-server/eng4/register.js';
@@ -60,7 +61,7 @@ export class NeuralMCPServer {
 
   private async initializeMessageHub() {
     try {
-      const hubPort = parseInt(process.env.MESSAGE_HUB_PORT || '3003', 10);
+      const hubPort = resolveMessageHubPort();
       this.messageHub = new MessageHubIntegration(hubPort, this.port);
       
       console.log(`🔗 Message Hub integration initialized on port ${hubPort}`);
@@ -1457,7 +1458,7 @@ export class NeuralMCPServer {
           advanced: advancedStats,
           messageHub: this.messageHub ? {
             enabled: true,
-            port: 3003,
+            port: this.messageHub.getPort(),
             status: 'active'
           } : {
             enabled: false

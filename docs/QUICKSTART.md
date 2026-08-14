@@ -119,4 +119,5 @@ store are in [CONCEPTS.md](./CONCEPTS.md).
   --env HYTHE_AGENT_ID=...` reaches the bridge, not plugin hook processes.
   Restart that Claude lane as `HYTHE_AGENT_ID=<same-id> claude`.
 - **Port collision** — change `NEURAL_MCP_PORT` in `.env` and `MCP_PORT`
-  in each client block together.
+  in each client block together. If the separate WebSocket notification port
+  collides, change `MESSAGE_HUB_PORT` and its container port mapping together.

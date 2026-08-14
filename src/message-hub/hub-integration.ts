@@ -1,4 +1,5 @@
 import { MessageHubWebSocketServer } from './websocket-server.js';
+import { DEFAULT_MESSAGE_HUB_PORT } from './config.js';
 
 /**
  * Integration Bridge between Message Hub and existing MCP Server
@@ -11,7 +12,7 @@ export class MessageHubIntegration {
   private integrationPort: number;
   private mcpPort: number;
 
-  constructor(integrationPort: number = 3003, mcpPort: number = 5174) {
+  constructor(integrationPort: number = DEFAULT_MESSAGE_HUB_PORT, mcpPort: number = 5174) {
     this.integrationPort = integrationPort;
     this.mcpPort = mcpPort;
     this.webSocketServer = new MessageHubWebSocketServer(integrationPort);

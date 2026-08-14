@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { createServer, type IncomingMessage } from 'http';
 import { isValidApiKeyFormat, safeKeyEqual } from '../middleware/security.js';
 import { getTenantManager } from '../tenant/index.js';
+import { DEFAULT_MESSAGE_HUB_PORT } from './config.js';
 
 // WebSocket event types for real-time notifications
 export interface MessageHubEvent {
@@ -82,7 +83,7 @@ interface ConnectedClient {
 
 /**
  * WebSocket Notification Server for Centralized Message Hub
- * Port: 3002
+ * Default port: 3004 (overridable with MESSAGE_HUB_PORT at server startup)
  * Purpose: Real-time notifications for <1 second message discovery
  */
 export class MessageHubWebSocketServer extends EventEmitter {
@@ -92,7 +93,7 @@ export class MessageHubWebSocketServer extends EventEmitter {
   private port: number;
   private heartbeatInterval: NodeJS.Timeout | null = null;
 
-  constructor(port: number = 3003) {
+  constructor(port: number = DEFAULT_MESSAGE_HUB_PORT) {
     super();
     this.port = port;
     this.server = createServer();
