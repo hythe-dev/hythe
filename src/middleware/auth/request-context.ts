@@ -46,6 +46,9 @@ export async function buildContextFromJwt(
     scopes: resolved.scopes,
     mfaLevel: mfaLevel || null,
     timezoneHint,
+    agentPrincipal: null,
+    agentCredentialPresented: false,
+    agentAuthMode: 'observe',
   };
 }
 
@@ -71,6 +74,9 @@ export function buildContextFromApiKey(
       scopes: apiKeyRecord.permissions || [],
       mfaLevel: null,
       timezoneHint: null,
+      agentPrincipal: null,
+      agentCredentialPresented: false,
+      agentAuthMode: 'observe',
     };
   }
 
@@ -96,6 +102,9 @@ export function buildContextFromDevHeaders(req: Request): RequestContext {
     scopes: ['*'],
     mfaLevel: null,
     timezoneHint: (req.headers['x-user-timezone'] as string) || null,
+    agentPrincipal: null,
+    agentCredentialPresented: false,
+    agentAuthMode: 'observe',
   };
 }
 

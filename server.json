@@ -6,12 +6,12 @@
     "url": "https://github.com/hythe-dev/hythe",
     "source": "github"
   },
-  "version": "0.1.4",
+  "version": "0.1.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@hythe/mcp",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "transport": {
         "type": "stdio"
       },
@@ -24,8 +24,22 @@
           "isSecret": false
         },
         {
+          "name": "HYTHE_AGENT_KEY_FILE",
+          "description": "Optional path to one protected per-agent credential file: regular, non-symlink, owned by the client user, mode 0400 or 0600, containing one hya1 token. Never place the token itself in an environment variable.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "HYTHE_AGENT_AUTH_MODE",
+          "description": "Client authorization expectation: observe, mixed, or required (default observe). Move to mixed and then required only after this exact lane has a credential and passes /agent/whoami.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
           "name": "API_KEY",
-          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (create a protected .env with: npx -y @hythe/mcp init --write-env --agent-id <agent-id>)",
+          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (create a protected .env with: npx -y @hythe/mcp@0.1.5 init --write-env --agent-id <agent-id>)",
           "isRequired": true,
           "format": "string",
           "isSecret": true

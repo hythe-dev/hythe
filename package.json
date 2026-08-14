@@ -1,6 +1,6 @@
 {
   "name": "@hythe/mcp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "HYTHE — coordination bus + shared truth for AI agent fleets (MCP server + stdio bridge).",
   "mcpName": "dev.hythe/hythe",
   "repository": {
@@ -14,7 +14,8 @@
   "type": "module",
   "main": "dist/unified-neural-mcp-server.js",
   "bin": {
-    "hythe-mcp": "bin/engram-mcp.cjs"
+    "hythe-mcp": "bin/engram-mcp.cjs",
+    "hythe-agent-auth": "dist/agent-auth/operator.js"
   },
   "files": [
     "bin/",
@@ -23,6 +24,8 @@
     "docker/",
     "docs/",
     ".env.example",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "TOOL-COMPATIBILITY-MAP.md",
     "BACKUP-AND-RESTORE.md"
   ],
@@ -37,6 +40,9 @@
     "test:run": "vitest run",
     "test:migrations": "node --test src/migrations/*.node-test.mjs",
     "migrate:private-message-residue": "node dist/migrations/007-private-message-residue.mjs",
+    "adjudicate:private-message-residue": "node dist/migrations/private-message-residue-adjudication.mjs",
+    "sanitize:sqlite": "node dist/migrations/vacuum-sanitized-database.mjs",
+    "agent-auth:operator": "node dist/agent-auth/operator.js",
     "test:agent-kit": "bash clients/agent-kit/tests/test-setup.sh",
     "test:release": "node --test scripts/verify-hythe-release-tree.test.mjs",
     "test:packed-consumer": "node scripts/verify-packed-consumer.mjs",

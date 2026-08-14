@@ -24,7 +24,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run ci:schemas
-      # P2 release verification remains explicit and contains no publish step.
+      # Release verification remains explicit and contains no publish step.
       - run: node scripts/verify-hythe-release-tree.mjs
       - run: npm run test:release
       # Install the actual tarball in an independent consumer. Package-level
@@ -35,6 +35,9 @@ jobs:
       # boots its own hermetic server (tests/global-setup.ts).
       - run: npx vitest run --pool=forks --poolOptions.forks.singleFork
       - run: npm run test:migrations
+      # Validate the production topology without resolving its protected env
+      # file or Pavilion host paths on the public runner.
+      - run: HYTHE_IMAGE=hythe:ci docker compose -f docker/pavilion-production.compose.yml config --quiet --no-env-resolution --no-path-resolution
 
   docker:
     runs-on: ubuntu-latest

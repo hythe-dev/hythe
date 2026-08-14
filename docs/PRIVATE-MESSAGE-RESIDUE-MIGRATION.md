@@ -42,8 +42,22 @@ these conditions is present:
 - the database changes between preflight and the locked transaction.
 
 Execution requires the exact confirmation token produced by dry-run, a new
-backup path, and a new report path. The backup is created with SQLite's backup
-API and must pass `quick_check` and the same logical preflight fingerprint.
+backup path, and a new report path. Those paths must be distinct and neither
+artifact may use the source database's `-wal`, `-journal`, or `-shm` sidecar
+name, including through a symlinked prospective parent. The backup and report
+may not use each other's SQLite sidecar namespace either.
+
+The backup is created with SQLite's backup API at a unique mode-`0600` sibling
+path. It must pass `quick_check`, full `integrity_check`, `foreign_key_check`,
+the same migration fingerprint, and a full schema/table/rowid logical digest.
+Only then is it fsynced and published to the requested path with atomic
+no-clobber semantics. A file that appears at the requested backup path is
+preserved and the database transaction rolls back. The published backup's
+inode, byte count, and SHA-256 are rechecked before mutation, before commit,
+immediately after commit, and again immediately before the final applied
+report and return. A missing or replaced post-commit backup is never reported
+as applied; it produces `committed-backup-verification-failed`, while an
+independently created replacement is preserved.
 Restoration, child-observation and index cleanup, deletion, verification, and
 the database audit row then happen in one transaction. Any failure before
 commit rolls everything back; the external report records the refusal or
@@ -79,18 +93,25 @@ node dist/migrations/007-private-message-residue.mjs /path/to/memory.db \
   --report /secure/path/message-residue-execute.json
 ```
 
-Success is `status: "applied"`, `quickCheck: "ok"`, and an `applied` count
-matching the reviewed dry run. The script also writes a row to
+Success is `status: "applied"`, `quickCheck: "ok"`, backup checks all green,
+an existing backup whose size and SHA-256 match the report, and an `applied`
+count matching the reviewed dry run. Never accept
+`committed-backup-verification-failed` as success; it means the transaction
+committed but the bound backup could not be proven at final reporting time.
+The script also writes a row to
 `private_message_residue_migration_audit` containing only the run identifier,
-preflight fingerprint, artifact paths, and counts.
+preflight fingerprint, backup path/hash/size/identity, report path, and counts.
 
 The confirmation fingerprint binds the configured vector table names, the
 resolved message/vector provenance, sender fallbacks, and every selected row.
 SQLite object discovery follows SQLite's case-insensitive identifier rules. A
-`pending` report is written before mutation and the final report replaces it
-atomically. If the database commits but the final replacement fails, stdout
-reports `applied-report-write-failed`, the pending file remains intact, and the
-database audit row is the reconciliation record.
+mode-`0600` report inode is reserved before the database opens, and a `pending`
+report is fsynced before mutation. Every later report update must match that
+inode's generation and the exact prior content hash. If another process
+replaces or edits the report, the migration never overwrites that independent
+file. A replacement before the pending write aborts before mutation; a
+replacement after commit produces `applied-report-write-failed`, and the
+database audit row plus stdout are the reconciliation records.
 
 Before restarting normal traffic, verify representative mailboxes using
 `get_message_detail`, verify an unrelated agent and tenant cannot read them,
@@ -112,3 +133,6 @@ graph-vector and private-shaped orphan/vector-only residue refusal,
 public-parent preservation, tenant isolation, configured vector-table cleanup (including
 identifier casing) and unsafe-name rejection, fingerprint provenance,
 transaction rollback, backup verification, and idempotent re-execution.
+Backup coverage also includes source-sidecar path rejection, no-clobber
+publication races, bound-artifact replacement refusal, full logical parity,
+mode-`0600`/SHA-256 evidence, and ownership-bound pending/final report updates.

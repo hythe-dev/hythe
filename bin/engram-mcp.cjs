@@ -23,6 +23,11 @@ const path = require('path');
 
 const PKG = require(path.join(__dirname, '..', 'package.json'));
 const PKG_NAME = PKG.name;
+const CLIENT_PACKAGE_SPEC = `${PKG_NAME}@${PKG.version}`;
+const SERVER_RELEASE_TAG = `v${PKG.version}`;
+const SERVER_REPOSITORY_URL = typeof PKG.repository === 'string'
+  ? PKG.repository
+  : PKG.repository?.url;
 // P1 compatibility seam: the legacy package keeps every existing string and
 // config key, while the private HYTHE overlay opts into the new public-facing
 // identity. Runtime/database names remain compatibility-pinned until P4.
@@ -32,6 +37,9 @@ const CLI_NAME = HYTHE_DISTRIBUTION ? 'hythe-mcp' : 'engram-mcp';
 const SERVER_KEY = HYTHE_DISTRIBUTION ? 'hythe' : 'engram';
 const KEY_FILE_ENV = HYTHE_DISTRIBUTION ? 'HYTHE_API_KEY_FILE' : 'ENGRAM_API_KEY_FILE';
 const AGENT_ID_ENV = HYTHE_DISTRIBUTION ? 'HYTHE_AGENT_ID' : 'ENGRAM_AGENT_ID';
+const AGENT_KEY_FILE_ENV = 'HYTHE_AGENT_KEY_FILE';
+const AGENT_AUTH_MODE_ENV = 'HYTHE_AGENT_AUTH_MODE';
+const RAW_AGENT_KEY_ENV_NAMES = ['HYTHE_AGENT_KEY', 'HYTHE_AGENT_TOKEN'];
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = '6174';
 
@@ -43,15 +51,17 @@ function helpText() {
     `  ${CLI_NAME}             run the stdio bridge (env: ${AGENT_ID_ENV} + API_KEY or ${KEY_FILE_ENV})`,
     `  ${CLI_NAME} init        print secret-free MCP client config blocks`,
     `    --agent-id <agent-id> stable client-lane identity (${HYTHE_DISTRIBUTION ? 'required' : 'recommended'})`,
+    `    --agent-key-file <p>  protected raw hya1 credential file (mode 400/600)`,
+    `    --agent-auth-mode <m> observe, mixed, or required (default observe)`,
     '    --write-env          generate an API key + write ./.env (mode 600; write-once)',
     '    --host <host>        bridge target host in printed configs (default 127.0.0.1)',
     '    --port <port>        bridge target port in printed configs (default 6174)',
     `  ${CLI_NAME} demo        seed a small two-agent coordination demo (demo-*`,
-    '                         namespaced; env: API_KEY, MCP_HOST, MCP_PORT)',
+    '                         namespaced; observe/mixed compatibility only)',
     `  ${CLI_NAME} --help      show this help`,
     '',
     'Typical first run:',
-    `  1. npx -y ${PKG_NAME} init --write-env --agent-id my-agent`,
+    `  1. From a ${SERVER_RELEASE_TAG} server checkout: npx -y ${CLIENT_PACKAGE_SPEC} init --write-env --agent-id my-agent`,
     '  2. docker compose -f docker/docker-compose.yml up -d',
     '  3. paste the printed block into your MCP client config',
   ].join('\n');
@@ -88,25 +98,32 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function configBlocks(keyFilePath, host, port, agentId) {
+function configBlocks(keyFilePath, host, port, agentId, agentKeyFilePath, agentAuthMode) {
   const env = {
     [KEY_FILE_ENV]: keyFilePath,
     ...(agentId ? { [AGENT_ID_ENV]: agentId } : {}),
+    ...(agentKeyFilePath ? { [AGENT_KEY_FILE_ENV]: agentKeyFilePath } : {}),
+    ...(agentAuthMode ? { [AGENT_AUTH_MODE_ENV]: agentAuthMode } : {}),
     MCP_HOST: host,
     MCP_PORT: String(port),
   };
   const clientJson = JSON.stringify(
-    { mcpServers: { [SERVER_KEY]: { command: 'npx', args: ['-y', PKG_NAME], env } } },
+    { mcpServers: { [SERVER_KEY]: { command: 'npx', args: ['-y', CLIENT_PACKAGE_SPEC], env } } },
     null,
     2
   );
+  const codexEnv = Object.entries(env)
+    .map(([name, value]) => `${name} = ${JSON.stringify(value)}`)
+    .join(', ');
 
   return [
     '─── Claude Code ─────────────────────────────────────────────────────',
     'Run:',
     `  claude mcp add ${SERVER_KEY} --env ${KEY_FILE_ENV}=${shellQuote(keyFilePath)}`
       + (agentId ? ` --env ${AGENT_ID_ENV}=${shellQuote(agentId)}` : '')
-      + ` --env MCP_HOST=${shellQuote(host)} --env MCP_PORT=${shellQuote(port)} -- npx -y ${PKG_NAME}`,
+      + (agentKeyFilePath ? ` --env ${AGENT_KEY_FILE_ENV}=${shellQuote(agentKeyFilePath)}` : '')
+      + (agentAuthMode ? ` --env ${AGENT_AUTH_MODE_ENV}=${shellQuote(agentAuthMode)}` : '')
+      + ` --env MCP_HOST=${shellQuote(host)} --env MCP_PORT=${shellQuote(port)} -- npx -y ${CLIENT_PACKAGE_SPEC}`,
     ...(agentId ? [
       '',
       'Claude plugin hooks are separate child processes; bind the same identity when launching this lane:',
@@ -119,10 +136,8 @@ function configBlocks(keyFilePath, host, port, agentId) {
     '─── Codex (~/.codex/config.toml) ────────────────────────────────────',
     `[mcp_servers.${SERVER_KEY}]`,
     'command = "npx"',
-    `args = ["-y", "${PKG_NAME}"]`,
-    `env = { ${KEY_FILE_ENV} = ${JSON.stringify(keyFilePath)}, `
-      + (agentId ? `${AGENT_ID_ENV} = ${JSON.stringify(agentId)}, ` : '')
-      + `MCP_HOST = ${JSON.stringify(host)}, MCP_PORT = ${JSON.stringify(String(port))} }`,
+    `args = ["-y", "${CLIENT_PACKAGE_SPEC}"]`,
+    `env = { ${codexEnv} }`,
     '',
     '─── Cursor (.cursor/mcp.json) ───────────────────────────────────────',
     clientJson,
@@ -162,20 +177,102 @@ function parseInitAgentId(argv) {
   return normalizeAgentId(value);
 }
 
-function runInit(argv) {
-  const writeEnv = argv.includes('--write-env');
-  const hostIdx = argv.indexOf('--host');
-  const portIdx = argv.indexOf('--port');
-  const host = hostIdx !== -1 ? argv[hostIdx + 1] : DEFAULT_HOST;
-  const port = portIdx !== -1 ? argv[portIdx + 1] : DEFAULT_PORT;
-  if (!host || !port) {
-    process.stderr.write(`${CLI_NAME} init: --host/--port need a value\n`);
-    process.exit(2);
+function parseSingleOption(argv, name) {
+  const positions = argv
+    .map((value, index) => value === name ? index : -1)
+    .filter((index) => index !== -1);
+  if (positions.length > 1) throw new Error(`${name} may be specified only once`);
+  if (positions.length === 0) return null;
+  const value = argv[positions[0] + 1];
+  if (value == null || value.startsWith('--') || value.length === 0) {
+    throw new Error(`${name} needs a value`);
   }
+  return value;
+}
 
-  let agentId;
+function validateInitArguments(argv) {
+  const valueOptions = new Set([
+    '--agent-id',
+    '--agent-key-file',
+    '--agent-auth-mode',
+    '--host',
+    '--port',
+  ]);
+  const flagOptions = new Set(['--write-env']);
+  const seenFlags = new Set();
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (
+      argument === '--agent-key'
+      || argument === '--agent-token'
+      || argument.startsWith('--agent-key=')
+      || argument.startsWith('--agent-token=')
+    ) {
+      throw new Error('raw agent credential options are not accepted; use --agent-key-file');
+    }
+    if (flagOptions.has(argument)) {
+      if (seenFlags.has(argument)) throw new Error(`${argument} may be specified only once`);
+      seenFlags.add(argument);
+      continue;
+    }
+    if (valueOptions.has(argument)) {
+      const value = argv[index + 1];
+      if (value == null || value.startsWith('--') || value.length === 0) {
+        throw new Error(`${argument} needs a value`);
+      }
+      index += 1;
+      continue;
+    }
+    throw new Error('unknown or stray init argument');
+  }
+}
+
+function hasLocalServerCheckout(directory) {
+  const requiredPaths = [
+    'package-lock.json',
+    'tsconfig.json',
+    'src',
+    path.join('docker', 'Dockerfile'),
+    path.join('docker', 'docker-compose.yml'),
+  ];
+  if (!requiredPaths.every((entry) => fs.existsSync(path.join(directory, entry)))) return false;
   try {
+    const localPackage = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8'));
+    const localLock = JSON.parse(fs.readFileSync(path.join(directory, 'package-lock.json'), 'utf8'));
+    return localPackage.name === PKG_NAME
+      && localPackage.version === PKG.version
+      && localPackage.hytheDistribution === HYTHE_DISTRIBUTION
+      && localLock.name === PKG_NAME
+      && localLock.version === PKG.version
+      && localLock.packages?.['']?.version === PKG.version;
+  } catch {
+    return false;
+  }
+}
+
+function runInit(argv) {
+  let writeEnv;
+  let host;
+  let port;
+  let agentId;
+  let agentKeyFilePath;
+  let agentAuthMode;
+  try {
+    validateInitArguments(argv);
+    writeEnv = argv.includes('--write-env');
+    host = parseSingleOption(argv, '--host') ?? DEFAULT_HOST;
+    port = parseSingleOption(argv, '--port') ?? DEFAULT_PORT;
     agentId = parseInitAgentId(argv);
+    const agentKeyFile = parseSingleOption(argv, '--agent-key-file');
+    agentKeyFilePath = agentKeyFile == null ? null : path.resolve(agentKeyFile);
+    agentAuthMode = parseSingleOption(argv, '--agent-auth-mode');
+    if (agentAuthMode != null && !['observe', 'mixed', 'required'].includes(agentAuthMode)) {
+      throw new Error('--agent-auth-mode must be observe, mixed, or required');
+    }
+    if (agentAuthMode === 'required' && agentKeyFilePath == null) {
+      throw new Error('--agent-key-file is required when --agent-auth-mode is required');
+    }
   } catch (error) {
     process.stderr.write(`${CLI_NAME} init: ${error.message}\n`);
     process.exit(2);
@@ -209,10 +306,18 @@ function runInit(argv) {
     lines.push('');
   }
 
-  lines.push('Start the server:  docker compose -f docker/docker-compose.yml up -d');
+  if (hasLocalServerCheckout(process.cwd())) {
+    lines.push('Start the server:  docker compose -f docker/docker-compose.yml up -d');
+  } else {
+    lines.push(`This directory is not an exact HYTHE ${SERVER_RELEASE_TAG} server checkout; server source is not bundled in this npm bridge package.`);
+    lines.push(`For a local server, use the reviewed ${SERVER_RELEASE_TAG} source checkout:`);
+    lines.push(`  git clone --depth 1 --branch ${SERVER_RELEASE_TAG} ${SERVER_REPOSITORY_URL}`);
+    lines.push('  cd hythe');
+    lines.push(`Then place a mode-600 .env in that checkout and run ${CLIENT_PACKAGE_SPEC} init there before Docker Compose.`);
+  }
   lines.push('Then paste the block for your client:');
   lines.push('');
-  lines.push(configBlocks(envPath, host, port, agentId));
+  lines.push(configBlocks(envPath, host, port, agentId, agentKeyFilePath, agentAuthMode));
   lines.push('');
   process.stdout.write(lines.join('\n') + '\n');
 }
@@ -247,6 +352,24 @@ function loadApiKeyFromFile() {
 
 function prepareCredential(mode) {
   try {
+    for (const envName of RAW_AGENT_KEY_ENV_NAMES) {
+      if (Object.prototype.hasOwnProperty.call(process.env, envName)) {
+        throw new Error(`${envName} is not accepted; use ${AGENT_KEY_FILE_ENV}`);
+      }
+    }
+    const agentMode = process.env[AGENT_AUTH_MODE_ENV] || 'observe';
+    if (!['observe', 'mixed', 'required'].includes(agentMode)) {
+      throw new Error(`${AGENT_AUTH_MODE_ENV} must be observe, mixed, or required`);
+    }
+    if (
+      mode === 'demo'
+      && (
+        Object.prototype.hasOwnProperty.call(process.env, AGENT_KEY_FILE_ENV)
+        || agentMode === 'required'
+      )
+    ) {
+      throw new Error('demo uses multiple principals and is unavailable with per-agent credentials');
+    }
     loadApiKeyFromFile();
     return true;
   } catch (error) {

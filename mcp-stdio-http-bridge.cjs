@@ -7,14 +7,20 @@ const fs = require('fs');
 const path = require('path');
 
 // P1 compatibility seam. The legacy package keeps its historical MCP
-// serverInfo name; the publish-blocked HYTHE overlay opts into the new display
+// serverInfo name; the HYTHE distribution opts into the public display
 // identity without changing tools, endpoints, auth, or graph keys.
 const PACKAGE_META = require('./package.json');
+const PACKAGE_VERSION = PACKAGE_META.version;
 const SERVER_INFO_NAME = PACKAGE_META.hytheDistribution === true
   ? 'hythe'
   : 'neural-ai-collaboration';
 const HYTHE_DISTRIBUTION = PACKAGE_META.hytheDistribution === true;
 const AGENT_ID_PATTERN = /^[A-Za-z0-9_.:-]+$/;
+const AGENT_KEY_PATTERN = /^hya1_[a-f0-9]{24}_[A-Za-z0-9_-]{43}$/;
+const AGENT_KEY_FILE_ENV = 'HYTHE_AGENT_KEY_FILE';
+const AGENT_AUTH_MODE_ENV = 'HYTHE_AGENT_AUTH_MODE';
+const RAW_AGENT_KEY_ENV_NAMES = ['HYTHE_AGENT_KEY', 'HYTHE_AGENT_TOKEN'];
+const AGENT_AUTH_MODE_STRENGTH = Object.freeze({ observe: 0, mixed: 1, required: 2 });
 const ENGRAM_URI_SEGMENT_PATTERN = /^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$/;
 // Tools whose `agentId` is the acting/owning identity, rather than a lookup or
 // delivery target. The bridge binds these calls to its immutable lane identity
@@ -50,6 +56,83 @@ const AGENT_ID_BOUND_TOOLS = new Set([
 const SERVER_HOSTNAME = process.env.MCP_HOST || 'localhost';
 const SERVER_PORT = parseInt(process.env.MCP_PORT || '6174', 10);
 const shortHost = os.hostname().split('.')?.[0] || 'host';
+
+function configuredAgentAuthMode() {
+  const value = process.env[AGENT_AUTH_MODE_ENV] || 'observe';
+  if (!['observe', 'mixed', 'required'].includes(value)) {
+    throw new Error(`${AGENT_AUTH_MODE_ENV} must be observe, mixed, or required`);
+  }
+  return value;
+}
+
+function readAgentCredentialFile() {
+  for (const envName of RAW_AGENT_KEY_ENV_NAMES) {
+    if (Object.prototype.hasOwnProperty.call(process.env, envName)) {
+      throw new Error(`${envName} is not accepted; use ${AGENT_KEY_FILE_ENV}`);
+    }
+  }
+
+  const configured = Object.prototype.hasOwnProperty.call(process.env, AGENT_KEY_FILE_ENV);
+  if (!configured) return null;
+  if (!process.env[AGENT_KEY_FILE_ENV]) {
+    throw new Error(`${AGENT_KEY_FILE_ENV} must name a protected credential file`);
+  }
+
+  let descriptor;
+  try {
+    const keyPath = path.resolve(process.env[AGENT_KEY_FILE_ENV]);
+    const before = fs.lstatSync(keyPath);
+    if (before.isSymbolicLink()) {
+      throw new Error(`${AGENT_KEY_FILE_ENV} must not reference a symbolic link`);
+    }
+    if (!before.isFile()) {
+      throw new Error(`${AGENT_KEY_FILE_ENV} must reference a regular file`);
+    }
+    if (process.platform !== 'win32') {
+      const permissions = before.mode & 0o7777;
+      if (permissions !== 0o400 && permissions !== 0o600) {
+        throw new Error(`${AGENT_KEY_FILE_ENV} must reference a mode-400 or mode-600 file`);
+      }
+      if (typeof process.geteuid === 'function' && before.uid !== process.geteuid()) {
+        throw new Error(`${AGENT_KEY_FILE_ENV} must be owned by the current user`);
+      }
+    }
+    if (before.size > 512) {
+      throw new Error(`${AGENT_KEY_FILE_ENV} does not contain one valid agent credential`);
+    }
+
+    const noFollow = fs.constants.O_NOFOLLOW || 0;
+    descriptor = fs.openSync(keyPath, fs.constants.O_RDONLY | noFollow);
+    const after = fs.fstatSync(descriptor);
+    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) {
+      throw new Error(`${AGENT_KEY_FILE_ENV} changed while it was being opened`);
+    }
+    if (process.platform !== 'win32') {
+      const permissions = after.mode & 0o7777;
+      if (permissions !== 0o400 && permissions !== 0o600) {
+        throw new Error(`${AGENT_KEY_FILE_ENV} must reference a mode-400 or mode-600 file`);
+      }
+      if (typeof process.geteuid === 'function' && after.uid !== process.geteuid()) {
+        throw new Error(`${AGENT_KEY_FILE_ENV} must be owned by the current user`);
+      }
+    }
+    if (after.size > 512) {
+      throw new Error(`${AGENT_KEY_FILE_ENV} does not contain one valid agent credential`);
+    }
+    const token = fs.readFileSync(descriptor, 'utf8').trim();
+    if (!AGENT_KEY_PATTERN.test(token)) {
+      throw new Error(`${AGENT_KEY_FILE_ENV} does not contain one valid agent credential`);
+    }
+    return token;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(AGENT_KEY_FILE_ENV)) {
+      throw error;
+    }
+    throw new Error(`${AGENT_KEY_FILE_ENV} could not be read safely`);
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
 
 function normalizeAgentId(value, source) {
   if (typeof value !== 'string') {
@@ -137,26 +220,101 @@ const identityLocked = Boolean(configuredIdentity);
 let currentName = process.env.AGENT_NAME || process.env.MCP_AGENT_NAME || `stdio-bridge-${shortHost}`;
 const DEFAULT_CAPABILITIES = ['mcp-client', 'bridge', 'ai-to-ai-messaging'];
 let currentCapabilities = DEFAULT_CAPABILITIES.slice();
-
-// Create readline interface for STDIO only after identity validation. Invalid
-// or conflicting aliases fail before the bridge can forward any request.
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: false
-});
+let agentAuthMode;
+let agentCredential;
+try {
+  agentAuthMode = configuredAgentAuthMode();
+  agentCredential = readAgentCredentialFile();
+  if (agentAuthMode === 'required' && !agentCredential) {
+    throw new Error(`${AGENT_KEY_FILE_ENV} is required when ${AGENT_AUTH_MODE_ENV}=required`);
+  }
+} catch (error) {
+  process.stderr.write(`[MCP STDIO Bridge] Agent credential configuration error: ${error.message}\n`);
+  process.exit(2);
+}
 
 // Track message IDs to handle async responses
 const pendingRequests = new Map();
 let nextId = 1;
 
-function buildHeaders(payload) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(payload)
-  };
+function buildHeaders(payload = null) {
+  const headers = {};
+  if (payload !== null) {
+    headers['Content-Type'] = 'application/json';
+    headers['Content-Length'] = Buffer.byteLength(payload);
+  }
   if (process.env.API_KEY) headers['x-api-key'] = process.env.API_KEY;
+  if (agentCredential) {
+    headers['X-Hythe-Agent-Key'] = agentCredential;
+    headers['X-Hythe-Agent-Id'] = currentFrom;
+  }
   return headers;
+}
+
+function verifyServerBoundIdentity() {
+  if (!agentCredential) return Promise.resolve();
+
+  return new Promise((resolveAttestation, rejectAttestation) => {
+    const req = http.request({
+      hostname: SERVER_HOSTNAME,
+      port: SERVER_PORT,
+      path: '/agent/whoami',
+      method: 'GET',
+      headers: buildHeaders(),
+    }, (res) => {
+      let body = '';
+      let oversized = false;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (oversized) return;
+        body += chunk;
+        if (Buffer.byteLength(body) > 65_536) {
+          oversized = true;
+          body = '';
+        }
+      });
+      res.on('end', () => {
+        if (oversized || res.statusCode !== 200) {
+          rejectAttestation(new Error('server rejected agent credential attestation'));
+          return;
+        }
+        let attestation;
+        try {
+          attestation = JSON.parse(body);
+        } catch {
+          rejectAttestation(new Error('server returned an invalid agent attestation'));
+          return;
+        }
+        if (
+          !attestation
+          || typeof attestation !== 'object'
+          || typeof attestation.agentId !== 'string'
+          || attestation.agentId !== currentFrom
+          || typeof attestation.credentialId !== 'string'
+          || !Array.isArray(attestation.scopes)
+        ) {
+          rejectAttestation(new Error('server-bound agent identity does not match HYTHE_AGENT_ID'));
+          return;
+        }
+        const attestedMode = attestation.authMode;
+        if (
+          !Object.prototype.hasOwnProperty.call(AGENT_AUTH_MODE_STRENGTH, attestedMode)
+          || AGENT_AUTH_MODE_STRENGTH[attestedMode] < AGENT_AUTH_MODE_STRENGTH[agentAuthMode]
+        ) {
+          rejectAttestation(new Error('server agent authorization mode is weaker than configured'));
+          return;
+        }
+        resolveAttestation();
+      });
+    });
+    req.setTimeout(5_000, () => {
+      req.destroy(new Error('agent attestation timed out'));
+    });
+    req.on('error', () => {
+      rejectAttestation(new Error('server agent credential attestation failed'));
+    });
+    req.end();
+  });
 }
 
 function postJsonRpc(message, { onComplete, suppressLog = false } = {}) {
@@ -204,7 +362,7 @@ function registerCurrentAgent(extraMetadata = {}) {
   const metadata = {
     pid: process.pid,
     generated: identityGenerated,
-    version: '1.0.0',
+    version: PACKAGE_VERSION,
     bridge: 'mcp-stdio-http',
     host: shortHost,
     ...extraMetadata
@@ -351,9 +509,10 @@ function bindToolIdentity(serverMessage, originalId) {
 // Oversized-message resource handles carry the exact recipient as their
 // middle segment: engram://message/<scope>/<recipient>/<message>. A bridge
 // with a fixed lane identity rejects foreign and legacy recipient-unbound
-// handles before any HTTP request. This is local defense in depth; the
-// shared-key HTTP server still treats a correctly formed URI as a bearer
-// capability and independently verifies its tenant+scope+recipient+id tuple.
+// handles before any HTTP request. The server independently verifies the
+// tenant+scope+recipient+id tuple and, when agent authorization is active,
+// binds that recipient to the authenticated exact principal. Required mode
+// rejects resource access with omitted per-agent proof.
 function bindMessageResourceIdentity(serverMessage, originalId) {
   if (serverMessage.method !== 'resources/read') return true;
 
@@ -388,8 +547,10 @@ function bindMessageResourceIdentity(serverMessage, originalId) {
   return true;
 }
 
-// Handle incoming STDIO messages from Claude Desktop
-rl.on('line', (line) => {
+// Handle incoming STDIO messages from Claude Desktop. The readline listener
+// is attached only after an optional server-derived identity attestation has
+// succeeded, so no initialization or tool request can race the preflight.
+function handleStdioLine(line) {
   if (!line.trim()) return;
   
   try {
@@ -414,7 +575,7 @@ rl.on('line', (line) => {
           },
           serverInfo: {
             name: SERVER_INFO_NAME,
-            version: '1.0.0'
+            version: PACKAGE_VERSION
           }
         }
       };
@@ -431,14 +592,7 @@ rl.on('line', (line) => {
         port: SERVER_PORT,
         path: '/mcp',
         method: 'POST',
-        headers: (() => {
-          const h = {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(postData)
-          };
-          if (process.env.API_KEY) h['x-api-key'] = process.env.API_KEY;
-          return h;
-        })()
+        headers: buildHeaders(postData)
       };
       
       const req = http.request(options, (res) => {
@@ -506,14 +660,7 @@ rl.on('line', (line) => {
       port: SERVER_PORT,
       path: '/mcp',
       method: 'POST',
-      headers: (() => {
-        const h = {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData)
-        };
-        if (process.env.API_KEY) h['x-api-key'] = process.env.API_KEY;
-        return h;
-      })()
+      headers: buildHeaders(postData)
     };
     
     const req = http.request(options, (res) => {
@@ -578,7 +725,7 @@ rl.on('line', (line) => {
   } catch (error) {
     process.stderr.write(`[MCP STDIO Bridge] Parse error: ${error.message}\n`);
   }
-});
+}
 
 // Handle process termination
 process.on('SIGINT', () => {
@@ -591,5 +738,15 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-// Log ready to stderr
-process.stderr.write(`[MCP STDIO Bridge] Ready - connecting to ${SERVER_HOSTNAME}:${SERVER_PORT}\n`);
+verifyServerBoundIdentity().then(() => {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+  });
+  rl.on('line', handleStdioLine);
+  process.stderr.write(`[MCP STDIO Bridge] Ready - connecting to ${SERVER_HOSTNAME}:${SERVER_PORT}\n`);
+}).catch((error) => {
+  process.stderr.write(`[MCP STDIO Bridge] Agent credential attestation error: ${error.message}\n`);
+  process.exit(2);
+});

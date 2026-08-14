@@ -151,7 +151,7 @@ export const RESUME_INPUT_SCHEMA = {
   additionalProperties: false,
   required: ['agentId', 'scope', 'budget'],
   properties: {
-    agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'ASSERTED exact opaque caller identity within the operator/API-key trust boundary (platform max 100). Case and transport-looking suffixes are identity-significant; this principal owns authorship, acks, and views.' },
+    agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'Exact opaque caller identity (platform max 100). With per-agent proof the server injects and authorizes the authenticated principal; observe-mode legacy calls may assert it explicitly. Case and transport-looking suffixes are identity-significant; this principal owns authorship, acks, and views.' },
     scope: SCOPE_SCHEMA,
     budget: { type: 'integer', minimum: 256, description: 'Hard total token budget for the bundle.' },
     sections: {

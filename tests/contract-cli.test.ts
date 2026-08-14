@@ -12,7 +12,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, statSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +26,7 @@ const serverKey = isHytheDistribution ? 'hythe' : 'engram';
 const keyFileEnv = isHytheDistribution ? 'HYTHE_API_KEY_FILE' : 'ENGRAM_API_KEY_FILE';
 const agentIdEnv = isHytheDistribution ? 'HYTHE_AGENT_ID' : 'ENGRAM_AGENT_ID';
 const testAgentId = 'codex-public-client';
+const packageSpec = `${pkg.name}@${pkg.version}`;
 
 const run = (args: string[], opts: Record<string, unknown> = {}) =>
   spawnSync('node', [CLI, ...args], { encoding: 'utf8', timeout: 15000, ...opts });
@@ -37,8 +38,11 @@ const containsCredentialShapedToken = (text: string) =>
   );
 
 describe('package-selected CLI (bin install path)', () => {
-  it('package.json maps the selected single bin to an existing entrypoint and ships bin + bridge', () => {
-    expect(pkg.bin).toEqual({ [cliName]: 'bin/engram-mcp.cjs' });
+  it('package.json maps the client and operator bins to shipped entrypoints', () => {
+    expect(pkg.bin).toEqual({
+      [cliName]: 'bin/engram-mcp.cjs',
+      'hythe-agent-auth': 'dist/agent-auth/operator.js',
+    });
     expect(existsSync(CLI)).toBe(true);
     expect(pkg.files).toContain('bin/');
     expect(pkg.files).toContain('mcp-stdio-http-bridge.cjs');
@@ -80,7 +84,7 @@ describe('package-selected CLI (bin install path)', () => {
       expect(start).toBeGreaterThan(-1);
       const block = JSON.parse(lines.slice(start + 1, end).join('\n').trim());
       expect(block.mcpServers[serverKey].command).toBe('npx');
-      expect(block.mcpServers[serverKey].args).toEqual(['-y', pkg.name]);
+      expect(block.mcpServers[serverKey].args).toEqual(['-y', packageSpec]);
       const clientEnv = block.mcpServers[serverKey].env;
       expect(Object.keys(clientEnv).sort()).toEqual([keyFileEnv, agentIdEnv, 'MCP_HOST', 'MCP_PORT'].sort());
       expect(clientEnv[keyFileEnv] === envPath).toBe(true);
@@ -92,8 +96,64 @@ describe('package-selected CLI (bin install path)', () => {
       expect(res.stdout).toContain(`${agentIdEnv} = "${testAgentId}"`);
       expect(res.stdout).toContain('Claude plugin hooks are separate child processes');
       expect(res.stdout).toContain(`${agentIdEnv}='${testAgentId}' claude`);
+      expect(res.stdout).toContain(`--branch v${pkg.version}`);
+      expect(res.stdout).toContain('server source is not bundled');
+      expect(res.stdout).not.toContain('Start the server:  docker compose');
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('init rejects unknown, stray, duplicate flag, and typo arguments without creating files', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'engram-cli-unknown-'));
+    try {
+      const cases = [
+        ['--agent-auth-mod', 'required'],
+        ['stray-positional'],
+        ['--write-env', '--write-env'],
+      ];
+      for (const extra of cases) {
+        const res = run(['init', '--agent-id', testAgentId, ...extra], { cwd: dir });
+        expect(res.status, extra.join(' ')).toBe(2);
+        expect(res.stderr).toMatch(/unknown|stray|specified only once/i);
+        expect(existsSync(join(dir, '.env'))).toBe(false);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('starts Docker only from the exact matching server checkout and rejects stale lookalikes', () => {
+    const matching = run(['init', '--agent-id', testAgentId], { cwd: REPO });
+    expect(matching.status).toBe(0);
+    expect(matching.stdout).toContain('Start the server:  docker compose');
+    expect(matching.stdout).not.toContain('not an exact HYTHE');
+
+    const stale = mkdtempSync(join(tmpdir(), 'hythe-stale-checkout-'));
+    try {
+      mkdirSync(join(stale, 'src'));
+      mkdirSync(join(stale, 'docker'));
+      writeFileSync(join(stale, 'tsconfig.json'), '{}\n');
+      writeFileSync(join(stale, 'docker', 'Dockerfile'), 'FROM scratch\n');
+      writeFileSync(join(stale, 'docker', 'docker-compose.yml'), 'services: {}\n');
+      writeFileSync(join(stale, 'package.json'), JSON.stringify({
+        name: pkg.name,
+        version: '0.1.4',
+        hytheDistribution: true,
+      }));
+      writeFileSync(join(stale, 'package-lock.json'), JSON.stringify({
+        name: pkg.name,
+        version: '0.1.4',
+        packages: { '': { version: '0.1.4' } },
+      }));
+
+      const result = run(['init', '--agent-id', testAgentId], { cwd: stale });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`not an exact HYTHE v${pkg.version}`);
+      expect(result.stdout).toContain(`--branch v${pkg.version}`);
+      expect(result.stdout).not.toContain('Start the server:  docker compose');
+    } finally {
+      rmSync(stale, { recursive: true, force: true });
     }
   });
 

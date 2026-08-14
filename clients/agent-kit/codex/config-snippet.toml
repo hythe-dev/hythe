@@ -1,12 +1,19 @@
 # Codex config additions (~/.codex/config.toml) — HYTHE memory wiring.
-# Easiest path: run `npx -y @hythe/mcp init --agent-id codex-cli` — it
-# prints this exact identity-bound block ready to paste. The credential stays
-# in the protected file; placeholders below are non-secret.
+# After an operator provisions this exact principal's credential, run:
+# `npx -y @hythe/mcp@0.1.5 init --agent-id codex-cli \
+#   --agent-key-file /absolute/path/to/codex-cli.agent-key \
+#   --agent-auth-mode required`
+# It prints this exact identity-bound block ready to paste. Both credentials
+# stay in protected files; placeholders below are non-secret.
 
 [mcp_servers.hythe]
 command = "npx"
-args = ["-y", "@hythe/mcp"]
-env = { HYTHE_API_KEY_FILE = "/absolute/path/to/.env", HYTHE_AGENT_ID = "codex-cli", MCP_HOST = "127.0.0.1", MCP_PORT = "6174" }
+args = ["-y", "@hythe/mcp@0.1.5"]
+env = { HYTHE_API_KEY_FILE = "/absolute/path/to/.env", HYTHE_AGENT_ID = "codex-cli", HYTHE_AGENT_KEY_FILE = "/absolute/path/to/codex-cli.agent-key", HYTHE_AGENT_AUTH_MODE = "required", MCP_HOST = "127.0.0.1", MCP_PORT = "6174" }
+
+# HYTHE_AGENT_KEY_FILE contains exactly the raw hya1 token plus an optional
+# trailing newline. It must be a regular, non-symlink file owned by this user
+# with mode 0400 or 0600. Never put the token itself in config or a URL.
 
 # This binds the transport, but MCP child env is not automatically
 # model-visible. Pair it with a trusted session hook/launcher that injects the

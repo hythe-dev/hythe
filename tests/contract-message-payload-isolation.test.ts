@@ -762,15 +762,21 @@ describe('Direct-message payload isolation', () => {
       timezoneHint: null,
     };
     const attempts = [
-      await mcpRaw(server, 'delete_entity', { entityName: privateName }, devContext),
+      await mcpRaw(server, 'delete_entity', {
+        agentId: 'privacy-regression-operator',
+        entityName: privateName,
+      }, devContext),
       await mcpRaw(server, 'remove_observations', {
+        agentId: 'privacy-regression-operator',
         entityName: privateAlias,
         observationIds: [privateObservationId],
       }, devContext),
       await mcpRaw(server, 'delete_observations_by_entity', {
+        agentId: 'privacy-regression-operator',
         entityName: privateAlias,
       }, devContext),
       await mcpRaw(server, 'update_observation', {
+        agentId: 'privacy-regression-operator',
         observationId: privateObservationId,
         newContent: 'generic mutation must not replace private content',
       }, devContext),
@@ -799,6 +805,7 @@ describe('Direct-message payload isolation', () => {
       contents: ['public before'],
     }, 'shared', 'observation', 'default');
     const publicUpdate = await mcpRaw(server, 'update_observation', {
+      agentId: 'privacy-regression-operator',
       observationId: publicObservationId,
       newContent: 'public after',
     }, devContext);

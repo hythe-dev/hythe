@@ -5114,13 +5114,14 @@ export class MemoryManager {
       const id = uuidv4();
       const hash = MemoryManager.contentHash(targetIds.join(','));
       const actorId = context.userId || context.apiKeyId || 'system';
+      const agentId = context.agentPrincipal?.agentId || actorId;
       this.db.prepare(
         `INSERT INTO neural_audit_log (id, operation, agent_id, entity_name, content_hash, flagged, flag_reason, tenant_id, actor_type, actor_id, target_count, reason)
          VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?)`
       ).run(
         id,
         operation,
-        actorId,
+        agentId,
         entityName,
         hash,
         context.tenantId,

@@ -46,6 +46,20 @@ try {
       throw new Error(`npm tarball omits Docker runtime artifact: ${requiredDockerPath}`);
     }
   }
+  for (const requiredMigrationTool of [
+    'dist/migrations/008-agent-principals.mjs',
+    'dist/migrations/private-message-residue-adjudication.mjs',
+    'dist/migrations/vacuum-sanitized-database.mjs',
+  ]) {
+    if (!packedPaths.includes(requiredMigrationTool)) {
+      throw new Error(`npm tarball omits offline migration tool: ${requiredMigrationTool}`);
+    }
+  }
+  for (const requiredReleaseDocument of ['CHANGELOG.md', 'SECURITY.md']) {
+    if (!packedPaths.includes(requiredReleaseDocument)) {
+      throw new Error(`npm tarball omits release document: ${requiredReleaseDocument}`);
+    }
+  }
   if (Number(packReport?.[0]?.size) > 2 * 1024 * 1024) {
     throw new Error(`npm tarball unexpectedly exceeds 2 MiB: ${packReport[0].size} bytes`);
   }
@@ -94,6 +108,44 @@ try {
   if (!cli.stdout.includes('@hythe/mcp — HYTHE stdio bridge')) {
     throw new Error('packed consumer CLI help contract drift');
   }
+  const operatorHelp = run(
+    join(consumer, 'node_modules/.bin/hythe-agent-auth'),
+    ['--help'],
+    { cwd: consumer }
+  );
+  if (!operatorHelp.stdout.includes('hythe-agent-auth issue')) {
+    throw new Error('packed consumer agent credential operator help contract drift');
+  }
+  const generatedAgentKeyPath = join(work, 'packed-agent.key');
+  const identityConfig = run(
+    join(consumer, 'node_modules/.bin/hythe-mcp'),
+    [
+      'init',
+      '--agent-id', 'packed-agent',
+      '--agent-key-file', generatedAgentKeyPath,
+      '--agent-auth-mode', 'required',
+    ],
+    { cwd: consumer }
+  );
+  if (!identityConfig.stdout.includes('HYTHE_AGENT_KEY_FILE')
+      || !identityConfig.stdout.includes(generatedAgentKeyPath)
+      || !identityConfig.stdout.includes('HYTHE_AGENT_AUTH_MODE')
+      || !identityConfig.stdout.includes('required')
+      || !identityConfig.stdout.includes('@hythe/mcp@0.1.5')
+      || !identityConfig.stdout.includes('--branch v0.1.5')
+      || !identityConfig.stdout.includes('server source is not bundled')
+      || identityConfig.stdout.includes('Start the server:  docker compose')
+      || /hya1_[a-f0-9]{24}_[A-Za-z0-9_-]{43}/.test(identityConfig.stdout)) {
+    throw new Error('packed consumer dual-proof config generation contract drift');
+  }
+  const typoConfig = run(
+    join(consumer, 'node_modules/.bin/hythe-mcp'),
+    ['init', '--agent-id', 'packed-agent', '--agent-auth-mod', 'required'],
+    { cwd: consumer, allowFailure: true }
+  );
+  if (typoConfig.status !== 2 || typoConfig.stdout !== '') {
+    throw new Error('packed consumer init accepted an unknown authorization option');
+  }
 
   const migration = join(consumer, 'node_modules/@hythe/mcp/dist/migrations/007-private-message-residue.mjs');
   const emptyDatabase = join(work, 'empty.db');
@@ -108,6 +160,34 @@ manager.close();
   const migrationSmoke = run(process.execPath, [migration, emptyDatabase], { cwd: consumer });
   if (!/"mode"\s*:\s*"dry-run"/i.test(`${migrationSmoke.stdout}\n${migrationSmoke.stderr}`)) {
     throw new Error('packed consumer migration did not run in dry-run mode');
+  }
+
+  const adjudication = join(
+    consumer,
+    'node_modules/@hythe/mcp/dist/migrations/private-message-residue-adjudication.mjs'
+  );
+  const adjudicationSmoke = run(process.execPath, [adjudication, emptyDatabase], { cwd: consumer });
+  const adjudicationOutput = `${adjudicationSmoke.stdout}\n${adjudicationSmoke.stderr}`;
+  if (!/"mode"\s*:\s*"inventory"/i.test(adjudicationOutput)
+      || !/"status"\s*:\s*"inventoried"/i.test(adjudicationOutput)) {
+    throw new Error('packed consumer adjudication tool did not run a read-only inventory');
+  }
+
+  const sanitation = join(
+    consumer,
+    'node_modules/@hythe/mcp/dist/migrations/vacuum-sanitized-database.mjs'
+  );
+  const sanitationOutputPath = join(work, 'sanitized-plan-output.db');
+  const sanitationSmoke = run(
+    process.execPath,
+    [sanitation, emptyDatabase, '--output', sanitationOutputPath],
+    { cwd: consumer }
+  );
+  const sanitationOutput = `${sanitationSmoke.stdout}\n${sanitationSmoke.stderr}`;
+  if (!/"mode"\s*:\s*"plan"/i.test(sanitationOutput)
+      || !/"status"\s*:\s*"ready"/i.test(sanitationOutput)
+      || existsSync(sanitationOutputPath)) {
+    throw new Error('packed consumer sanitation tool did not run a non-writing ready plan');
   }
 
   const vectorSmokePath = join(consumer, 'vector-smoke.mjs');
@@ -137,7 +217,9 @@ try {
     throw new Error('packed consumer hash-fallback smoke contract drift');
   }
 
-  process.stdout.write('Packed HYTHE consumer verification passed: audit 0, CLI + migration + deterministic hash fallback.\n');
+  process.stdout.write(
+    'Packed HYTHE consumer verification passed: audit 0, dual-proof CLI/operator + migration/adjudication/sanitation + deterministic hash fallback.\n'
+  );
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

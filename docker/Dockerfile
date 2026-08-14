@@ -39,5 +39,5 @@ ENV SQLITE_VEC_TRANSFORMERS_MODULE=file:///opt/hythe-transformers/node_modules/@
 USER engram
 EXPOSE 6174 3004
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=40s \
-  CMD node -e "fetch('http://localhost:6174/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://localhost:6174/ready').then(async r=>{const b=await r.json();process.exit(r.status===200&&b.ready===true&&b.degraded===false?0:1)}).catch(()=>process.exit(1))"
 CMD ["sh", "-c", "node docker/verify-transformer-runtime.mjs && exec node dist/unified-neural-mcp-server.js"]

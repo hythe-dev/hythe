@@ -13,18 +13,28 @@
  * legacy pointer/entity/message/vector row must be uniquely and tenant-safely
  * accounted for; ambiguous or orphaned state is reported and left untouched.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import {
+  chmodSync,
+  constants,
+  createReadStream,
   existsSync,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   closeSync,
-  renameSync,
+  readSync,
+  realpathSync,
+  statSync,
   unlinkSync,
-  writeFileSync,
+  writeSync,
 } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
@@ -36,6 +46,7 @@ const AUDIT_TABLE = 'private_message_residue_migration_audit';
 const DEFAULT_VECTOR_TABLE = 'shared_memory_vec';
 const DEFAULT_VECTOR_INDEX_TABLE = 'neural_vec_index';
 const SAFE_SQLITE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-journal', '-shm'];
 const PRIVATE_OBSERVATION_SOURCES = new Set([
   'create_entities_inline',
   'add_observations',
@@ -52,6 +63,207 @@ function stableStringify(value) {
       `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
+}
+
+function quoteIdentifier(value) {
+  return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+async function fileHash(path) {
+  const digest = createHash('sha256');
+  await new Promise((resolvePromise, reject) => {
+    const stream = createReadStream(path);
+    stream.on('data', (chunk) => digest.update(chunk));
+    stream.once('error', reject);
+    stream.once('end', resolvePromise);
+  });
+  return digest.digest('hex');
+}
+
+function pathIdentity(path) {
+  const realpath = realpathSync(resolve(path));
+  const stats = statSync(realpath, { bigint: true });
+  return {
+    realpath,
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    bytes: stats.size.toString(),
+    mtimeNs: stats.mtimeNs.toString(),
+  };
+}
+
+function sameFileObject(left, right) {
+  return Boolean(left && right
+    && left.device === right.device
+    && left.inode === right.inode);
+}
+
+function databasePathFromConnection(db) {
+  const main = db.prepare('PRAGMA database_list').all().find((row) => row.name === 'main');
+  if (!main?.file) throw new Error('migration requires a file-backed main SQLite database');
+  return main.file;
+}
+
+function logicalDatabaseSnapshot(db) {
+  const schemaObjects = db.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    ORDER BY type, name COLLATE BINARY
+  `).all();
+  const tables = schemaObjects
+    .filter((object) => object.type === 'table')
+    .map((object) => object.name);
+  const tableDigests = [];
+  for (const table of tables) {
+    const tableSql = schemaObjects.find((object) => object.type === 'table' && object.name === table)?.sql || '';
+    const columns = new Set(db.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all()
+      .map((column) => String(column.name).toLowerCase()));
+    const rowIdAlias = /\bWITHOUT\s+ROWID\b/i.test(tableSql)
+      ? null
+      : ['rowid', '_rowid_', 'oid'].find((candidate) => !columns.has(candidate));
+    const select = rowIdAlias
+      ? `SELECT ${rowIdAlias} AS __pmr_logical_rowid, * FROM ${quoteIdentifier(table)}`
+      : `SELECT * FROM ${quoteIdentifier(table)}`;
+    const rowHashes = [];
+    for (const row of db.prepare(select).iterate()) rowHashes.push(hash(stableStringify(row)));
+    rowHashes.sort();
+    tableDigests.push({ table, rows: rowHashes.length, digest: hash(rowHashes.join('\n')) });
+  }
+  const schemaDigest = hash(stableStringify(schemaObjects));
+  return {
+    schemaObjects: schemaObjects.length,
+    schemaDigest,
+    tables: tableDigests,
+    digest: hash(stableStringify({ schemaDigest, tables: tableDigests })),
+  };
+}
+
+function databaseChecks(db) {
+  const quickCheck = db.pragma('quick_check', { simple: true });
+  const integrityRows = db.pragma('integrity_check');
+  const integrityCheck = integrityRows.length === 1 && integrityRows[0].integrity_check === 'ok'
+    ? 'ok'
+    : integrityRows;
+  const foreignKeyViolations = db.pragma('foreign_key_check').length;
+  return { quickCheck, integrityCheck, foreignKeyViolations };
+}
+
+function fsyncFileAndParent(path) {
+  const fileDescriptor = openSync(path, 'r');
+  try {
+    fsyncSync(fileDescriptor);
+  } finally {
+    closeSync(fileDescriptor);
+  }
+  const directoryDescriptor = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(directoryDescriptor);
+  } finally {
+    closeSync(directoryDescriptor);
+  }
+}
+
+function uniqueSiblingPath(path) {
+  return `${path}.unverified-${process.pid}-${Date.now()}-${randomBytes(8).toString('hex')}`;
+}
+
+function publishNoClobber(temporaryPath, finalPath) {
+  linkSync(temporaryPath, finalPath);
+  try {
+    chmodSync(finalPath, 0o600);
+    fsyncFileAndParent(finalPath);
+    unlinkSync(temporaryPath);
+  } catch (error) {
+    try {
+      const temporaryIdentity = pathIdentity(temporaryPath);
+      const finalIdentity = pathIdentity(finalPath);
+      if (sameFileObject(temporaryIdentity, finalIdentity)) unlinkSync(finalPath);
+    } catch {
+      // Preserve an independently-created destination if publication lost ownership.
+    }
+    throw error;
+  }
+}
+
+function sqlitePathsCollide(left, right) {
+  if (left === right) return true;
+  return SQLITE_SIDECAR_SUFFIXES.some((suffix) => left === `${right}${suffix}` || right === `${left}${suffix}`);
+}
+
+function canonicalProspectivePath(path) {
+  const absolute = resolve(path);
+  const suffix = [basename(absolute)];
+  let ancestor = dirname(absolute);
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) throw new Error(`cannot resolve artifact parent for ${absolute}`);
+    suffix.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  return resolve(realpathSync(ancestor), ...suffix);
+}
+
+function validateReportPath(databasePath, reportPath) {
+  const canonicalDatabase = realpathSync(resolve(databasePath));
+  const canonicalReport = canonicalProspectivePath(reportPath);
+  if (sqlitePathsCollide(canonicalDatabase, canonicalReport)) {
+    throw new Error('report path collides with the source SQLite database or one of its sidecars');
+  }
+}
+
+function validateArtifactPaths(databasePath, backupPath, reportPath) {
+  const canonicalDatabase = realpathSync(resolve(databasePath));
+  const canonicalBackup = canonicalProspectivePath(backupPath);
+  const canonicalReport = canonicalProspectivePath(reportPath);
+  if (new Set([canonicalDatabase, canonicalBackup, canonicalReport]).size !== 3) {
+    throw new Error('database, backup, and report paths must be distinct');
+  }
+  if (sqlitePathsCollide(canonicalDatabase, canonicalBackup)) {
+    throw new Error('backup path collides with the source SQLite database or one of its sidecars');
+  }
+  if (sqlitePathsCollide(canonicalDatabase, canonicalReport)) {
+    throw new Error('report path collides with the source SQLite database or one of its sidecars');
+  }
+  if (sqlitePathsCollide(canonicalBackup, canonicalReport)) {
+    throw new Error('backup and report paths collide within one SQLite sidecar namespace');
+  }
+}
+
+async function verifyArtifact(path, expectedIdentity, expectedHash, expectedBytes) {
+  try {
+    const before = pathIdentity(path);
+    if (!sameFileObject(before, expectedIdentity)
+        || before.realpath !== expectedIdentity.realpath
+        || before.bytes !== String(expectedBytes)
+        || statSync(path).size !== expectedBytes) return false;
+    const actualHash = await fileHash(path);
+    const after = pathIdentity(path);
+    return sameFileObject(after, expectedIdentity)
+      && after.realpath === expectedIdentity.realpath
+      && after.bytes === String(expectedBytes)
+      && statSync(path).size === expectedBytes
+      && actualHash === expectedHash;
+  } catch {
+    return false;
+  }
+}
+
+function unlinkIfSameObject(path, expectedIdentity) {
+  try {
+    if (!sameFileObject(pathIdentity(path), expectedIdentity)) return false;
+    unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function markCommittedBackupVerificationFailure(report, counts) {
+  report.status = 'committed-backup-verification-failed';
+  report.committed = true;
+  report.committedCounts = counts || report.applied || report.committedCounts;
+  delete report.applied;
+  report.error = 'database committed but the verified backup is missing or changed';
 }
 
 function tableExists(db, name) {
@@ -1092,6 +1304,7 @@ function ensureNewOutputPath(path, label) {
   mkdirSync(dirname(absolute), { recursive: true });
   const fd = openSync(absolute, 'wx', 0o600);
   closeSync(fd);
+  fsyncFileAndParent(absolute);
   return absolute;
 }
 
@@ -1103,19 +1316,67 @@ function validateNewOutputPath(path, label) {
   return absolute;
 }
 
-function writeReport(path, report) {
+function reportOwnership(path) {
+  if (!path) return null;
+  const fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW);
+  const stats = fstatSync(fd, { bigint: true });
+  return {
+    fd,
+    device: stats.dev.toString(),
+    inode: stats.ino.toString(),
+    ctimeNs: stats.ctimeNs.toString(),
+    hash: hash(Buffer.alloc(0)),
+  };
+}
+
+function writeReport(path, report, ownership) {
   if (!path) return;
-  const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    writeFileSync(temporaryPath, `${JSON.stringify(report, null, 2)}\n`, {
-      mode: 0o600,
-      flag: 'wx',
-    });
-    renameSync(temporaryPath, path);
-  } catch (error) {
-    try { unlinkSync(temporaryPath); } catch { /* no temporary file to remove */ }
-    throw error;
+  if (!ownership) throw new Error('report ownership evidence is required');
+  const content = Buffer.from(`${JSON.stringify(report, null, 2)}\n`);
+  const fd = ownership.fd;
+  {
+    const before = fstatSync(fd, { bigint: true });
+    if (before.dev.toString() !== ownership.device || before.ino.toString() !== ownership.inode
+        || before.ctimeNs.toString() !== ownership.ctimeNs) {
+      throw new Error('report path ownership changed; refusing to overwrite it');
+    }
+    const pathBefore = lstatSync(path, { bigint: true });
+    if (pathBefore.dev.toString() !== ownership.device || pathBefore.ino.toString() !== ownership.inode) {
+      throw new Error('report path ownership changed; refusing to overwrite it');
+    }
+    const existing = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < existing.length) {
+      const bytesRead = readSync(fd, existing, offset, existing.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== existing.length || hash(existing) !== ownership.hash) {
+      throw new Error('report content changed outside this migration; refusing to overwrite it');
+    }
+    ftruncateSync(fd, 0);
+    let written = 0;
+    while (written < content.length) {
+      written += writeSync(fd, content, written, content.length - written, written);
+    }
+    fsyncSync(fd);
+    const after = fstatSync(fd, { bigint: true });
+    if (after.dev.toString() !== ownership.device || after.ino.toString() !== ownership.inode) {
+      throw new Error('report file identity changed during write');
+    }
+    const pathStats = lstatSync(path, { bigint: true });
+    if (pathStats.dev.toString() !== ownership.device || pathStats.ino.toString() !== ownership.inode) {
+      throw new Error('report path was independently replaced; replacement was preserved');
+    }
+    ownership.hash = hash(content);
+    ownership.ctimeNs = after.ctimeNs.toString();
   }
+}
+
+function closeReportOwnership(ownership) {
+  if (!ownership) return;
+  closeSync(ownership.fd);
+  ownership.fd = null;
 }
 
 function deleteScopedIndexRows(db, table, tenantColumn, idColumn, rows) {
@@ -1256,22 +1517,31 @@ export async function runPrivateMessageResidueMigration(options) {
     if (!options.reportPath) throw new Error('--report is required with --execute');
     const requestedBackup = resolve(options.backupPath);
     const requestedReport = resolve(options.reportPath);
-    if (new Set([dbPath, requestedBackup, requestedReport]).size !== 3) {
-      throw new Error('database, backup, and report paths must be distinct');
+    validateArtifactPaths(dbPath, requestedBackup, requestedReport);
+    const canonicalDatabasePath = realpathSync(dbPath);
+    if (canonicalDatabasePath !== dbPath) {
+      validateArtifactPaths(canonicalDatabasePath, requestedBackup, requestedReport);
     }
     backupPath = validateNewOutputPath(requestedBackup, 'backup');
     reportPath = ensureNewOutputPath(requestedReport, 'report');
   } else if (options.reportPath) {
-    reportPath = ensureNewOutputPath(options.reportPath, 'report');
+    const requestedReport = resolve(options.reportPath);
+    validateReportPath(dbPath, requestedReport);
+    const canonicalDatabasePath = realpathSync(dbPath);
+    if (canonicalDatabasePath !== dbPath) validateReportPath(canonicalDatabasePath, requestedReport);
+    reportPath = ensureNewOutputPath(requestedReport, 'report');
   }
-
   const startedAt = new Date().toISOString();
-  const db = new Database(dbPath, { readonly: !execute, fileMustExist: true });
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
+  const reportFileOwnership = reportOwnership(reportPath);
+  let db;
+  let sourceIdentity;
   let analysis;
   let report;
   try {
+    db = new Database(dbPath, { readonly: !execute, fileMustExist: true });
+    db.pragma('foreign_keys = ON');
+    db.pragma('busy_timeout = 5000');
+    sourceIdentity = pathIdentity(databasePathFromConnection(db));
     analysis = analyzePrivateMessageResidue(db);
     report = {
       migration: '007-private-message-residue',
@@ -1283,62 +1553,112 @@ export async function runPrivateMessageResidueMigration(options) {
     };
     if (!execute) {
       report.completedAt = new Date().toISOString();
-      writeReport(reportPath, report);
+      writeReport(reportPath, report, reportFileOwnership);
       return report;
     }
     if (!analysis.ready) {
       report.status = 'refused';
       report.completedAt = new Date().toISOString();
-      writeReport(reportPath, report);
+      writeReport(reportPath, report, reportFileOwnership);
       return report;
     }
     if (options.confirm !== analysis.confirmationToken) {
       report.status = 'refused';
       report.issues = [...report.issues, issue('confirmation_token_mismatch')];
       report.completedAt = new Date().toISOString();
-      writeReport(reportPath, report);
+      writeReport(reportPath, report, reportFileOwnership);
       return report;
     }
 
-    // Persist the reviewed preflight before the transaction. Final report
-    // replacement is atomic, so a crash or filesystem failure after COMMIT
-    // leaves an explicit pending artifact rather than an empty/truncated file.
-    writeReport(reportPath, report);
+    // Persist the reviewed preflight before the transaction. Every later
+    // update is bound to this reserved report inode and prior content hash, so
+    // an independently replaced path is never overwritten.
+    if (typeof options.beforePendingReportWrite === 'function') options.beforePendingReportWrite();
+    writeReport(reportPath, report, reportFileOwnership);
+    let backupTemporaryPath = null;
+    let backupTemporaryIdentity = null;
     db.exec('BEGIN IMMEDIATE');
     try {
       const lockedAnalysis = analyzePrivateMessageResidue(db);
       if (!lockedAnalysis.ready || lockedAnalysis.fingerprint !== analysis.fingerprint) {
         throw new Error('database changed after preflight; confirmation token is stale');
       }
+      const lockedSourceIdentity = pathIdentity(dbPath);
+      if (!sameFileObject(lockedSourceIdentity, sourceIdentity)
+          || lockedSourceIdentity.realpath !== sourceIdentity.realpath) {
+        throw new Error('database path no longer names the locked source database');
+      }
+      const lockedLogical = logicalDatabaseSnapshot(db);
 
       // better-sqlite3 intentionally makes backup() a no-op on a connection
       // that already owns a write transaction. Hold the IMMEDIATE lock here,
       // but take the backup through a second read-only connection. This keeps
       // the backup and all following mutations on one stable logical snapshot.
-      ensureNewOutputPath(backupPath, 'backup');
-      const backupSource = new Database(dbPath, { readonly: true, fileMustExist: true });
+      backupTemporaryPath = uniqueSiblingPath(backupPath);
+      const placeholder = openSync(backupTemporaryPath, 'wx', 0o600);
+      closeSync(placeholder);
+      backupTemporaryIdentity = pathIdentity(backupTemporaryPath);
+      const backupSource = new Database(sourceIdentity.realpath, { readonly: true, fileMustExist: true });
       try {
-        await backupSource.backup(backupPath);
+        const backupSourceIdentity = pathIdentity(databasePathFromConnection(backupSource));
+        if (!sameFileObject(backupSourceIdentity, sourceIdentity)) {
+          throw new Error('backup source does not match the locked database object');
+        }
+        await backupSource.backup(backupTemporaryPath);
       } finally {
         backupSource.close();
       }
-      const backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
-      let backupCheck;
+      chmodSync(backupTemporaryPath, 0o600);
+      if (!sameFileObject(pathIdentity(backupTemporaryPath), backupTemporaryIdentity)
+          || !sameFileObject(pathIdentity(dbPath), sourceIdentity)) {
+        throw new Error('database or temporary backup path changed during backup');
+      }
+
+      const backupDb = new Database(backupTemporaryPath, { readonly: true, fileMustExist: true });
+      let backupChecks;
       let backupAnalysis;
+      let backupLogical;
       try {
+        backupDb.pragma('foreign_keys = ON');
         loadVecExtensionIfNeeded(backupDb, lockedAnalysis.vectorStorage.vectorTable);
-        backupCheck = backupDb.pragma('quick_check', { simple: true });
+        backupChecks = databaseChecks(backupDb);
         backupAnalysis = analyzePrivateMessageResidue(backupDb);
+        backupLogical = logicalDatabaseSnapshot(backupDb);
       } finally {
         backupDb.close();
       }
-      if (backupCheck !== 'ok' || backupAnalysis.fingerprint !== lockedAnalysis.fingerprint) {
-        throw new Error('backup verification failed or backup snapshot does not match locked preflight');
+      if (backupChecks.quickCheck !== 'ok' || backupChecks.integrityCheck !== 'ok'
+          || backupChecks.foreignKeyViolations !== 0
+          || backupAnalysis.fingerprint !== lockedAnalysis.fingerprint
+          || backupLogical.digest !== lockedLogical.digest) {
+        throw new Error('backup integrity or full logical snapshot does not match locked preflight');
+      }
+      fsyncFileAndParent(backupTemporaryPath);
+      const backupSha256 = await fileHash(backupTemporaryPath);
+      const backupBytes = statSync(backupTemporaryPath).size;
+      if (options.failAfterBackupVerification) {
+        throw new Error('injected failure after migration backup verification');
+      }
+      if (typeof options.beforeBackupPromotion === 'function') options.beforeBackupPromotion();
+      publishNoClobber(backupTemporaryPath, backupPath);
+      backupTemporaryPath = null;
+      const backupIdentity = pathIdentity(backupPath);
+      if (!sameFileObject(backupIdentity, backupTemporaryIdentity)
+          || !await verifyArtifact(backupPath, backupIdentity, backupSha256, backupBytes)) {
+        throw new Error('verified backup changed during no-clobber publication');
+      }
+      if (typeof options.afterBackupPromotion === 'function') options.afterBackupPromotion();
+      if (!await verifyArtifact(backupPath, backupIdentity, backupSha256, backupBytes)) {
+        throw new Error('verified backup is missing or changed before migration mutation');
       }
       report.backup = {
         path: backupPath,
-        quickCheck: backupCheck,
+        bytes: backupBytes,
+        sha256: backupSha256,
+        pathIdentity: backupIdentity,
+        checks: backupChecks,
         fingerprint: backupAnalysis.fingerprint,
+        logicalDigest: backupLogical.digest,
       };
 
       const counts = applyAnalysis(db, lockedAnalysis, { failAfterStep: options.failAfterStep });
@@ -1350,41 +1670,96 @@ export async function runPrivateMessageResidueMigration(options) {
           applied_at TEXT NOT NULL,
           preflight_fingerprint TEXT NOT NULL,
           backup_path TEXT NOT NULL,
+          backup_sha256 TEXT NOT NULL,
+          backup_bytes INTEGER NOT NULL,
+          backup_identity_json TEXT NOT NULL,
           report_path TEXT NOT NULL,
           counts_json TEXT NOT NULL
         )
       `);
+      const auditColumns = tableColumns(db, AUDIT_TABLE);
+      for (const [column, declaration] of [
+        ['backup_sha256', 'TEXT'],
+        ['backup_bytes', 'INTEGER'],
+        ['backup_identity_json', 'TEXT'],
+      ]) {
+        if (!auditColumns.has(column)) db.exec(`ALTER TABLE ${AUDIT_TABLE} ADD COLUMN ${column} ${declaration}`);
+      }
       const runId = hash(`${analysis.fingerprint}\n${startedAt}\n${reportPath}`).slice(0, 32);
       db.prepare(`
         INSERT INTO ${AUDIT_TABLE}
-          (run_id, applied_at, preflight_fingerprint, backup_path, report_path, counts_json)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(runId, new Date().toISOString(), analysis.fingerprint, backupPath, reportPath, JSON.stringify(counts));
+          (run_id, applied_at, preflight_fingerprint, backup_path, backup_sha256,
+           backup_bytes, backup_identity_json, report_path, counts_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        runId,
+        new Date().toISOString(),
+        analysis.fingerprint,
+        backupPath,
+        backupSha256,
+        backupBytes,
+        JSON.stringify(backupIdentity),
+        reportPath,
+        JSON.stringify(counts)
+      );
+      if (typeof options.beforeCommit === 'function') options.beforeCommit();
+      if (!await verifyArtifact(backupPath, backupIdentity, backupSha256, backupBytes)) {
+        throw new Error('verified backup is missing or changed before commit');
+      }
+      writeReport(reportPath, report, reportFileOwnership);
       db.exec('COMMIT');
-      report.status = 'applied';
       report.runId = runId;
-      report.applied = counts;
       report.quickCheck = postCheck;
+      if (typeof options.afterCommit === 'function') options.afterCommit();
+      if (!await verifyArtifact(backupPath, backupIdentity, backupSha256, backupBytes)) {
+        markCommittedBackupVerificationFailure(report, counts);
+      } else {
+        report.status = 'applied';
+        report.applied = counts;
+      }
     } catch (error) {
+      if (backupTemporaryPath && backupTemporaryIdentity) {
+        unlinkIfSameObject(backupTemporaryPath, backupTemporaryIdentity);
+      }
       if (db.inTransaction) db.exec('ROLLBACK');
       const afterRollback = analyzePrivateMessageResidue(db);
       report.status = 'rolled-back';
       report.rolledBack = afterRollback.fingerprint === analysis.fingerprint;
       report.error = error.message;
       report.completedAt = new Date().toISOString();
-      writeReport(reportPath, report);
+      writeReport(reportPath, report, reportFileOwnership);
       return report;
     }
     report.completedAt = new Date().toISOString();
     try {
-      writeReport(reportPath, report);
+      if (typeof options.beforeFinalReportWrite === 'function') options.beforeFinalReportWrite();
+      if (report.status === 'applied'
+          && !await verifyArtifact(
+            report.backup.path,
+            report.backup.pathIdentity,
+            report.backup.sha256,
+            report.backup.bytes
+          )) {
+        markCommittedBackupVerificationFailure(report, report.applied);
+      }
+      writeReport(reportPath, report, reportFileOwnership);
+      if (report.status === 'applied'
+          && !await verifyArtifact(
+            report.backup.path,
+            report.backup.pathIdentity,
+            report.backup.sha256,
+            report.backup.bytes
+          )) {
+        markCommittedBackupVerificationFailure(report, report.applied);
+        writeReport(reportPath, report, reportFileOwnership);
+      }
     } catch (error) {
       report.reportWriteError = error.message;
-      report.status = 'applied-report-write-failed';
+      if (report.status === 'applied') report.status = 'applied-report-write-failed';
     }
     return report;
   } catch (error) {
-    if (db.inTransaction) db.exec('ROLLBACK');
+    if (db?.inTransaction) db.exec('ROLLBACK');
     const failureReport = report || {
       migration: '007-private-message-residue',
       mode: execute ? 'execute' : 'dry-run',
@@ -1396,10 +1771,11 @@ export async function runPrivateMessageResidueMigration(options) {
     failureReport.status = 'aborted';
     failureReport.error = error.message;
     failureReport.completedAt = new Date().toISOString();
-    writeReport(reportPath, failureReport);
+    writeReport(reportPath, failureReport, reportFileOwnership);
     return failureReport;
   } finally {
-    db.close();
+    closeReportOwnership(reportFileOwnership);
+    if (db) db.close();
   }
 }
 
@@ -1425,7 +1801,8 @@ if (isCli) {
   try {
     const report = await runPrivateMessageResidueMigration(parseArgs(process.argv.slice(2)));
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    if (['refused', 'rolled-back', 'aborted', 'applied-report-write-failed'].includes(report.status)) {
+    if (['refused', 'rolled-back', 'aborted', 'applied-report-write-failed',
+      'committed-backup-verification-failed'].includes(report.status)) {
       process.exitCode = 2;
     }
   } catch (error) {

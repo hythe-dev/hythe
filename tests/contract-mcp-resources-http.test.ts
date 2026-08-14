@@ -20,7 +20,15 @@ function runBridge(port: number, uri: string, stateDir: string): Promise<{
 }> {
   return new Promise((resolveRun, rejectRun) => {
     const env = { ...process.env };
-    for (const key of ['ENGRAM_AGENT_ID', 'MCP_FROM', 'FROM']) delete env[key];
+    for (const key of [
+      'ENGRAM_AGENT_ID',
+      'MCP_FROM',
+      'FROM',
+      'HYTHE_AGENT_KEY_FILE',
+      'HYTHE_AGENT_KEY',
+      'HYTHE_AGENT_TOKEN',
+      'HYTHE_AGENT_AUTH_MODE',
+    ]) delete env[key];
     Object.assign(env, {
       API_KEY,
       HYTHE_AGENT_ID: 'agent-resource-reader',

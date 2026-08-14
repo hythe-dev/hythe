@@ -1,14 +1,23 @@
 # Quickstart — two coordinating agents in ~15 minutes
 
 This walks a clean machine from zero to two AI agents sharing state through
-HYTHE. Prerequisites: Docker (with compose) and Node.js ≥ 20.9.
+HYTHE. Prerequisites: Git, Docker (with compose), and Node.js ≥ 20.9.
 
-## 1. Generate config (1 min)
+The first five sections are an `observe`-mode compatibility bootstrap: they
+bind each client locally but do not yet make the shared deployment key proof of
+an individual agent. Complete server-enforced identity is the deliberate
+lane-by-lane rollout in section 6.
 
-From the directory where you'll run the server:
+## 1. Check out the server and generate config (2 min)
+
+The npm package is the client bridge; it does not contain a buildable server
+source tree. Start from the exact release tag so Docker Compose has the source,
+lockfile, and Dockerfile it needs:
 
 ```bash
-npx -y @hythe/mcp init --write-env --agent-id agent-a
+git clone --depth 1 --branch v0.1.5 https://github.com/hythe-dev/hythe.git
+cd hythe
+npx -y @hythe/mcp@0.1.5 init --write-env --agent-id agent-a
 ```
 
 This generates a fresh API key and writes it only to `./.env` (mode 600,
@@ -41,7 +50,7 @@ hook plugin, add the bridge, then launch the identity-bound lane:
 ```bash
 claude plugin marketplace add hythe-dev/hythe
 claude plugin install hythe
-claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env HYTHE_AGENT_ID=agent-a --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp
+claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env HYTHE_AGENT_ID=agent-a --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp@0.1.5
 HYTHE_AGENT_ID=agent-a claude
 ```
 
@@ -56,7 +65,7 @@ identity fails closed. Same pattern for Codex (`~/.codex/config.toml`), Cursor
 ## 4. Seed the demo (optional, 2 min)
 
 ```bash
-HYTHE_API_KEY_FILE="$PWD/.env" npx -y @hythe/mcp demo
+HYTHE_API_KEY_FILE="$PWD/.env" npx -y @hythe/mcp@0.1.5 demo
 ```
 
 This seeds a namespaced (`demo-*`) two-agent story: `demo-alice` writes a
@@ -73,7 +82,7 @@ credential, then paste it into the second harness (say Codex next to Claude
 Code):
 
 ```bash
-npx -y @hythe/mcp init --agent-id agent-b
+npx -y @hythe/mcp@0.1.5 init --agent-id agent-b
 ```
 
 Each client lane needs a stable, distinct identity. The bridge rejects a
@@ -104,13 +113,47 @@ actions — plus the message that pointed at it. That's the loop: checkpoint
 cadence, stand-down) is [SPEC.md](./SPEC.md); the concepts behind the
 store are in [CONCEPTS.md](./CONCEPTS.md).
 
+## 6. Complete agent authorization (operator rollout)
+
+Do not switch a populated deployment directly from `observe` to `required`.
+Each live lane first needs a separate credential file and a successful
+server-derived identity canary. The full offline command contract is in the
+[agent credential operator guide](./AGENT-CREDENTIAL-OPERATOR.md); the safe
+transition is observe → mixed → required:
+
+1. Keep the server in `observe` while inventorying every real client identity.
+2. Stop HYTHE and every SQLite user, take and verify a fresh backup, then run
+   `hythe-agent-auth issue` for one exact tenant/agent. Write its new token only
+   to a previously nonexistent mode-`0600` file.
+3. Configure that one client with its unchanged `HYTHE_AGENT_ID`, the absolute
+   `HYTHE_AGENT_KEY_FILE` path, and `HYTHE_AGENT_AUTH_MODE=mixed`. Never copy
+   the token into an environment variable or generated config.
+4. Start the server in `mixed`. The bridge must attest `/agent/whoami` before
+   reading MCP stdin; confirm the returned tenant, exact case-sensitive agent,
+   credential ID, scopes, and `mixed` mode.
+5. Stop the server and promote that exact freshly attested credential with
+   `hythe-agent-auth promote --credential-id ...`. Restart in `mixed`; calls
+   that strip agent proof can no longer claim the enforced principal.
+6. Repeat issuance, client restart, attestation, and promotion for every live
+   lane. Retire or explicitly exclude stale registrations; do not mint a key
+   merely because a historical registration says `active`.
+7. Only after all supported lanes pass positive and cross-agent negative
+   canaries, configure every client and the server as `required`. A required
+   client intentionally refuses a weaker server mode.
+
+Keep the previous image, stopped container, client package/plugin, and verified
+database backup through the soak window. Rolling back to a server that does not
+understand enforced principals reopens shared-key impersonation; follow the
+[Pavilion production runbook](./PAVILION-PRODUCTION.md) or an equivalent
+deployment-specific rollback plan.
+
 ## Troubleshooting
 
 - **Bridge connects but calls fail** — confirm `HYTHE_API_KEY_FILE` points to
   the same mode-400 or mode-600 `.env` used by the server. The server also logs
   auth failures.
 - **`.env` refuses to boot** — the placeholder `API_KEY=CHANGE_ME` is
-  deliberately rejected; run `npx -y @hythe/mcp init --write-env --agent-id agent-a`
+  deliberately rejected; run `npx -y @hythe/mcp@0.1.5 init --write-env --agent-id agent-a`
   for a real key and identity-bound client config.
 - **Bridge exits with an identity error** — set `HYTHE_AGENT_ID` to one stable
   1-100 character id for that client lane. If the legacy `ENGRAM_AGENT_ID`,
@@ -118,6 +161,10 @@ store are in [CONCEPTS.md](./CONCEPTS.md).
 - **Claude hooks emit no recovery context** — the identity in `claude mcp add
   --env HYTHE_AGENT_ID=...` reaches the bridge, not plugin hook processes.
   Restart that Claude lane as `HYTHE_AGENT_ID=<same-id> claude`.
+- **Bridge exits before MCP initialization with an attestation error** — verify
+  `HYTHE_AGENT_KEY_FILE` names the exact lane's protected file, its token is
+  active, and the configured client mode is not stronger than the server mode.
+  Do not fall back by removing the agent proof for an enforced principal.
 - **Port collision** — change `NEURAL_MCP_PORT` in `.env` and `MCP_PORT`
   in each client block together. If the separate WebSocket notification port
   collides, change `MESSAGE_HUB_PORT` and its container port mapping together.

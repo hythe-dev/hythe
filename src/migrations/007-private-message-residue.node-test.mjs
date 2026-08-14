@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -213,6 +223,252 @@ test('execute requires the reviewed token and does not create a backup on refusa
   assert.equal(existsSync(reportPath), true);
 });
 
+test('backup and report paths cannot alias the source database sidecar namespace', async () => {
+  const fixture = makeFixture();
+  const before = readCounts(fixture.dbPath);
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  assert.equal(dry.status, 'ready');
+  for (const suffix of ['-wal', '-journal', '-shm']) {
+    await assert.rejects(
+      runPrivateMessageResidueMigration({
+        dbPath: fixture.dbPath,
+        execute: true,
+        confirm: dry.confirmationToken,
+        backupPath: `${fixture.dbPath}${suffix}`,
+        reportPath: join(fixture.directory, `sidecar-backup${suffix}.json`),
+      }),
+      /backup path collides with the source SQLite database or one of its sidecars/,
+      `backup alias ${suffix}`
+    );
+    await assert.rejects(
+      runPrivateMessageResidueMigration({
+        dbPath: fixture.dbPath,
+        execute: true,
+        confirm: dry.confirmationToken,
+        backupPath: join(fixture.directory, `safe-backup${suffix}.db`),
+        reportPath: `${fixture.dbPath}${suffix}`,
+      }),
+      /report path collides with the source SQLite database or one of its sidecars/,
+      `report alias ${suffix}`
+    );
+    await assert.rejects(
+      runPrivateMessageResidueMigration({
+        dbPath: fixture.dbPath,
+        reportPath: `${fixture.dbPath}${suffix}`,
+      }),
+      /report path collides with the source SQLite database or one of its sidecars/,
+      `dry-run report alias ${suffix}`
+    );
+  }
+  assert.deepEqual(readCounts(fixture.dbPath), before);
+  for (const suffix of ['-wal', '-journal', '-shm']) {
+    assert.equal(existsSync(`${fixture.dbPath}${suffix}`), false, suffix);
+  }
+});
+
+test('symlinked artifact parents cannot bypass the source SQLite sidecar namespace', async () => {
+  for (const collision of ['backup', 'report']) {
+    const fixture = makeFixture();
+    const before = readCounts(fixture.dbPath);
+    const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+    const aliasRoot = join(fixture.directory, 'alias-root');
+    mkdirSync(aliasRoot);
+    const alias = join(aliasRoot, 'database-parent');
+    symlinkSync(fixture.directory, alias, 'dir');
+    const sidecarAlias = join(alias, 'memory.db-journal');
+    const backupPath = collision === 'backup'
+      ? sidecarAlias
+      : join(fixture.directory, 'safe-symlink-backup.db');
+    const reportPath = collision === 'report'
+      ? sidecarAlias
+      : join(fixture.directory, 'safe-symlink-report.json');
+    await assert.rejects(
+      runPrivateMessageResidueMigration({
+        dbPath: fixture.dbPath,
+        execute: true,
+        confirm: dry.confirmationToken,
+        backupPath,
+        reportPath,
+      }),
+      /path collides with the source SQLite database or one of its sidecars/
+    );
+    assert.equal(existsSync(sidecarAlias), false);
+    assert.equal(existsSync(backupPath), false);
+    assert.equal(existsSync(reportPath), false);
+    assert.deepEqual(readCounts(fixture.dbPath), before);
+  }
+});
+
+test('verified backup publication never overwrites a destination created in the promotion gap', async () => {
+  const fixture = makeFixture();
+  const before = readCounts(fixture.dbPath);
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'raced-backup.db');
+  const marker = 'INDEPENDENT-MIGRATION-BACKUP';
+  const report = await runPrivateMessageResidueMigration({
+    dbPath: fixture.dbPath,
+    execute: true,
+    confirm: dry.confirmationToken,
+    backupPath,
+    reportPath: join(fixture.directory, 'raced-backup-report.json'),
+    beforeBackupPromotion() {
+      writeFileSync(backupPath, marker, { flag: 'wx', mode: 0o600 });
+    },
+  });
+  assert.equal(report.status, 'rolled-back');
+  assert.equal(report.rolledBack, true);
+  assert.equal(readFileSync(backupPath, 'utf8'), marker);
+  assert.deepEqual(readCounts(fixture.dbPath), before);
+  assert.equal(readdirSync(fixture.directory).some((name) => name.includes('.unverified-')), false);
+});
+
+test('migration refuses to mutate when the verified backup is replaced before mutation', async () => {
+  const fixture = makeFixture();
+  const before = readCounts(fixture.dbPath);
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'replaced-backup.db');
+  const marker = 'INDEPENDENT-REPLACEMENT';
+  const report = await runPrivateMessageResidueMigration({
+    dbPath: fixture.dbPath,
+    execute: true,
+    confirm: dry.confirmationToken,
+    backupPath,
+    reportPath: join(fixture.directory, 'replaced-backup-report.json'),
+    afterBackupPromotion() {
+      unlinkSync(backupPath);
+      writeFileSync(backupPath, marker, { flag: 'wx', mode: 0o600 });
+    },
+  });
+  assert.equal(report.status, 'rolled-back');
+  assert.equal(report.rolledBack, true);
+  assert.equal(readFileSync(backupPath, 'utf8'), marker);
+  assert.deepEqual(readCounts(fixture.dbPath), before);
+  assert.equal(readdirSync(fixture.directory).some((name) => name.includes('.unverified-')), false);
+});
+
+test('backup replacement immediately before commit preserves the replacement and rolls back', async () => {
+  const fixture = makeFixture();
+  const before = readCounts(fixture.dbPath);
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'precommit-replaced-backup.db');
+  const marker = 'INDEPENDENT-PRECOMMIT-BACKUP';
+  const report = await runPrivateMessageResidueMigration({
+    dbPath: fixture.dbPath,
+    execute: true,
+    confirm: dry.confirmationToken,
+    backupPath,
+    reportPath: join(fixture.directory, 'precommit-replaced-report.json'),
+    beforeCommit() {
+      unlinkSync(backupPath);
+      writeFileSync(backupPath, marker, { flag: 'wx', mode: 0o600 });
+    },
+  });
+  assert.equal(report.status, 'rolled-back');
+  assert.equal(report.rolledBack, true);
+  assert.equal(readFileSync(backupPath, 'utf8'), marker);
+  assert.deepEqual(readCounts(fixture.dbPath), before);
+});
+
+test('backup deletion immediately after commit can never be reported as applied', async () => {
+  const fixture = makeFixture();
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'postcommit-deleted-backup.db');
+  const reportPath = join(fixture.directory, 'postcommit-deleted-report.json');
+  const report = await runPrivateMessageResidueMigration({
+    dbPath: fixture.dbPath,
+    execute: true,
+    confirm: dry.confirmationToken,
+    backupPath,
+    reportPath,
+    afterCommit() {
+      unlinkSync(backupPath);
+    },
+  });
+  assert.equal(report.status, 'committed-backup-verification-failed');
+  assert.equal(report.committed, true);
+  assert.equal(report.applied, undefined);
+  assert.equal(existsSync(backupPath), false);
+  assert.equal(readCounts(fixture.dbPath).content, fixture.fullBody);
+  assert.equal(JSON.parse(readFileSync(reportPath, 'utf8')).status,
+    'committed-backup-verification-failed');
+});
+
+test('pending report write preserves an independently replaced reservation and does not mutate', async () => {
+  const fixture = makeFixture();
+  const before = readCounts(fixture.dbPath);
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'pending-report-backup.db');
+  const reportPath = join(fixture.directory, 'pending-report.json');
+  const marker = 'INDEPENDENT-PENDING-REPORT';
+  await assert.rejects(
+    runPrivateMessageResidueMigration({
+      dbPath: fixture.dbPath,
+      execute: true,
+      confirm: dry.confirmationToken,
+      backupPath,
+      reportPath,
+      beforePendingReportWrite() {
+        unlinkSync(reportPath);
+        writeFileSync(reportPath, marker, { flag: 'wx', mode: 0o600 });
+      },
+    }),
+    /report path ownership changed; refusing to overwrite it/
+  );
+  assert.equal(readFileSync(reportPath, 'utf8'), marker);
+  assert.equal(existsSync(backupPath), false);
+  assert.deepEqual(readCounts(fixture.dbPath), before);
+});
+
+test('final report write never overwrites an independently replaced pending report', async () => {
+  const fixture = makeFixture();
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'final-report-backup.db');
+  const reportPath = join(fixture.directory, 'final-report.json');
+  const marker = 'INDEPENDENT-FINAL-REPORT';
+  const report = await runPrivateMessageResidueMigration({
+    dbPath: fixture.dbPath,
+    execute: true,
+    confirm: dry.confirmationToken,
+    backupPath,
+    reportPath,
+    beforeFinalReportWrite() {
+      unlinkSync(reportPath);
+      writeFileSync(reportPath, marker, { flag: 'wx', mode: 0o600 });
+    },
+  });
+  assert.equal(report.status, 'applied-report-write-failed');
+  assert.match(report.reportWriteError, /report path ownership changed/);
+  assert.equal(readFileSync(reportPath, 'utf8'), marker);
+  assert.equal(existsSync(backupPath), true);
+  assert.equal(readCounts(fixture.dbPath).content, fixture.fullBody);
+});
+
+test('backup replacement at final reporting is preserved and downgrades applied status', async () => {
+  const fixture = makeFixture();
+  const dry = await runPrivateMessageResidueMigration({ dbPath: fixture.dbPath });
+  const backupPath = join(fixture.directory, 'final-replaced-backup.db');
+  const reportPath = join(fixture.directory, 'final-replaced-backup-report.json');
+  const marker = 'INDEPENDENT-FINAL-BACKUP';
+  const report = await runPrivateMessageResidueMigration({
+    dbPath: fixture.dbPath,
+    execute: true,
+    confirm: dry.confirmationToken,
+    backupPath,
+    reportPath,
+    beforeFinalReportWrite() {
+      unlinkSync(backupPath);
+      writeFileSync(backupPath, marker, { flag: 'wx', mode: 0o600 });
+    },
+  });
+  assert.equal(report.status, 'committed-backup-verification-failed');
+  assert.equal(report.committed, true);
+  assert.equal(report.applied, undefined);
+  assert.equal(readFileSync(backupPath, 'utf8'), marker);
+  assert.equal(readCounts(fixture.dbPath).content, fixture.fullBody);
+  assert.equal(JSON.parse(readFileSync(reportPath, 'utf8')).status,
+    'committed-backup-verification-failed');
+});
+
 test('confirmation fingerprint binds shared sender fallback and vector primary mapping', () => {
   const fixture = makeFixture();
   const db = new Database(fixture.dbPath);
@@ -282,6 +538,12 @@ test('clean execution restores the full body and removes only accounted residue'
   const report = await executeFixture(fixture);
   assert.equal(report.status, 'applied');
   assert.equal(report.quickCheck, 'ok');
+  assert.equal(report.backup.checks.quickCheck, 'ok');
+  assert.equal(report.backup.checks.integrityCheck, 'ok');
+  assert.equal(report.backup.checks.foreignKeyViolations, 0);
+  assert.match(report.backup.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(report.backup.bytes, statSync(join(fixture.directory, 'backup.db')).size);
+  assert.equal(statSync(join(fixture.directory, 'backup.db')).mode & 0o777, 0o600);
   assert.deepEqual(readCounts(fixture.dbPath), {
     ai: 1,
     shared: 1,
@@ -295,6 +557,15 @@ test('clean execution restores the full body and removes only accounted residue'
   const backup = readCounts(join(fixture.directory, 'backup.db'));
   assert.match(backup.content, /^Full content stored as entity/);
   assert.equal(backup.shared, 3);
+  const audit = new Database(fixture.dbPath, { readonly: true });
+  const auditRow = audit.prepare(`
+    SELECT backup_sha256, backup_bytes, backup_identity_json
+    FROM private_message_residue_migration_audit
+  `).get();
+  audit.close();
+  assert.equal(auditRow.backup_sha256, report.backup.sha256);
+  assert.equal(auditRow.backup_bytes, report.backup.bytes);
+  assert.equal(JSON.parse(auditRow.backup_identity_json).inode, report.backup.pathIdentity.inode);
 });
 
 test('real sqlite-vec rows are removed with their private index rows', async () => {

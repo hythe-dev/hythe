@@ -1,5 +1,8 @@
 import express from 'express';
 import { createHash, randomUUID as uuidv4 } from 'node:crypto';
+import type { Server as HttpServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { createRequire } from 'node:module';
 import cors from 'cors';
 import helmet from 'helmet';
 import { MemoryManager } from './unified-server/memory/index.js';
@@ -24,8 +27,27 @@ import {
 } from './middleware/index.js';
 import type { RequestContext } from './middleware/index.js';
 import type { TenantRequest } from './middleware/index.js';
-import { metrics, sloMonitor, recordMCPLatency, startSLOMonitoring, correlationMiddleware, logger } from './observability/index.js';
+import { metrics, sloMonitor, recordMCPLatency, startSLOMonitoring, stopSLOMonitoring, correlationMiddleware, logger } from './observability/index.js';
 import { NotificationPort, SlackNotificationAdapter } from './notifications/index.js';
+import {
+  AgentAuthorizationError,
+  AgentCredentialStore,
+  bindAgentInvocation,
+  bindMessageResourceRecipient,
+  assertAgentCredentialScope,
+  createAgentCredentialMiddleware,
+  resolveAgentAuthMode,
+} from './agent-auth/index.js';
+import type { AgentAuthMode } from './agent-auth/index.js';
+
+const packageMetadata = createRequire(import.meta.url)('../package.json') as { version?: unknown };
+if (typeof packageMetadata.version !== 'string' || packageMetadata.version.length === 0) {
+  throw new Error('HYTHE package metadata does not contain a valid version');
+}
+
+/** The single source for every version advertised by the running server. */
+export const HYTHE_VERSION = packageMetadata.version;
+export const HYTHE_SERVICE_NAME = 'hythe';
 
 // Unified Neural AI Collaboration MCP Server
 // Exposes ALL system capabilities through a single MCP interface
@@ -38,10 +60,20 @@ export class NeuralMCPServer {
   private messageHub?: MessageHubIntegration;
   private notificationPort: NotificationPort;
   private restoring = false;
+  private httpServer?: HttpServer;
+  private startPromise?: Promise<void>;
+  private shutdownPromise?: Promise<void>;
+  private resourceShutdownPromise?: Promise<void>;
+  private messageHubStarted = false;
+  private lifecycleState: 'initialized' | 'starting' | 'ready' | 'closing' | 'closed' = 'initialized';
+  private agentCredentialStore: AgentCredentialStore;
+  private agentAuthMode: AgentAuthMode;
 
   constructor(port: number = 6174, dbPath?: string) {
     this.port = port;
     this.memoryManager = new MemoryManager(dbPath);
+    this.agentCredentialStore = new AgentCredentialStore(this.memoryManager.getDb());
+    this.agentAuthMode = resolveAgentAuthMode();
     this.agentId = 'unified-neural-mcp-server';
     this.sessionId = 'neural-unified-session';
     
@@ -62,7 +94,12 @@ export class NeuralMCPServer {
   private async initializeMessageHub() {
     try {
       const hubPort = resolveMessageHubPort();
-      this.messageHub = new MessageHubIntegration(hubPort, this.port);
+      this.messageHub = new MessageHubIntegration(
+        hubPort,
+        this.port,
+        this.agentCredentialStore,
+        this.agentAuthMode,
+      );
       
       console.log(`🔗 Message Hub integration initialized on port ${hubPort}`);
     } catch (error) {
@@ -120,8 +157,36 @@ export class NeuralMCPServer {
     // Apply authentication to all routes except public paths
     this.app.use(authMiddleware);
 
+    // Independent per-agent proof. The existing key/JWT remains the tenant or
+    // deployment credential; an agent credential can only narrow and bind it.
+    this.app.use(createAgentCredentialMiddleware(this.agentCredentialStore, this.agentAuthMode));
+
     // Apply general rate limiting
     this.app.use(rateLimitMiddleware);
+
+    // A supplied per-agent proof always narrows the deployment/JWT authority.
+    // Operator routes that do not naturally flow through the MCP binder must
+    // opt into an explicit agent-side scope before reading or mutating state.
+    const requireAgentScope = (
+      req: express.Request,
+      res: express.Response,
+      scope: string,
+    ): boolean => {
+      const context = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
+      try {
+        assertAgentCredentialScope(context, scope);
+        return true;
+      } catch (error) {
+        if (error instanceof AgentAuthorizationError) {
+          res.status(error.status).json({
+            error: 'Agent authorization failed',
+            code: error.code,
+          });
+          return false;
+        }
+        throw error;
+      }
+    };
 
     // Restore locking: reject requests during DB restore
     this.app.use((req, res, next) => {
@@ -147,8 +212,10 @@ export class NeuralMCPServer {
       const rateLimiterStatus = getRateLimiterStatus();
       res.json({
         status: 'healthy',
-        service: 'unified-neural-mcp-server',
-        version: '1.0.0',
+        service: HYTHE_SERVICE_NAME,
+        version: HYTHE_VERSION,
+        lifecycle: this.lifecycleState,
+        agentAuthMode: this.agentAuthMode,
         timestamp: new Date().toISOString(),
         port: this.port,
         agentId: this.agentId,
@@ -174,13 +241,20 @@ export class NeuralMCPServer {
         const criticalAlerts = activeAlerts.filter(a => a.severity === 'critical');
 
         // Determine readiness based on system connectivity
-        const isReady = systemStatus.sqlite.connected; // SQLite is minimum requirement
+        const lifecycleReady = this.lifecycleState === 'ready';
+        const isReady = lifecycleReady && systemStatus.sqlite.connected; // SQLite is minimum requirement
         const vectorConnected = systemStatus.vector?.connected ?? systemStatus.weaviate?.connected ?? false;
-        const isDegraded = !systemStatus.advancedSystemsEnabled || !vectorConnected;
+        const isDegraded = !isReady
+          || !systemStatus.advancedSystemsEnabled
+          || !vectorConnected
+          || criticalAlerts.length > 0;
 
         const status = {
           ready: isReady,
           degraded: isDegraded,
+          version: HYTHE_VERSION,
+          lifecycle: this.lifecycleState,
+          agentAuthMode: this.agentAuthMode,
           systems: {
             sqlite: systemStatus.sqlite.connected,
             vector: vectorConnected,
@@ -203,25 +277,61 @@ export class NeuralMCPServer {
         res.status(503).json({
           ready: false,
           degraded: true,
+          version: HYTHE_VERSION,
+          lifecycle: this.lifecycleState,
+          agentAuthMode: this.agentAuthMode,
           error: error instanceof Error ? error.message : 'Unknown error',
           timestamp: new Date().toISOString()
         });
       }
     });
 
+    // Secret-free identity attestation for clients. This route never accepts
+    // a caller-supplied agent id: the response is derived exclusively from
+    // the independently validated agent credential in RequestContext.
+    this.app.get('/agent/whoami', (req, res) => {
+      const context = (req as TenantRequest).requestContext;
+      if (!context?.agentPrincipal) {
+        res.status(401).json({
+          error: 'Unauthorized',
+          message: 'A valid agent credential is required',
+          code: 'AGENT_CREDENTIAL_REQUIRED',
+        });
+        return;
+      }
+      // Promotion evidence is intentionally route-specific: generic token
+      // validation, denied requests, and malformed operations never qualify.
+      this.agentCredentialStore.markCredentialAttested(
+        context.agentPrincipal.credentialId,
+        context.agentAuthMode,
+      );
+      res.json({
+        tenantId: context.tenantId,
+        agentId: context.agentPrincipal.agentId,
+        credentialId: context.agentPrincipal.credentialId,
+        scopes: [...context.agentPrincipal.scopes],
+        enforcementState: context.agentPrincipal.enforcementState,
+        authMode: context.agentAuthMode,
+        version: HYTHE_VERSION,
+      });
+    });
+
     // Metrics endpoint (Prometheus-compatible)
-    this.app.get('/metrics', (_req, res) => {
+    this.app.get('/metrics', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       res.set('Content-Type', 'text/plain; version=0.0.4');
       res.send(metrics.toPrometheusFormat());
     });
 
     // Metrics JSON endpoint (for dashboards)
-    this.app.get('/metrics.json', (_req, res) => {
+    this.app.get('/metrics.json', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       res.json(metrics.getSnapshot());
     });
 
     // Recent events endpoint (for debugging/alerting)
     this.app.get('/metrics/events', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       const count = parseInt(req.query.count as string) || 100;
       const category = req.query.category as string;
       const level = req.query.level as string;
@@ -229,7 +339,8 @@ export class NeuralMCPServer {
     });
 
     // Event retention/compaction status endpoint
-    this.app.get('/metrics/retention', (_req, res) => {
+    this.app.get('/metrics/retention', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       res.json({
         config: metrics.getRetentionConfig(),
         compactionStats: metrics.getCompactionStats(),
@@ -240,7 +351,8 @@ export class NeuralMCPServer {
     });
 
     // Manual compaction trigger endpoint (POST)
-    this.app.post('/metrics/compact', async (_req, res) => {
+    this.app.post('/metrics/compact', async (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:write')) return;
       try {
         const stats = await metrics.runCompaction();
         res.json({
@@ -258,7 +370,8 @@ export class NeuralMCPServer {
     });
 
     // SLO status endpoint
-    this.app.get('/slo/status', (_req, res) => {
+    this.app.get('/slo/status', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       res.json({
         status: sloMonitor.getSLOStatus(),
         activeAlerts: sloMonitor.getActiveAlerts(),
@@ -268,6 +381,7 @@ export class NeuralMCPServer {
 
     // SLO alerts endpoint
     this.app.get('/slo/alerts', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       const limit = parseInt(req.query.limit as string) || 100;
       const activeOnly = req.query.active === 'true';
 
@@ -279,7 +393,8 @@ export class NeuralMCPServer {
     });
 
     // Logger configuration endpoint
-    this.app.get('/logs/config', (_req, res) => {
+    this.app.get('/logs/config', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:read')) return;
       res.json({
         config: logger.getConfig(),
         timestamp: new Date().toISOString()
@@ -288,6 +403,7 @@ export class NeuralMCPServer {
 
     // Update logger configuration (POST)
     this.app.post('/logs/config', (req, res) => {
+      if (!requireAgentScope(req, res, 'ops:write')) return;
       try {
         const newConfig = req.body;
         logger.configure(newConfig);
@@ -306,7 +422,8 @@ export class NeuralMCPServer {
 
     // Admin endpoint: query audit log (restricted unless ENABLE_ADMIN_ENDPOINTS is set)
     this.app.get('/admin/audit-log', (req, res): void => {
-      if (!process.env.ENABLE_ADMIN_ENDPOINTS) {
+      if (!requireAgentScope(req, res, 'audit:read')) return;
+      if (process.env.ENABLE_ADMIN_ENDPOINTS !== '1') {
         res.status(403).json({ error: 'Admin endpoints disabled. Set ENABLE_ADMIN_ENDPOINTS=1 to enable.' });
         return;
       }
@@ -341,6 +458,13 @@ export class NeuralMCPServer {
         const result = await this._handleToolCall(toolName, args, context);
         res.json(result);
       } catch (error) {
+        if (error instanceof AgentAuthorizationError) {
+          res.status(error.status).json({
+            error: 'Agent authorization failed',
+            code: error.code,
+          });
+          return;
+        }
         res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
       }
     });
@@ -376,8 +500,8 @@ export class NeuralMCPServer {
                 resources: {}
               },
               serverInfo: {
-                name: 'neural-ai-collaboration',
-                version: '1.0.0'
+                name: HYTHE_SERVICE_NAME,
+                version: HYTHE_VERSION
               }
             }
           });
@@ -394,8 +518,8 @@ export class NeuralMCPServer {
                 resources: {}
               },
               serverInfo: {
-                name: 'neural-ai-collaboration',
-                version: '1.0.0'
+                name: HYTHE_SERVICE_NAME,
+                version: HYTHE_VERSION
               }
             };
             break;
@@ -446,6 +570,18 @@ export class NeuralMCPServer {
       } catch (error) {
         const latencyMs = Date.now() - startTime;
         recordMCPLatency(latencyMs);
+        if (error instanceof AgentAuthorizationError) {
+          console.warn(`⚠️ MCP agent authorization denied: ${error.code}`);
+          return res.json({
+            jsonrpc: '2.0',
+            id: req.body?.id || 1,
+            error: {
+              code: -32003,
+              message: 'Agent authorization failed',
+              data: { code: error.code },
+            },
+          });
+        }
         console.error(`❌ Unified Neural MCP request error (${latencyMs}ms):`, error);
         return res.json({
           jsonrpc: '2.0',
@@ -496,9 +632,16 @@ export class NeuralMCPServer {
           parsedData = { from: 'unknown', to: 'unknown', message: 'Unknown body type', content: 'Unknown body type' };
         }
         
-        const { from, to, message, messageType: requestedMessageType, type, priority, content } = parsedData;
+        const { to, message, messageType: requestedMessageType, type, priority, content } = parsedData;
         const actualMessage = message || content || parsedData.payload?.message || parsedData.payload?.content;
         const reqContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
+        const boundMessageArgs = bindAgentInvocation(
+          'send_ai_message',
+          parsedData,
+          reqContext,
+          this.agentCredentialStore,
+        );
+        const from = boundMessageArgs.from as string;
 
         if (!to || typeof to !== 'string' || !to.trim()) {
           res.status(400).json({ error: 'Message recipient is required' });
@@ -522,10 +665,7 @@ export class NeuralMCPServer {
           return;
         }
 
-        if (!from) {
-          console.warn(`⚠️ HTTP /ai-message called without 'from' — attributing to 'system'. Callers should always include 'from'.`);
-        }
-        const requestedSender = from || 'system';
+        const requestedSender = from;
         const senderAgentId = this.memoryManager.resolveMailboxAddress(requestedSender, reqContext.tenantId);
         const targetAgentId = this.memoryManager.resolveMailboxAddress(to, reqContext.tenantId);
         if (!senderAgentId || !targetAgentId) {
@@ -569,6 +709,10 @@ export class NeuralMCPServer {
         });
 
       } catch (error) {
+        if (error instanceof AgentAuthorizationError) {
+          res.status(error.status).json({ error: 'Agent authorization failed', code: error.code });
+          return;
+        }
         console.error('❌ AI message error:', error);
         res.status(500).json({ error: 'Message delivery failed' });
       }
@@ -577,13 +721,20 @@ export class NeuralMCPServer {
     // Get messages for an AI agent — P1: uses indexed ai_messages table
     this.app.get('/ai-messages/:agentId', async (req, res) => {
       try {
-        const { agentId } = req.params;
+        const { agentId: requestedAgentId } = req.params;
         const { since, messageType, limit, unreadOnly, markAsRead, from } = req.query as {
           since?: string; messageType?: string; limit?: string;
           unreadOnly?: string; markAsRead?: string; from?: string;
         };
 
         const msgReqContext = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
+        const boundMailboxArgs = bindAgentInvocation(
+          'get_ai_messages',
+          { agentId: requestedAgentId },
+          msgReqContext,
+          this.agentCredentialStore,
+        );
+        const agentId = boundMailboxArgs.agentId as string;
         if (this.memoryManager.resolveMailboxAddress(agentId, msgReqContext.tenantId) !== agentId) {
           res.status(400).json({ error: 'Agent identity is invalid' });
           return;
@@ -623,6 +774,10 @@ export class NeuralMCPServer {
 
         res.json({ agentId, messages });
       } catch (error) {
+        if (error instanceof AgentAuthorizationError) {
+          res.status(error.status).json({ error: 'Agent authorization failed', code: error.code });
+          return;
+        }
         console.error('❌ Get messages error:', error);
         res.status(500).json({ error: 'Failed to get messages' });
       }
@@ -636,6 +791,11 @@ export class NeuralMCPServer {
     this.app.get('/api/graph-export', async (req, res) => {
       try {
         const context = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
+
+        // A supplied agent proof narrows the base credential. Shared-key/JWT
+        // operator calls may omit agent proof, but an agent-scoped call must
+        // explicitly carry memory read authority.
+        assertAgentCredentialScope(context, 'memory:read');
 
         // Authorize: must have graph:view at minimum
         const authResult = this.memoryManager.authorizeGraphRead(context);
@@ -759,6 +919,13 @@ export class NeuralMCPServer {
 
         res.json(responseBody);
       } catch (error) {
+        if (error instanceof AgentAuthorizationError) {
+          res.status(error.status).json({
+            error: 'Agent authorization failed',
+            code: error.code,
+          });
+          return;
+        }
         console.error('graph-export error:', error);
         res.status(500).json({ error: 'Graph export failed' });
       }
@@ -806,6 +973,31 @@ export class NeuralMCPServer {
       }
       const context = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
       const access: 'read' | 'write' = req.method === 'GET' ? 'read' : 'write';
+      if (context.agentAuthMode === 'required' && context.agentPrincipal == null) {
+        res.status(401).json({
+          error: 'Unauthorized',
+          message: 'An agent credential is required for data management in required mode',
+          code: 'AGENT_CREDENTIAL_REQUIRED',
+        });
+        return;
+      }
+      if (context.agentPrincipal != null) {
+        const agentScopes = context.agentPrincipal.scopes;
+        const required = `data:${access}`;
+        const hasAgentScope = agentScopes.includes('*')
+          || agentScopes.includes('data:*')
+          || agentScopes.includes('data:admin')
+          || agentScopes.includes(required)
+          || (access === 'read' && agentScopes.includes('data:write'));
+        if (!hasAgentScope) {
+          res.status(403).json({
+            error: 'Forbidden',
+            message: `Agent credential lacks required scope ${required}`,
+            code: 'AGENT_SCOPE_REQUIRED',
+          });
+          return;
+        }
+      }
       const verdict = authorizeDataManagement(context, access);
       if (!verdict.authorized) {
         res.status(403).json({ error: 'Forbidden', message: verdict.reason, code: 'DATA_MANAGEMENT_FORBIDDEN' });
@@ -1122,6 +1314,7 @@ export class NeuralMCPServer {
     // ─── Dashboard API: Agent Status ───
     this.app.get('/api/agent-status', async (req, res) => {
       try {
+        if (!requireAgentScope(req, res, 'dashboard:read')) return;
         const context = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
         const tenantId = context.tenantId || 'default';
         const db = this.memoryManager.getDb();
@@ -1238,6 +1431,7 @@ export class NeuralMCPServer {
     // ─── Dashboard API: Recent Events (individual messages for event feed) ───
     this.app.get('/api/recent-events', async (req, res) => {
       try {
+        if (!requireAgentScope(req, res, 'dashboard:read')) return;
         const context = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
         const tenantId = context.tenantId || 'default';
         const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
@@ -1288,6 +1482,7 @@ export class NeuralMCPServer {
     // ─── Dashboard API: Analytics ───
     this.app.get('/api/analytics', async (req, res) => {
       try {
+        if (!requireAgentScope(req, res, 'dashboard:read')) return;
         const context = (req as TenantRequest).requestContext || DEFAULT_REQUEST_CONTEXT;
         const tenantId = context.tenantId || 'default';
         const db = this.memoryManager.getDb();
@@ -1421,6 +1616,7 @@ export class NeuralMCPServer {
     // Comprehensive system status endpoint
     this.app.get('/system/status', async (req, res) => {
       try {
+        if (!requireAgentScope(req, res, 'ops:read')) return;
         const memoryStatus = await this.memoryManager.getSystemStatus();
         
         const memoryStats = {
@@ -1447,8 +1643,8 @@ export class NeuralMCPServer {
 
         const systemStatus = {
           timestamp: new Date().toISOString(),
-          service: 'neural-ai-collaboration',
-          version: '1.0.0',
+          service: HYTHE_SERVICE_NAME,
+          version: HYTHE_VERSION,
           uptime: process.uptime(),
           memory: {
             used: process.memoryUsage(),
@@ -1556,6 +1752,7 @@ export class NeuralMCPServer {
   }
 
   private _handleResourceRead(uri: string, context: RequestContext = DEFAULT_REQUEST_CONTEXT) {
+    bindMessageResourceRecipient(uri, context, this.agentCredentialStore);
     return readEng4Resource(this.memoryManager.getDb(), context.tenantId, uri);
   }
 
@@ -1612,7 +1809,8 @@ export class NeuralMCPServer {
 
   private async _handleToolCall(name: string, args: any = {}, context: RequestContext = DEFAULT_REQUEST_CONTEXT) {
     try {
-      const agent = args.agentId || this.agentId;
+      args = bindAgentInvocation(name, args, context, this.agentCredentialStore);
+      const agent = args.agentId || args.from || this.agentId;
       const tenantId = context.tenantId;
 
       // ENG-4 primitives: schema+handler registered atomically in
@@ -2930,6 +3128,7 @@ export class NeuralMCPServer {
           // Execute is destructive: admin-equivalent authorization + the
           // explicit confirm key. Dry-run stays open to any authenticated key.
           if (mode === 'execute') {
+            assertAgentCredentialScope(context, 'memory:admin');
             const authResult = this.memoryManager.authorizeGraphMutation('compact_memory', context);
             if (!authResult.authorized) {
               return {
@@ -3901,7 +4100,7 @@ export class NeuralMCPServer {
             ...(expiresAt ? { expiresAt } : {}),
             status: 'active',
             lifecycleStatus: 'active',
-            version: '1.0.0'
+            version: HYTHE_VERSION
           };
 
           // Upsert into canonical agent_registrations table
@@ -4618,6 +4817,22 @@ export class NeuralMCPServer {
           throw new Error(`Unknown tool: ${name}`);
       }
     } catch (error) {
+      if (error instanceof AgentAuthorizationError) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error: 'Agent authorization failed',
+              code: error.code,
+            }),
+          }],
+          structuredContent: {
+            error: 'Agent authorization failed',
+            code: error.code,
+          },
+          isError: true,
+        };
+      }
       return {
         content: [
           { type: 'text', text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}` },
@@ -4711,48 +4926,187 @@ export class NeuralMCPServer {
     return path;
   }
 
-  async start() {
-    if (this.messageHub) {
-      await this.messageHub.start();
+  start(): Promise<void> {
+    if (this.lifecycleState === 'closing' || this.lifecycleState === 'closed') {
+      return Promise.reject(new Error('Cannot start a HYTHE server that is closing or closed'));
     }
+    if (this.lifecycleState === 'ready') return Promise.resolve();
+    if (this.startPromise) return this.startPromise;
 
-    // Start SLO monitoring (check every 60 seconds)
-    startSLOMonitoring(60000);
+    this.lifecycleState = 'starting';
+    this.startPromise = this.startServer();
+    return this.startPromise;
+  }
 
-    // Event compaction with 30-day retention (per PM guidance)
-    // Uses defaults from metrics module (10000 events, 720 hours, 1 hour interval)
-    // Compaction is async/non-blocking
-    metrics.startCompaction();
+  private async startServer(): Promise<void> {
+    try {
+      if (this.messageHub) {
+        await this.messageHub.start();
+        this.messageHubStarted = true;
+      }
 
-    return new Promise<void>((resolve) => {
-      this.app.listen(this.port, () => {
-        console.log(`🧠 Unified Neural AI Collaboration MCP Server started on port ${this.port}`);
-        console.log(`📡 MCP Endpoint: http://localhost:${this.port}/mcp`);
-        console.log(`💬 AI Messaging: http://localhost:${this.port}/ai-message`);
-        console.log(`📊 Health Check: http://localhost:${this.port}/health`);
-        console.log(`📈 SLO Status: http://localhost:${this.port}/slo/status`);
-        console.log(`🔧 System Status: http://localhost:${this.port}/system/status`);
-        
-        if (this.messageHub) {
-          const hubPort = this.messageHub.getPort();
-          console.log(`📡 Message Hub WebSocket: ws://localhost:${hubPort}`);
-          console.log('⚡ Real-time notifications: <100ms message discovery');
-        }
-        
-        console.log('🌟 Capabilities:');
-        console.log('   🧠 Knowledge Graph (SQLite + Weaviate)');
-        console.log('   💬 AI Agent Messaging');
-        console.log('   🌐 Cross-Platform Path Translation');
-        console.log('   📈 Observability & SLOs');
-        console.log('');
-        console.log('🚀 Ready for Neural AI Collaboration!');
-        resolve();
+      if (this.isShuttingDown()) {
+        await this.shutdownResources();
+        return;
+      }
+
+      // Start SLO monitoring (check every 60 seconds).
+      startSLOMonitoring(60000);
+
+      // Event compaction with 30-day retention (per PM guidance).
+      metrics.startCompaction();
+
+      await new Promise<void>((resolve, reject) => {
+        const listener = this.app.listen(this.port);
+        this.httpServer = listener;
+
+        const onError = (error: Error) => {
+          listener.off('listening', onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          listener.off('error', onError);
+          const address = listener.address();
+          if (address && typeof address !== 'string') {
+            this.port = (address as AddressInfo).port;
+          }
+          resolve();
+        };
+
+        listener.once('error', onError);
+        listener.once('listening', onListening);
       });
+
+      if (this.isShuttingDown()) {
+        await this.shutdownResources();
+        return;
+      }
+      this.lifecycleState = 'ready';
+
+      console.log(`🧠 Unified Neural AI Collaboration MCP Server started on port ${this.port}`);
+      console.log(`📡 MCP Endpoint: http://localhost:${this.port}/mcp`);
+      console.log(`💬 AI Messaging: http://localhost:${this.port}/ai-message`);
+      console.log(`📊 Health Check: http://localhost:${this.port}/health`);
+      console.log(`✅ Readiness Check: http://localhost:${this.port}/ready`);
+      console.log(`📈 SLO Status: http://localhost:${this.port}/slo/status`);
+      console.log(`🔧 System Status: http://localhost:${this.port}/system/status`);
+
+      if (this.messageHub) {
+        const hubPort = this.messageHub.getPort();
+        console.log(`📡 Message Hub WebSocket: ws://localhost:${hubPort}`);
+        console.log('⚡ Real-time notifications: <100ms message discovery');
+      }
+
+      console.log('🌟 Capabilities:');
+      console.log('   🧠 Knowledge Graph (SQLite + Weaviate)');
+      console.log('   💬 AI Agent Messaging');
+      console.log('   🌐 Cross-Platform Path Translation');
+      console.log('   📈 Observability & SLOs');
+      console.log('');
+      console.log('🚀 Ready for Neural AI Collaboration!');
+    } catch (error) {
+      this.lifecycleState = 'closing';
+      try {
+        await this.shutdownResources();
+      } catch (shutdownError) {
+        console.error('Failed to clean up after HYTHE startup error:', shutdownError);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Stop accepting traffic, drain listeners and background work, then close
+   * SQLite. The returned promise is stable, so repeated shutdown requests all
+   * observe the same result and never close a resource twice.
+   */
+  close(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    if (this.lifecycleState === 'closed') return Promise.resolve();
+
+    const wasStarting = this.lifecycleState === 'starting';
+    this.lifecycleState = 'closing';
+    this.shutdownPromise = wasStarting && this.startPromise
+      ? this.startPromise.catch(() => undefined).then(() => this.shutdownResources())
+      : this.shutdownResources();
+    return this.shutdownPromise;
+  }
+
+  private isShuttingDown(): boolean {
+    return this.lifecycleState === 'closing' || this.lifecycleState === 'closed';
+  }
+
+  private stopHttpListener(): Promise<void> {
+    const listener = this.httpServer;
+    this.httpServer = undefined;
+    if (!listener?.listening) return Promise.resolve();
+
+    // Calling close immediately stops new connections. Its callback fires only
+    // after requests already accepted by Node's HTTP server have drained.
+    return new Promise<void>((resolve, reject) => {
+      listener.close((error) => error ? reject(error) : resolve());
     });
   }
 
-  close() {
-    this.memoryManager.close();
+  private shutdownResources(): Promise<void> {
+    if (this.resourceShutdownPromise) return this.resourceShutdownPromise;
+
+    const hasAsyncListeners = Boolean(this.httpServer?.listening || this.messageHubStarted);
+    if (!hasAsyncListeners) {
+      // Most in-process tests construct the app without calling start(). Keep
+      // their historical fire-and-forget close safe while still returning an
+      // awaitable, idempotent promise.
+      stopSLOMonitoring();
+      void metrics.stopCompaction();
+      const memoryClose = this.memoryManager.close();
+      this.resourceShutdownPromise = memoryClose.then(() => {
+        this.lifecycleState = 'closed';
+      });
+      return this.resourceShutdownPromise;
+    }
+
+    const httpDrain = this.stopHttpListener();
+    this.resourceShutdownPromise = (async () => {
+      const errors: unknown[] = [];
+
+      if (this.messageHub && this.messageHubStarted) {
+        try {
+          await this.messageHub.stop();
+        } catch (error) {
+          errors.push(error);
+        } finally {
+          this.messageHubStarted = false;
+        }
+      }
+
+      stopSLOMonitoring();
+      try {
+        await metrics.stopCompaction();
+      } catch (error) {
+        errors.push(error);
+      }
+
+      try {
+        await httpDrain;
+      } catch (error) {
+        errors.push(error);
+      }
+
+      // SQLite must be the last resource closed: requests and background work
+      // above may still need it while they drain.
+      try {
+        await this.memoryManager.close();
+      } catch (error) {
+        errors.push(error);
+      }
+
+      this.lifecycleState = 'closed';
+      if (errors.length > 0) {
+        throw new AggregateError(errors, 'HYTHE shutdown encountered one or more errors');
+      }
+    })();
+
+    return this.resourceShutdownPromise;
   }
 
   /** Expose Express app for testing (supertest). */
@@ -4782,9 +5136,25 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   // isolated/test server run against a throwaway DB without touching prod data.
   const dbPath = process.env.NEURAL_DB_PATH || undefined;
   const server = new NeuralMCPServer(port, dbPath);
-  
+
+  let shutdownStarted = false;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    console.log(`🛑 ${signal} received; draining HYTHE`);
+    void server.close().then(() => {
+      console.log('✅ HYTHE shutdown complete');
+      process.exitCode = 0;
+    }).catch((error) => {
+      console.error('❌ HYTHE shutdown failed:', error);
+      process.exitCode = 1;
+    });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+
   server.start().catch((error) => {
     console.error('Failed to start Unified Neural MCP Server:', error);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }

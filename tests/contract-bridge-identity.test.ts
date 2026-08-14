@@ -9,6 +9,7 @@ import { UnifiedToolSchemas } from '../src/shared/toolSchemas.js';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BRIDGE = join(REPO, 'mcp-stdio-http-bridge.cjs');
+const packageVersion = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')).version;
 const cleanups: Array<() => void> = [];
 const bridgeSource = readFileSync(BRIDGE, 'utf8');
 const boundToolsBlock = /const AGENT_ID_BOUND_TOOLS = new Set\(\[([\s\S]*?)\]\);/.exec(bridgeSource)?.[1] || '';
@@ -16,7 +17,16 @@ const agentIdBoundTools = Array.from(boundToolsBlock.matchAll(/'([^']+)'/g), (ma
 
 function identityCleanEnv(extra: NodeJS.ProcessEnv = {}) {
   const env = { ...process.env, ...extra };
-  for (const key of ['HYTHE_AGENT_ID', 'ENGRAM_AGENT_ID', 'FROM', 'MCP_FROM']) {
+  for (const key of [
+    'HYTHE_AGENT_ID',
+    'ENGRAM_AGENT_ID',
+    'FROM',
+    'MCP_FROM',
+    'HYTHE_AGENT_KEY_FILE',
+    'HYTHE_AGENT_KEY',
+    'HYTHE_AGENT_TOKEN',
+    'HYTHE_AGENT_AUTH_MODE',
+  ]) {
     delete env[key];
   }
   return { ...env, ...extra };
@@ -74,6 +84,23 @@ afterEach(() => {
 });
 
 describe('stdio bridge identity boundary', () => {
+  it('advertises the package version during local MCP initialization', async () => {
+    const recorder = await startRecorder();
+    const response = await runBridge(BRIDGE, identityCleanEnv({
+      HYTHE_AGENT_ID: 'codex-public-client',
+      MCP_HOST: '127.0.0.1',
+      MCP_PORT: String(recorder.port),
+    }), {
+      jsonrpc: '2.0', id: 90, method: 'initialize', params: {},
+    });
+
+    expect(response.status).toBe(0);
+    const initialized = response.stdout.trim().split('\n')
+      .map((line) => JSON.parse(line))
+      .find((entry) => entry.id === 90);
+    expect(initialized.result.serverInfo.version).toBe(packageVersion);
+  });
+
   it('keeps the bridge policy closed over every declared or implicit acting identity', () => {
     const targetOnlyAgentIdTools = new Set(['send_ai_message', 'get_agent_status']);
     const declaredActingTools = Object.values(UnifiedToolSchemas)
