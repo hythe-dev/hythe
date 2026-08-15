@@ -6,12 +6,12 @@
     "url": "https://github.com/hythe-dev/hythe",
     "source": "github"
   },
-  "version": "0.1.5",
+  "version": "0.1.6",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@hythe/mcp",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "transport": {
         "type": "stdio"
       },
@@ -39,7 +39,7 @@
         },
         {
           "name": "API_KEY",
-          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (create a protected .env with: npx -y @hythe/mcp@0.1.5 init --write-env --agent-id <agent-id>)",
+          "description": "Shared API key authenticating the bridge to your self-hosted HYTHE server (create a protected .env with: npx -y @hythe/mcp@0.1.6 init --write-env --agent-id <agent-id>)",
           "isRequired": true,
           "format": "string",
           "isSecret": true

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.6 - 2026-08-14
+
+- Add `discover_related_context`, a tenant-scoped, `memory:read`-authorized,
+  read-only tool that exact-resolves a project/task name or registered alias
+  before retrieval, combines bounded vector candidates with one/two-hop graph
+  paths, reports score/currentness/evidence/provenance plus explicit degradation
+  and coverage under a hard response budget, and performs no writes.
+- Fix latency-SLO recovery by resolving the same severity-keyed p95 warning and
+  p99 critical records created by the monitor, so a recovered p99 window clears
+  the critical alert and `/ready` can return from degraded HTTP 207 to healthy
+  HTTP 200.
+
 ## 0.1.5 - 2026-08-14
 
 - Add dual-proof authentication: the existing deployment or tenant credential

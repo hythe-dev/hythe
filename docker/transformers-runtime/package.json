@@ -1,6 +1,6 @@
 {
   "name": "@hythe/transformers-runtime",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Docker-only, independently locked q8 embedding runtime for HYTHE.",
   "type": "module",
