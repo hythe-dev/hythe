@@ -48,7 +48,7 @@ import { resolveScope, deriveScopeKey, type EntityDirectory } from '../src/unifi
 // Inert migrations: importing is safe; only direct execution refuses.
 import { DDL_STANDALONE } from '../src/migrations/005-eng4-control-plane.mjs';
 import { planHandoffBackfill, applyHandoffBackfill } from '../src/migrations/006-handoff-uuid-backfill.mjs';
-import { RETAINED_LEGACY_TOOLS, RETIRED_TOOLS, ENG4_RESOURCE_TEMPLATES, validateEng4Output, Eng4OutputValidationError } from '../src/unified-server/eng4/register.js';
+import { RETAINED_LEGACY_TOOLS, READ_DISCOVERY_TOOLS, RETIRED_TOOLS, ENG4_RESOURCE_TEMPLATES, validateEng4Output, Eng4OutputValidationError } from '../src/unified-server/eng4/register.js';
 
 // $data:true is load-bearing: coverage closedness (included===total when
 // complete) is expressed via $data refs. Runtime validators MUST enable it.
@@ -1901,9 +1901,9 @@ describe('STEP-3 B — registration, tool diet, resources (executable)', () => {
   const call = async (name: string, args: Record<string, any>) =>
     (server as any)._handleToolCall(name, args);
 
-  it('tools/list is EXACTLY the v1 surface: 15 retained + resume + checkpoint; every retired tool absent; no third eng4 tool', async () => {
+  it('tools/list is exactly the retained, read-discovery, and two ENG-4 state surfaces', async () => {
     const listed = (await (server as any)._handleToolsList()).tools.map((t: any) => t.name).sort();
-    expect(listed).toEqual([...RETAINED_LEGACY_TOOLS, 'resume', 'checkpoint'].sort());
+    expect(listed).toEqual([...RETAINED_LEGACY_TOOLS, ...READ_DISCOVERY_TOOLS, 'resume', 'checkpoint'].sort());
     for (const retired of RETIRED_TOOLS) expect(listed).not.toContain(retired);
     expect(listed.filter((n: string) => /snapshot|history|changes|get_checkpoint/.test(n))).toEqual([]);
   });

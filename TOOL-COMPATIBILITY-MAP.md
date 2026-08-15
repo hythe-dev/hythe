@@ -3,10 +3,10 @@
 Authorized: adversarial review `4320b5c5` + owner GO; corrected per review
 `b2543ebc` (lifecycle symmetry + bounded adjacency kept). Registry of
 record: `src/unified-server/eng4/register.ts` — `tools/list` is built
-exclusively from `RETAINED_LEGACY_TOOLS + ENG4_TOOLS`, so nothing retired
-can linger in discovery accidentally.
+exclusively from `RETAINED_LEGACY_TOOLS + READ_DISCOVERY_TOOLS + ENG4_TOOLS`,
+so nothing retired can linger in discovery accidentally.
 
-## Surface: 33 → 19
+## Surface: 33 → 20
 
 ### New canonical primitives (2)
 | Tool | Notes |
@@ -16,6 +16,11 @@ can linger in discovery accidentally.
 
 History/snapshot/message/handoff fetch is a **resource** (`engram://…` via
 `resources/list` templates + `resources/read`), deliberately never a tool.
+
+### Read-only knowledge discovery (1)
+| Tool | Notes |
+|---|---|
+| `discover_related_context` | Exact-resolves a project/task scope, automatically retrieves bounded vector candidates, reranks them with one/two-hop graph paths, and returns score/currentness/evidence/provenance explanations under a hard response budget. It never creates a relation or changes memory; durable graph writes remain an explicit `create_relations` step after validation. |
 
 ### Retained legacy tools (17)
 `create_entities`, `add_observations`, `get_current_observation`,

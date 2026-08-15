@@ -491,11 +491,11 @@ describe('Neural Contract Baseline', () => {
       const json = await res.json();
       const tools = json.result?.tools || [];
 
-      // Step-3 tool diet (TOOL-COMPATIBILITY-MAP.md, sol b2543ebc): the
-      // agent-facing surface is EXACTLY 19 — 17 retained legacy tools plus
-      // the two ENG-4 primitives. Retired tools stay callable until cutover
-      // but must never appear in discovery.
-      expect(tools.length).toBe(19);
+      // Step-3 tool diet plus bounded related-context discovery: the
+      // agent-facing surface is EXACTLY 20 — 17 retained legacy tools,
+      // one read-only discovery tool, and the two ENG-4 primitives. Retired
+      // tools stay callable until cutover but never appear in discovery.
+      expect(tools.length).toBe(20);
 
       const keepTools = [
         'create_entities',
@@ -515,6 +515,7 @@ describe('Neural Contract Baseline', () => {
         'set_agent_identity',
         'begin_session',
         'end_session',
+        'discover_related_context',
         'resume',
         'checkpoint',
       ];

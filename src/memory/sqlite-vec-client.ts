@@ -203,6 +203,57 @@ export class SqliteVecClient {
     return fallbackRows.map((row) => this.rowToMemoryItem(row));
   }
 
+  /**
+   * Strict vector KNN for callers that must distinguish semantic retrieval
+   * from lexical fallback. A missing vec0 backend is reported as degradation;
+   * this method never substitutes LIKE matches or unscored rows.
+   */
+  async searchSemanticMemories(
+    options: SearchOptions,
+  ): Promise<{ memories: MemoryItem[]; degraded: boolean; reasons: string[] }> {
+    if (!this.initialized) await this.initialize();
+    if (!this.extensionLoaded) {
+      return {
+        memories: [],
+        degraded: true,
+        reasons: ['semantic_vector_backend_unavailable'],
+      };
+    }
+
+    const parsed = this.parseSearchOptions(options, undefined, undefined, options.limit ?? 10, options.tenantId);
+    const queryEmbedding = await this.createEmbedding(parsed.query);
+    if (!queryEmbedding) {
+      return {
+        memories: [],
+        degraded: true,
+        reasons: ['semantic_query_embedding_unavailable'],
+      };
+    }
+
+    try {
+      const semanticWindow = this.searchWithVectorsTenantComplete(parsed, queryEmbedding);
+      const rows = semanticWindow.rows;
+      const memories = rows
+        .filter((row) => Number.isFinite(row.distance))
+        .map((row) => this.rowToMemoryItem(row));
+      const reasons = new Set<string>();
+      if (memories.length !== rows.length) reasons.add('semantic_similarity_unavailable');
+      if (semanticWindow.capped) reasons.add('semantic_tenant_window_exhausted');
+      if (semanticWindow.indexIncomplete) reasons.add('semantic_vector_index_incomplete');
+      return {
+        memories,
+        degraded: reasons.size > 0,
+        reasons: [...reasons].sort(),
+      };
+    } catch (error) {
+      return {
+        memories: [],
+        degraded: true,
+        reasons: ['semantic_vector_search_failed'],
+      };
+    }
+  }
+
   async calculateSimilarity(memory1: MemoryItem, memory2: MemoryItem): Promise<number> {
     const v1 = await this.createEmbedding(memory1.content || '');
     const v2 = await this.createEmbedding(memory2.content || '');
@@ -368,6 +419,14 @@ export class SqliteVecClient {
     // the index table for tenant/type/agent filtering. Because filters apply
     // AFTER knn, over-fetch k so post-filtering still returns enough rows.
     const overfetch = Math.min(500, Math.max(options.limit * 5, 50));
+    return this.searchWithVectorWindow(options, queryEmbedding, overfetch);
+  }
+
+  private searchWithVectorWindow(
+    options: { query: string; agentId?: string; memoryType?: string; tenantId: string; limit: number },
+    queryEmbedding: number[],
+    knnLimit: number,
+  ): IndexRow[] {
     let sql = `
       WITH knn AS (
         SELECT rowid, distance
@@ -382,7 +441,7 @@ export class SqliteVecClient {
       WHERE m.tenant_id = ?
     `;
 
-    const params: Array<string | number> = [JSON.stringify(queryEmbedding), overfetch, options.tenantId];
+    const params: Array<string | number> = [JSON.stringify(queryEmbedding), knnLimit, options.tenantId];
 
     if (options.agentId) {
       sql += ' AND m.agent_id = ?';
@@ -398,6 +457,79 @@ export class SqliteVecClient {
     params.push(options.limit);
 
     return this.db.prepare(sql).all(...params) as IndexRow[];
+  }
+
+  /**
+   * vec0 applies partition predicates only after the global KNN window. Expand
+   * that window deterministically until the requested tenant/filter rows are
+   * complete, the vector table is exhausted, or the hard work cap is reached.
+   * The last case is explicit degradation rather than a silently empty result.
+   */
+  private searchWithVectorsTenantComplete(
+    options: { query: string; agentId?: string; memoryType?: string; tenantId: string; limit: number },
+    queryEmbedding: number[],
+  ): { rows: IndexRow[]; capped: boolean; indexIncomplete: boolean } {
+    const hardKnnCap = 5000;
+    let filteredSql = `SELECT COUNT(*) AS count
+      FROM ${this.indexTableName}
+      WHERE tenant_id = ? AND vector_rowid IS NOT NULL`;
+    const filteredParams: Array<string> = [options.tenantId];
+    if (options.agentId) {
+      filteredSql += ' AND agent_id = ?';
+      filteredParams.push(options.agentId);
+    }
+    if (options.memoryType) {
+      filteredSql += ' AND memory_type = ?';
+      filteredParams.push(options.memoryType);
+    }
+    const filteredCount = Number((this.db.prepare(filteredSql).get(...filteredParams) as any)?.count || 0);
+    if (filteredCount === 0) return { rows: [], capped: false, indexIncomplete: false };
+
+    let totalVectors: number | null = null;
+    try {
+      totalVectors = Number((this.db.prepare(
+        `SELECT COUNT(*) AS count FROM ${this.vectorTableName}`,
+      ).get() as any)?.count || 0);
+    } catch {
+      // A count is an optimization and an exhaustion proof. The hard cap still
+      // bounds work and will be reported if completeness cannot be established.
+    }
+    if (totalVectors === 0) {
+      return { rows: [], capped: false, indexIncomplete: true };
+    }
+
+    const desiredRows = Math.min(options.limit, filteredCount);
+    let knnLimit = Math.min(
+      Math.max(options.limit * 5, 50),
+      totalVectors === null ? hardKnnCap : Math.max(totalVectors, 1),
+      hardKnnCap,
+    );
+    let rows: IndexRow[] = [];
+
+    while (knnLimit > 0) {
+      rows = this.searchWithVectorWindow(options, queryEmbedding, knnLimit);
+      if (rows.length >= desiredRows) return { rows, capped: false, indexIncomplete: false };
+      if (totalVectors !== null && knnLimit >= totalVectors) {
+        return { rows, capped: false, indexIncomplete: true };
+      }
+      if (knnLimit >= hardKnnCap) return { rows, capped: true, indexIncomplete: false };
+
+      const nextLimit = Math.min(
+        hardKnnCap,
+        totalVectors === null ? hardKnnCap : Math.max(totalVectors, 1),
+        Math.max(knnLimit + 1, knnLimit * 2),
+      );
+      if (nextLimit <= knnLimit) {
+        return {
+          rows,
+          capped: totalVectors === null || knnLimit < totalVectors,
+          indexIncomplete: totalVectors !== null && knnLimit >= totalVectors,
+        };
+      }
+      knnLimit = nextLimit;
+    }
+
+    return { rows, capped: filteredCount > 0, indexIncomplete: false };
   }
 
   private searchWithFallback(

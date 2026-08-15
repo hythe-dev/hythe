@@ -45,6 +45,7 @@ const AGENT_ID_RULES = new Map<string, BindingRule>([
 // explicit base-only compatibility path; required mode rejects omitted proof.
 const AGENT_SCOPE_ONLY_RULES = new Map<string, string>([
   ['search_entities', 'memory:read'],
+  ['discover_related_context', 'memory:read'],
   ['get_entity_detail', 'memory:read'],
   ['get_current_observation', 'memory:read'],
   ['get_entity_neighborhood', 'memory:read'],

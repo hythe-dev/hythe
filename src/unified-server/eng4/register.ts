@@ -13,7 +13,8 @@
  * - History stays a RESOURCE: engram:// templates are exported for MCP
  *   resources/list + resources/read; there is deliberately no third tool.
  * - Tool diet (v1 surface, see TOOL-COMPATIBILITY-MAP.md): tools/list is
- *   built EXCLUSIVELY from RETAINED_LEGACY_TOOLS + ENG4_TOOLS, so a
+ *   built EXCLUSIVELY from RETAINED_LEGACY_TOOLS + READ_DISCOVERY_TOOLS +
+ *   ENG4_TOOLS, so a
  *   retired tool can never linger in discovery accidentally. Retired-tool
  *   HANDLERS remain callable as a documented, test-covered compatibility
  *   surface until the owner-gated cutover; call-blocking happens there,
@@ -90,6 +91,12 @@ export const RETAINED_LEGACY_TOOLS: readonly string[] = [
   'get_entity_neighborhood', // bounded typed adjacency — relations must not be write-only (sol b2543ebc)
   'begin_session',
   'end_session',
+];
+
+/** New read-only knowledge discovery tools. Kept separate from the exactly
+ * two ENG-4 state primitives and from the retained compatibility surface. */
+export const READ_DISCOVERY_TOOLS: readonly string[] = [
+  'discover_related_context',
 ];
 
 /** Retired from DISCOVERY now; handlers stay callable until cutover. */

@@ -192,7 +192,7 @@ class SLOMonitor {
         threshold: config.p95Ms
       });
     } else {
-      this.resolveAlert(`${config.name}_p95`);
+      this.resolveAlert(`${config.name}_warning`);
     }
 
     // Check p99
@@ -205,7 +205,7 @@ class SLOMonitor {
         threshold: config.p99Ms
       });
     } else {
-      this.resolveAlert(`${config.name}_p99`);
+      this.resolveAlert(`${config.name}_critical`);
     }
   }
 

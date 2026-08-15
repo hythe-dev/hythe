@@ -9,7 +9,7 @@ import { MemoryManager } from './unified-server/memory/index.js';
 import { MessageHubIntegration } from './message-hub/hub-integration.js';
 import { resolveMessageHubPort } from './message-hub/config.js';
 import { UnifiedToolSchemas } from './shared/toolSchemas.js';
-import { ENG4_TOOLS, RETAINED_LEGACY_TOOLS, handleEng4Tool, ENG4_RESOURCE_TEMPLATES, readEng4Resource } from './unified-server/eng4/register.js';
+import { ENG4_TOOLS, RETAINED_LEGACY_TOOLS, READ_DISCOVERY_TOOLS, handleEng4Tool, ENG4_RESOURCE_TEMPLATES, readEng4Resource } from './unified-server/eng4/register.js';
 import { validateEng4Output } from './unified-server/eng4/register.js';
 import { adaptLegacyBeginSessionArgs } from './unified-server/eng4/schemas.js';
 import { performBeginSession, performEndSession } from './unified-server/eng4/session.js';
@@ -39,6 +39,10 @@ import {
   resolveAgentAuthMode,
 } from './agent-auth/index.js';
 import type { AgentAuthMode } from './agent-auth/index.js';
+import {
+  performRelatedContextDiscovery,
+  RELATED_CONTEXT_LIMITS,
+} from './unified-server/memory/related-context.js';
 
 const packageMetadata = createRequire(import.meta.url)('../package.json') as { version?: unknown };
 if (typeof packageMetadata.version !== 'string' || packageMetadata.version.length === 0) {
@@ -1758,11 +1762,17 @@ export class NeuralMCPServer {
 
   private async _handleToolsList() {
     // v1 TOOL DIET (Step-3, TOOL-COMPATIBILITY-MAP.md): discovery is built
-    // EXCLUSIVELY from the retained registry + the two ENG-4 primitives —
+    // EXCLUSIVELY from the retained registry, read-only discovery registry,
+    // and the two ENG-4 primitives —
     // a retired tool can never linger in tools/list accidentally.
     return {
       tools: [
         ...RETAINED_LEGACY_TOOLS.map((name) => ({
+          name: UnifiedToolSchemas[name].name,
+          description: UnifiedToolSchemas[name].description,
+          inputSchema: UnifiedToolSchemas[name].inputSchema,
+        })),
+        ...READ_DISCOVERY_TOOLS.map((name) => ({
           name: UnifiedToolSchemas[name].name,
           description: UnifiedToolSchemas[name].description,
           inputSchema: UnifiedToolSchemas[name].inputSchema,
@@ -1955,6 +1965,136 @@ export class NeuralMCPServer {
               },
             ],
           };
+        }
+
+        case 'discover_related_context': {
+          const discovery = await performRelatedContextDiscovery(
+            this.memoryManager,
+            tenantId,
+            args,
+          );
+          const effectiveBudget = Math.max(
+            RELATED_CONTEXT_LIMITS.minBudget,
+            Math.min(
+              Number(discovery.coverage?.budget) || RELATED_CONTEXT_LIMITS.defaultBudget,
+              RELATED_CONTEXT_LIMITS.maxBudget,
+            ),
+          );
+
+          let responsePayload: Record<string, any> = discovery;
+          const serialize = () => this.serializeWithTokenEstimate(responsePayload, false);
+          let responseText = serialize();
+          let parsedResponse = JSON.parse(responseText);
+          while (
+            parsedResponse.meta.tokenEstimate > effectiveBudget
+            && Array.isArray(responsePayload.candidates)
+            && responsePayload.candidates.length > 0
+          ) {
+            responsePayload.candidates.pop();
+            responsePayload.coverage.returnedCount = responsePayload.candidates.length;
+            responsePayload.coverage.truncated = true;
+            responsePayload.coverage.omittedReason = 'budget';
+            responseText = serialize();
+            parsedResponse = JSON.parse(responseText);
+          }
+
+          // Exact identifiers are never shortened. If ambiguity/alias detail
+          // cannot fit, omit the list as a whole and preserve its count.
+          if (parsedResponse.meta.tokenEstimate > effectiveBudget) {
+            const ambiguous = responsePayload.resolvedScope?.ambiguousCandidates;
+            if (Array.isArray(ambiguous) && ambiguous.length > 0) {
+              responsePayload.resolvedScope.ambiguousCandidateCount = ambiguous.length;
+              responsePayload.resolvedScope.ambiguousCandidates = [];
+              if (responsePayload.error) {
+                responsePayload.error.candidateCount = ambiguous.length;
+                delete responsePayload.error.candidates;
+              }
+            }
+            const aliases = responsePayload.resolvedScope?.aliasesMatched;
+            if (Array.isArray(aliases) && aliases.length > 0) {
+              responsePayload.resolvedScope.aliasesMatchedCount = aliases.length;
+              responsePayload.resolvedScope.aliasesMatched = [];
+            }
+            responseText = serialize();
+            parsedResponse = JSON.parse(responseText);
+          }
+
+          if (parsedResponse.meta.tokenEstimate > effectiveBudget) {
+            responsePayload = {
+              schemaVersion: responsePayload.schemaVersion,
+              resolvedScope: {
+                projectId: responsePayload.resolvedScope?.projectId ?? null,
+                taskId: responsePayload.resolvedScope?.taskId ?? null,
+                scopeKey: responsePayload.resolvedScope?.scopeKey ?? null,
+                aliasesMatched: [],
+                ...(responsePayload.resolvedScope?.ambiguousCandidateCount
+                  ? { ambiguousCandidateCount: responsePayload.resolvedScope.ambiguousCandidateCount }
+                  : {}),
+              },
+              candidates: [],
+              degraded: {
+                semantic: responsePayload.degraded?.semantic === true,
+                graph: responsePayload.degraded?.graph === true,
+                reasons: [],
+                reasonCount: Array.isArray(responsePayload.degraded?.reasons)
+                  ? responsePayload.degraded.reasons.length
+                  : 0,
+              },
+              coverage: {
+                ...responsePayload.coverage,
+                returnedCount: 0,
+                truncated: responsePayload.coverage?.rankedCount > 0,
+                omittedReason: responsePayload.coverage?.rankedCount > 0 ? 'budget' : 'none',
+                tokenEstimate: 0,
+              },
+              writesPerformed: 0,
+              ...(responsePayload.error ? {
+                error: {
+                  code: responsePayload.error.code,
+                  message: 'Response details omitted to satisfy the hard budget.',
+                  ...(responsePayload.error.candidateCount
+                    ? { candidateCount: responsePayload.error.candidateCount }
+                    : {}),
+                },
+              } : {}),
+            };
+            responseText = serialize();
+            parsedResponse = JSON.parse(responseText);
+          }
+
+          // Close the accounting loop: tokenEstimate is part of the payload,
+          // so update and reserialize until it agrees with the final MCP body.
+          for (let pass = 0; pass < 4; pass++) {
+            responsePayload.coverage.tokenEstimate = parsedResponse.meta.tokenEstimate;
+            responseText = serialize();
+            const next = JSON.parse(responseText);
+            if (next.meta.tokenEstimate === responsePayload.coverage.tokenEstimate) {
+              parsedResponse = next;
+              break;
+            }
+            parsedResponse = next;
+          }
+
+          if (parsedResponse.meta.tokenEstimate > effectiveBudget) {
+            responsePayload = {
+              schemaVersion: 1,
+              candidates: [],
+              coverage: {
+                budget: effectiveBudget,
+                tokenEstimate: 0,
+                returnedCount: 0,
+                truncated: true,
+                omittedReason: 'budget',
+              },
+              writesPerformed: 0,
+              error: { code: 'BUDGET_EXHAUSTED' },
+            };
+            responseText = serialize();
+            parsedResponse = JSON.parse(responseText);
+            responsePayload.coverage.tokenEstimate = parsedResponse.meta.tokenEstimate;
+            responseText = serialize();
+          }
+          return { content: [{ type: 'text', text: responseText }] };
         }
 
         case 'search_entities': {

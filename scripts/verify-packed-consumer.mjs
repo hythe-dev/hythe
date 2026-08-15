@@ -131,8 +131,8 @@ try {
       || !identityConfig.stdout.includes(generatedAgentKeyPath)
       || !identityConfig.stdout.includes('HYTHE_AGENT_AUTH_MODE')
       || !identityConfig.stdout.includes('required')
-      || !identityConfig.stdout.includes('@hythe/mcp@0.1.5')
-      || !identityConfig.stdout.includes('--branch v0.1.5')
+      || !identityConfig.stdout.includes(`${installedPackage.name}@${installedPackage.version}`)
+      || !identityConfig.stdout.includes(`--branch v${installedPackage.version}`)
       || !identityConfig.stdout.includes('server source is not bundled')
       || identityConfig.stdout.includes('Start the server:  docker compose')
       || /hya1_[a-f0-9]{24}_[A-Za-z0-9_-]{43}/.test(identityConfig.stdout)) {

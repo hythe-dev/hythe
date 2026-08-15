@@ -1,5 +1,14 @@
 # Security
 
+## 0.1.6 dual-proof agent authorization
+
+Version 0.1.6 preserves the dual-proof authorization model introduced in
+0.1.5: effective authority remains the intersection of the deployment or
+tenant credential and the exact agent credential. The new
+`discover_related_context` surface requires `memory:read`, stays within the
+authenticated tenant, exact-resolves its project/task scope before retrieval,
+and performs no writes or implicit relation creation.
+
 ## 0.1.5 dual-proof agent authorization
 
 HYTHE separates two proofs. The existing deployment API key or tenant

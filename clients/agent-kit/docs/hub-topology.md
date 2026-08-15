@@ -29,7 +29,7 @@ chains and message state, and silent data loss. One hub, many clients.
    `MCP_PORT` and the shared deployment/tenant credential file). Each client
    lane also receives its own protected per-agent credential file (see the
    [offline operator guide](../../../docs/AGENT-CREDENTIAL-OPERATOR.md)).
-   Generate each block with `npx -y @hythe/mcp@0.1.5 init --agent-id <agent-id>
+   Generate each block with `npx -y @hythe/mcp@0.1.6 init --agent-id <agent-id>
    --agent-key-file /absolute/path/to/<agent-id>.agent-key
    --agent-auth-mode required` so it contains that machine's exact
    `HYTHE_AGENT_ID` (e.g. `claude-desktop`, `claude-laptop`) plus a file
