@@ -59,6 +59,28 @@ History and full message/handoff bodies are **resources**
 deliberately not tools: bulk history stays off the tool surface and
 payload hashes are verified on read.
 
+## Discovering reusable knowledge
+
+`resume` is deterministic rehydration for one exact scope; it does not
+silently roam the whole tenant graph. When an agent needs knowledge that may
+have been learned elsewhere, `discover_related_context` performs a separate,
+read-only enrichment step:
+
+1. exact-resolve the project/task scope;
+2. retrieve bounded vector-similar entity, observation, and relation rows;
+3. union those candidates with bounded one/two-hop graph neighbors;
+4. rerank with explicit semantic and graph score components; and
+5. explain each result with paths, current-observation status, evidence
+   references, and author/timestamp provenance.
+
+The discovery vocabulary comes from stored entities and relations — the
+server contains no business/project names or fixed domain relation list.
+Candidates are suggestions, not new truth: discovery never creates a relation
+or changes memory. If an explained relationship is validated, a writer may
+make it durable with the separate `create_relations` tool. A relation records
+relevance; it never grants access, which remains controlled by tenant and
+credential scopes.
+
 ## Scopes and tenancy
 
 Every read and write is bound to a tenant (the security boundary) and most
@@ -102,5 +124,5 @@ substrate; the tutorial walks a real two-harness session.
 
 Data is one SQLite file (WAL mode) — see BACKUP-AND-RESTORE.md for the
 tested backup/restore/compaction runbook. The tool surface is versioned
-and dieted (19 tools; see TOOL-COMPATIBILITY-MAP.md for every retired tool
+and dieted (20 tools; see TOOL-COMPATIBILITY-MAP.md for every retired tool
 and its exact replacement).

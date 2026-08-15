@@ -438,6 +438,57 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
       required: ['query']
     }
   },
+  discover_related_context: {
+    name: 'discover_related_context',
+    description: 'Read-only related-knowledge discovery for an exact project/task scope. Automatically retrieves vector candidates, reranks them with bounded one/two-hop graph paths, and explains currentness, evidence references, provenance, and score components. It never creates relations or changes memory; use create_relations separately only after validating a proposed relationship.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        scope: {
+          type: 'object',
+          additionalProperties: false,
+          description: 'Exact canonical name or registered alias for at least one project/task entity. Unknown or ambiguous scopes fail closed before broad retrieval.',
+          properties: {
+            project: { type: 'string', minLength: 1 },
+            task: { type: 'string', minLength: 1 },
+          },
+          anyOf: [
+            { required: ['project'] },
+            { required: ['task'] },
+          ],
+        },
+        intent: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 4000,
+          description: 'The current goal or question used to discover reusable knowledge.',
+        },
+        candidateLimit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 25,
+          default: 10,
+          description: 'Maximum ranked entities returned (server hard cap: 25).',
+        },
+        graphDepth: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 2,
+          default: 1,
+          description: 'Maximum graph path depth used for reranking (server hard cap: 2).',
+        },
+        budget: {
+          type: 'integer',
+          minimum: 256,
+          maximum: 12000,
+          default: 3000,
+          description: 'Hard token-estimate ceiling for the serialized response.',
+        },
+      },
+      required: ['scope', 'intent'],
+    },
+  },
   get_agent_context: {
     name: 'get_agent_context',
     description: 'Retrieve a tiered context bundle for an agent, optionally scoped to a project. Returns identity, project state, unread messages, guardrails, and handoff flags.',

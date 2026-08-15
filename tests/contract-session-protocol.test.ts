@@ -308,8 +308,9 @@ describe('Session Protocol Contract Tests', () => {
       expect(toolNames).not.toContain('get_agent_context');
       expect(toolNames).toContain('begin_session');
       expect(toolNames).toContain('end_session');
+      expect(toolNames).toContain('discover_related_context');
       expect(toolNames).toContain('resume');
-      expect(tools.length).toBe(19);
+      expect(tools.length).toBe(20);
     });
   });
 });

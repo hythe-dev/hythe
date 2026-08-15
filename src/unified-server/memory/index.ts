@@ -1731,6 +1731,100 @@ export class MemoryManager {
     }
   }
 
+  /**
+   * Vector-only retrieval for related-context discovery. Unlike `search()`,
+   * this surface does not mix lexical/table matches into the result and does
+   * not swallow backend availability or query failures. That lets the caller
+   * report semantic degradation honestly while still applying the same
+   * tenant and private-graph filters as every other memory read.
+   */
+  async searchRelatedContextSemantic(
+    query: string,
+    tenantId: string = 'default',
+    limit: number = 30,
+  ): Promise<{ results: SearchResult[]; degraded: boolean; reasons: string[] }> {
+    const boundedLimit = Math.max(1, Math.min(Math.floor(Number(limit) || 30), 75));
+    if (!this.isAdvancedSystemsEnabled || !this.vectorClient) {
+      return {
+        results: [],
+        degraded: true,
+        reasons: ['semantic_backend_unavailable'],
+      };
+    }
+
+    try {
+      const semantic = await this.vectorClient.searchSemanticMemories({
+        query,
+        tenantId,
+        limit: boundedLimit,
+      });
+      const results: SearchResult[] = [];
+      const reasons = new Set(semantic.reasons);
+      const backingRow = this.db.prepare(
+        `SELECT id, memory_type, content, created_by, created_at
+         FROM shared_memory
+         WHERE tenant_id = ? AND id = ? AND memory_type IN ('entity', 'observation', 'relation')
+         LIMIT 1`,
+      );
+      for (const vectorResult of semantic.memories) {
+        const row = backingRow.get(tenantId, vectorResult.id) as {
+          id: string;
+          memory_type: string;
+          content: string;
+          created_by: string;
+          created_at: string;
+        } | undefined;
+        if (!row) {
+          reasons.add('semantic_backing_row_missing');
+          continue;
+        }
+        if (String(vectorResult.type).toLowerCase() !== String(row.memory_type).toLowerCase()) {
+          reasons.add('semantic_backing_type_mismatch');
+          continue;
+        }
+        if (String(vectorResult.content) !== row.content) {
+          reasons.add('semantic_index_backing_mismatch');
+          continue;
+        }
+        if (this.isConfidentialGraphRow(row.memory_type, row.content, tenantId)) {
+          reasons.add('semantic_private_row_filtered');
+          continue;
+        }
+        const distance = vectorResult.metadata
+          && typeof (vectorResult.metadata as any).distance === 'number'
+          ? (vectorResult.metadata as any).distance
+          : undefined;
+        if (distance === undefined || !Number.isFinite(distance)) {
+          reasons.add('semantic_similarity_unavailable');
+          continue;
+        }
+        const semanticSimilarity = 1 / (1 + distance);
+        results.push({
+          id: row.id,
+          type: 'shared',
+          content: { original: row.content },
+          relevance: semanticSimilarity,
+          source: `sqlite-vec:${row.created_by}`,
+          timestamp: new Date(row.created_at),
+          memoryType: row.memory_type,
+          distance,
+          semanticSimilarity,
+        });
+      }
+      return {
+        results,
+        degraded: semantic.degraded || reasons.size > 0,
+        reasons: [...reasons].sort(),
+      };
+    } catch {
+      return {
+        results: [],
+        degraded: true,
+        reasons: ['semantic_backend_failed'],
+      };
+    }
+  }
+
   getMemorySystem(): MemorySystem {
     return this.memorySystem;
   }
@@ -4780,6 +4874,163 @@ export class MemoryManager {
         return false;
       }
     });
+  }
+
+  private relatedContextEntityLookupKeys(
+    entityName: string,
+    tenantId: string,
+    expectedEntityId?: string,
+  ): { entityId: string | null; lookupKeys: string[]; truncated: boolean } {
+    const ids = expectedEntityId
+      ? [expectedEntityId]
+      : [...new Set(
+          this.resolveEntityCandidatesExact(entityName, tenantId)
+            .map((candidate) => candidate.id),
+        )];
+    if (ids.length !== 1) return { entityId: null, lookupKeys: [], truncated: false };
+    const row = this.db.prepare(
+      `SELECT content FROM shared_memory
+       WHERE tenant_id = ? AND id = ? AND memory_type = 'entity' AND json_valid(content)
+       LIMIT 1`,
+    ).get(tenantId, ids[0]) as { content: string } | undefined;
+    if (!row) return { entityId: null, lookupKeys: [], truncated: false };
+    try {
+      const content = JSON.parse(row.content || '{}');
+      if (this.isConfidentialMessageSearchItem('entity', content)) {
+        return { entityId: null, lookupKeys: [], truncated: false };
+      }
+      const canonical = this.entityQueryVariants(content?.name || '').sort();
+      const aliases = (Array.isArray(content?.aliases) ? content.aliases : [])
+        .flatMap((alias: unknown) => typeof alias === 'string' ? this.entityQueryVariants(alias) : [])
+        .sort();
+      const allLookupKeys = [...new Set([...canonical, ...aliases])];
+      // The write-time entity identity index retains at most 64 keys. Querying
+      // beyond that boundary could find an observation but could not prove its
+      // alias maps uniquely back to this entity. Stop at the same bound and
+      // report the omitted identity space as explicit degradation.
+      const maxQueryKeys = MemoryManager.MAX_LOOKUP_KEYS_PER_MEMORY;
+      return {
+        entityId: ids[0],
+        lookupKeys: allLookupKeys.slice(0, maxQueryKeys),
+        truncated: allLookupKeys.length > maxQueryKeys,
+      };
+    } catch {
+      return { entityId: null, lookupKeys: [], truncated: false };
+    }
+  }
+
+  /** Bounded, deterministic observation rows for discovery currentness. */
+  findRelatedContextObservations(
+    entityName: string,
+    tenantId: string,
+    limit: number = 100,
+    expectedEntityId?: string,
+  ): { rows: any[]; truncated: boolean; degradedReason?: string; degradedReasons?: string[] } {
+    const cap = Math.max(1, Math.min(Math.floor(Number(limit) || 100), 100));
+    const { entityId, lookupKeys, truncated: lookupKeysTruncated } =
+      this.relatedContextEntityLookupKeys(entityName, tenantId, expectedEntityId);
+    if (lookupKeys.length === 0) return { rows: [], truncated: false };
+    if (!this.graphLookupIndexHasRows(tenantId)) {
+      return { rows: [], truncated: true, degradedReason: 'graph_lookup_index_unavailable' };
+    }
+    const placeholders = lookupKeys.map(() => '?').join(',');
+    const rawLimit = Math.min(200, Math.max(cap + 1, cap * 2));
+    const rawRows = this.db.prepare(
+      `SELECT sm.id, sm.content, sm.created_by, sm.created_at, sm.rowid AS storage_rowid
+       FROM graph_lookup_keys gl
+       JOIN shared_memory sm
+         ON sm.id = gl.memory_id
+        AND sm.tenant_id = gl.tenant_id
+        AND sm.memory_type = gl.memory_type
+       WHERE gl.tenant_id = ?
+         AND gl.lookup_key IN (${placeholders})
+         AND gl.memory_type = 'observation'
+         AND gl.key_kind = 'entity_name'
+         AND sm.memory_type = 'observation'
+       GROUP BY sm.id
+       ORDER BY sm.created_at DESC, sm.rowid DESC, sm.id ASC
+       LIMIT ?`,
+    ).all(tenantId, ...lookupKeys, rawLimit) as any[];
+    let identityFiltered = false;
+    const visible = rawRows.filter((row) => {
+      if (this.isConfidentialGraphRow('observation', row.content, tenantId)) return false;
+      try {
+        const payload = JSON.parse(row.content || '{}');
+        if (typeof payload.entityName !== 'string' || !payload.entityName.trim()) {
+          identityFiltered = true;
+          return false;
+        }
+        const resolvedIds = [...new Set(
+          this.resolveEntityCandidatesExact(payload.entityName, tenantId)
+            .map((candidate) => candidate.id),
+        )];
+        if (resolvedIds.length !== 1 || resolvedIds[0] !== entityId) {
+          identityFiltered = true;
+          return false;
+        }
+        return true;
+      } catch {
+        identityFiltered = true;
+        return false;
+      }
+    });
+    const degradedReasons = [
+      ...(identityFiltered ? ['observation_identity_ambiguous_or_mismatched'] : []),
+      ...(lookupKeysTruncated ? ['entity_alias_lookup_limit_reached'] : []),
+    ];
+    return {
+      rows: visible.slice(0, cap),
+      truncated: visible.length > cap || rawRows.length === rawLimit,
+      ...(degradedReasons.length > 0 ? {
+        degradedReason: degradedReasons[0],
+        degradedReasons,
+      } : {}),
+    };
+  }
+
+  /** Bounded, deterministic relation rows for discovery graph traversal. */
+  findRelatedContextRelations(
+    entityName: string,
+    tenantId: string,
+    limit: number = 200,
+    expectedEntityId?: string,
+  ): { rows: any[]; truncated: boolean; degradedReason?: string; degradedReasons?: string[] } {
+    const cap = Math.max(1, Math.min(Math.floor(Number(limit) || 200), 200));
+    const { lookupKeys, truncated: lookupKeysTruncated } =
+      this.relatedContextEntityLookupKeys(entityName, tenantId, expectedEntityId);
+    if (lookupKeys.length === 0) return { rows: [], truncated: false };
+    if (!this.graphLookupIndexHasRows(tenantId)) {
+      return { rows: [], truncated: true, degradedReason: 'graph_lookup_index_unavailable' };
+    }
+    const placeholders = lookupKeys.map(() => '?').join(',');
+    const rawLimit = Math.min(400, Math.max(cap + 1, cap * 2));
+    const rawRows = this.db.prepare(
+      `SELECT sm.id, sm.content, sm.created_by, sm.created_at
+       FROM graph_lookup_keys gl
+       JOIN shared_memory sm
+         ON sm.id = gl.memory_id
+        AND sm.tenant_id = gl.tenant_id
+        AND sm.memory_type = gl.memory_type
+       WHERE gl.tenant_id = ?
+         AND gl.lookup_key IN (${placeholders})
+         AND gl.memory_type = 'relation'
+         AND gl.key_kind IN ('relation_from', 'relation_to')
+         AND sm.memory_type = 'relation'
+       GROUP BY sm.id
+       ORDER BY sm.id ASC
+       LIMIT ?`,
+    ).all(tenantId, ...lookupKeys, rawLimit) as any[];
+    const visible = rawRows.filter((row) =>
+      !this.isConfidentialGraphRow('relation', row.content, tenantId)
+    );
+    return {
+      rows: visible.slice(0, cap),
+      truncated: visible.length > cap || rawRows.length === rawLimit,
+      ...(lookupKeysTruncated ? {
+        degradedReason: 'entity_alias_lookup_limit_reached',
+        degradedReasons: ['entity_alias_lookup_limit_reached'],
+      } : {}),
+    };
   }
 
   /**
