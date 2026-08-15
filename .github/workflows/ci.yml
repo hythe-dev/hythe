@@ -37,7 +37,7 @@ jobs:
       - run: npm run test:migrations
       # Validate the production topology without resolving its protected env
       # file or Pavilion host paths on the public runner.
-      - run: HYTHE_IMAGE=hythe:ci docker compose -f docker/pavilion-production.compose.yml config --quiet --no-env-resolution --no-path-resolution
+      - run: HYTHE_RUNTIME_ENV_FILE="$GITHUB_WORKSPACE/.env.example" HYTHE_IMAGE=hythe:ci docker compose -f docker/pavilion-production.compose.yml config --quiet --no-env-resolution --no-path-resolution
 
   docker:
     runs-on: ubuntu-latest

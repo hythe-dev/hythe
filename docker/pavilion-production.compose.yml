@@ -13,7 +13,10 @@ services:
     restart: unless-stopped
     stop_grace_period: 20s
     env_file:
-      - /home/tomcat65/engram-prod/migration-20260730/runtime.env
+      # Production uses the protected Pavilion path by default. CI overrides
+      # only the path with the tracked, non-secret example so Compose can
+      # validate this topology on a clean runner without production files.
+      - "${HYTHE_RUNTIME_ENV_FILE:-/home/tomcat65/engram-prod/migration-20260730/runtime.env}"
     environment:
       NODE_ENV: production
       NEURAL_MCP_PORT: "6174"
