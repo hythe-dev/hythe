@@ -1,6 +1,6 @@
 # Codex config additions (~/.codex/config.toml) — HYTHE memory wiring.
 # After an operator provisions this exact principal's credential, run:
-# `npx -y @hythe/mcp@0.1.6 init --agent-id codex-cli \
+# `npx -y @hythe/mcp@0.1.7 init --agent-id codex-cli \
 #   --agent-key-file /absolute/path/to/codex-cli.agent-key \
 #   --agent-auth-mode required`
 # It prints this exact identity-bound block ready to paste. Both credentials
@@ -8,7 +8,7 @@
 
 [mcp_servers.hythe]
 command = "npx"
-args = ["-y", "@hythe/mcp@0.1.6"]
+args = ["-y", "@hythe/mcp@0.1.7"]
 env = { HYTHE_API_KEY_FILE = "/absolute/path/to/.env", HYTHE_AGENT_ID = "codex-cli", HYTHE_AGENT_KEY_FILE = "/absolute/path/to/codex-cli.agent-key", HYTHE_AGENT_AUTH_MODE = "required", MCP_HOST = "127.0.0.1", MCP_PORT = "6174" }
 
 # HYTHE_AGENT_KEY_FILE contains exactly the raw hya1 token plus an optional

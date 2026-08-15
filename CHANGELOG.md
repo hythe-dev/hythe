@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.7 - 2026-08-14
+
+- Add the hash-bound `quarantine_backing_observation` adjudication disposition
+  for an unresolved private-shaped vector with exactly one proven observation
+  backing row and one uniquely owned vec0 row. The operator must copy the exact
+  target evidence from inventory; ambiguous, stale, cross-tenant, conflicting,
+  or multiply owned rows remain refused.
+- Validate raw target keys before normalization so unknown nested manifest
+  fields cannot be silently discarded before fail-closed planning.
+
 ## 0.1.6 - 2026-08-14
 
 - Add `discover_related_context`, a tenant-scoped, `memory:read`-authorized,

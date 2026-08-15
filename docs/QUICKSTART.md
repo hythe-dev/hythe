@@ -15,9 +15,9 @@ source tree. Start from the exact release tag so Docker Compose has the source,
 lockfile, and Dockerfile it needs:
 
 ```bash
-git clone --depth 1 --branch v0.1.6 https://github.com/hythe-dev/hythe.git
+git clone --depth 1 --branch v0.1.7 https://github.com/hythe-dev/hythe.git
 cd hythe
-npx -y @hythe/mcp@0.1.6 init --write-env --agent-id agent-a
+npx -y @hythe/mcp@0.1.7 init --write-env --agent-id agent-a
 ```
 
 This generates a fresh API key and writes it only to `./.env` (mode 600,
@@ -50,7 +50,7 @@ hook plugin, add the bridge, then launch the identity-bound lane:
 ```bash
 claude plugin marketplace add hythe-dev/hythe
 claude plugin install hythe
-claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env HYTHE_AGENT_ID=agent-a --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp@0.1.6
+claude mcp add hythe --env HYTHE_API_KEY_FILE="$PWD/.env" --env HYTHE_AGENT_ID=agent-a --env MCP_HOST=127.0.0.1 --env MCP_PORT=6174 -- npx -y @hythe/mcp@0.1.7
 HYTHE_AGENT_ID=agent-a claude
 ```
 
@@ -65,7 +65,7 @@ identity fails closed. Same pattern for Codex (`~/.codex/config.toml`), Cursor
 ## 4. Seed the demo (optional, 2 min)
 
 ```bash
-HYTHE_API_KEY_FILE="$PWD/.env" npx -y @hythe/mcp@0.1.6 demo
+HYTHE_API_KEY_FILE="$PWD/.env" npx -y @hythe/mcp@0.1.7 demo
 ```
 
 This seeds a namespaced (`demo-*`) two-agent story: `demo-alice` writes a
@@ -82,7 +82,7 @@ credential, then paste it into the second harness (say Codex next to Claude
 Code):
 
 ```bash
-npx -y @hythe/mcp@0.1.6 init --agent-id agent-b
+npx -y @hythe/mcp@0.1.7 init --agent-id agent-b
 ```
 
 Each client lane needs a stable, distinct identity. The bridge rejects a
@@ -153,7 +153,7 @@ deployment-specific rollback plan.
   the same mode-400 or mode-600 `.env` used by the server. The server also logs
   auth failures.
 - **`.env` refuses to boot** — the placeholder `API_KEY=CHANGE_ME` is
-  deliberately rejected; run `npx -y @hythe/mcp@0.1.6 init --write-env --agent-id agent-a`
+  deliberately rejected; run `npx -y @hythe/mcp@0.1.7 init --write-env --agent-id agent-a`
   for a real key and identity-bound client config.
 - **Bridge exits with an identity error** — set `HYTHE_AGENT_ID` to one stable
   1-100 character id for that client lane. If the legacy `ENGRAM_AGENT_ID`,

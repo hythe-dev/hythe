@@ -25,17 +25,16 @@ HYTHE is an MCP server that lets multiple AI coding agents — Claude Code, Code
 
 ## Status
 
-**Version 0.1.6.** This source tree and package define the reviewed 0.1.6
-release. An npm-registry observation during release verification on 2026-08-14
-found `@hythe/mcp@0.1.3` at the `latest` tag; that is a timestamped registry
-fact, not an instruction to run an unpinned client. Version 0.1.6 preserves
-0.1.5's dual-proof agent authorization, exact-mailbox/private-payload
-containment, and offline cleanup tools. It adds bounded, read-only
-related-context discovery for exact project/task scopes and fixes latency-SLO
-alert recovery so a resolved p99 breach no longer leaves readiness degraded.
-The earlier 0.1.4 candidate is superseded and is not a publish target. All
-0.1.6 rollout configurations pin `@hythe/mcp@0.1.6`; do not use an unpinned
-npm dist-tag until the registry returns that exact version. The predecessor
+**Version 0.1.7.** This source tree and package define the reviewed 0.1.7
+release. Version 0.1.7 preserves 0.1.6's dual-proof agent authorization,
+exact-mailbox/private-payload containment, bounded related-context discovery,
+and latency-SLO recovery. It extends the offline adjudicator with an explicit,
+hash-bound `quarantine_backing_observation` disposition for a uniquely proven
+private-shaped observation that backs an otherwise unresolved vector; ambiguous,
+cross-tenant, stale, or multiply owned evidence still fails closed. The earlier
+0.1.4 candidate is superseded and is not a publish target. All 0.1.7 rollout
+configurations pin `@hythe/mcp@0.1.7`; verify that the registry returns that
+exact version before production use. The predecessor
 `@tomcat65/engram-mcp` and `io.github.tomcat65/engram` remain available as
 compatibility history and are never unpublished.
 
@@ -45,7 +44,7 @@ House rule: every claim in these docs must trace to a test or a measurement (see
 
 | Claim | Evidence | Source | Date |
 |---|---|---|---|
-| Tree green, full gates | Source and clean installed-package gates cover 49 Vitest files (530 passed, 2 skipped, 6 explicit todos), 91 migration checks, 43 release-tree checks, 31 agent-kit checks, zero production npm audit findings, registry validation, and an isolated Docker start/readiness/MCP/WebSocket/graceful-shutdown canary. | `.github/workflows/ci.yml`, `tests/`, `src/migrations/`, `clients/agent-kit/tests/test-setup.sh`, `scripts/verify-hythe-release-tree.test.mjs`, `scripts/verify-packed-consumer.mjs` | 2026-08-14 |
+| Tree green, full gates | Source and clean installed-package gates cover 49 Vitest files (530 passed, 2 skipped, 6 explicit todos), 107 migration checks, 43 release-tree checks, 31 agent-kit checks, zero production npm audit findings, registry validation, and an isolated Docker start/readiness/MCP/WebSocket/graceful-shutdown canary. | `.github/workflows/ci.yml`, `tests/`, `src/migrations/`, `clients/agent-kit/tests/test-setup.sh`, `scripts/verify-hythe-release-tree.test.mjs`, `scripts/verify-packed-consumer.mjs` | 2026-08-14 |
 | Compaction identity fails closed | Startup and post-compaction hooks reject missing, conflicting, or invalid identity; the bridge binds acting tools and message-resource recipients to the configured exact lane before any HTTP request. | `clients/agent-kit/tests/test-setup.sh`, `tests/contract-bridge-identity.test.ts` | 2026-08-13 |
 | Exact mailboxes stay isolated | Houston/Hythe, case variants, display metadata, legacy identity history, cross-tenant poisoning, suffix handles, lifecycle changes, supersession, HTTP, and ENG-4 authorship have negative isolation coverage. | `tests/contract-message-identity-isolation.test.ts`, `tests/contract-eng4-p0.test.ts` | 2026-08-13 |
 | Private message bodies stay out of shared graph surfaces | Historical, oversized, malformed, alias-linked, relation-linked, imported, exported, searched, graphed, logged, and restored payload paths are covered; hidden children do not leak through counts. | `tests/contract-message-payload-isolation.test.ts`, `tests/contract-data-payload-isolation.test.ts`, `tests/contract-log-confidentiality.test.ts` | 2026-08-13 |

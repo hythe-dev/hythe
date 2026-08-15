@@ -11,6 +11,7 @@
  *   - restore_mailbox
  *   - private_duplicate
  *   - stale_vector_remove
+ *   - quarantine_backing_observation
  *
  * Explicitly refused until purpose-built adapters exist:
  *   - public_relink (graph-index and embedding rebuild required)
@@ -65,6 +66,7 @@ const ALLOWED_DISPOSITIONS = new Set([
   'restore_mailbox',
   'private_duplicate',
   'quarantine',
+  'quarantine_backing_observation',
   'stale_vector_remove',
 ]);
 const VECTOR_ISSUE_CODES = new Set([
@@ -703,6 +705,8 @@ function vectorOwnership(db, vectorStorage, tenantId, id) {
     if (shared) backingRows.push({
       ...rowDescriptor('shared_memory', tenantId, id, shared),
       memoryType: shared.memory_type,
+      parentTopology: parentTopology(db, shared),
+      ancillaryRows: ancillaryTopology(db, tenantId, id),
     });
   }
   if (tableExists(db, 'ai_messages')) {
@@ -758,6 +762,11 @@ function supportedDispositions(issue, descriptor, row, topology, vectors) {
   const supported = [];
   if (!descriptor.exists) return supported;
   if (VECTOR_ISSUE_CODES.has(issue.code)) supported.push('stale_vector_remove');
+  if (issue.code === 'unrepresented_private_vector'
+      && issue.reason === 'unresolved_private_shaped_observation'
+      && String(issue.memoryType || '').trim().toLowerCase() === 'observation') {
+    supported.push('quarantine_backing_observation');
+  }
   if (descriptor.locator.table === 'shared_memory') {
     const pointerCount = topology?.pointerMessages?.length || 0;
     if (pointerCount === 0) supported.push('quarantine');
@@ -968,6 +977,106 @@ function validateTarget(db, target, expectedTable, errors, findingId) {
   return row;
 }
 
+function validateBackingObservationQuarantine(db, finding, decision, errors) {
+  const ownership = finding.vectorOwnership;
+  if (finding.issue?.code !== 'unrepresented_private_vector'
+      || finding.issue?.reason !== 'unresolved_private_shaped_observation'
+      || String(finding.issue?.memoryType || '').trim().toLowerCase() !== 'observation'
+      || String(ownership?.index?.memoryType || '').trim().toLowerCase() !== 'observation') {
+    errors.push({ code: 'backing_observation_wrong_type', findingId: finding.findingId });
+    return null;
+  }
+  const backingRows = Array.isArray(ownership?.backingRows) ? ownership.backingRows : [];
+  if (backingRows.length === 0) {
+    errors.push({ code: 'backing_observation_missing', findingId: finding.findingId });
+    return null;
+  }
+  if (backingRows.length !== 1) {
+    errors.push({ code: 'backing_observation_not_unique', findingId: finding.findingId });
+    return null;
+  }
+
+  const backing = backingRows[0];
+  const target = decision.target;
+  strictKeys(
+    target,
+    new Set(['table', 'tenantId', 'id', 'rowHash', 'contentHash']),
+    'decision.target',
+    errors
+  );
+  const indexLocator = ownership?.index?.locator;
+  const targetHasIdentity = target
+    && target.table === 'shared_memory'
+    && typeof target.tenantId === 'string'
+    && typeof target.id === 'string';
+  if (!targetHasIdentity
+      || backing.locator?.table !== 'shared_memory'
+      || target.tenantId !== backing.locator.tenantId
+      || target.id !== backing.locator.id
+      || target.tenantId !== finding.locator.tenantId
+      || target.id !== finding.locator.id
+      || !indexLocator
+      || indexLocator.table !== finding.locator.table
+      || indexLocator.tenantId !== finding.locator.tenantId
+      || indexLocator.id !== finding.locator.id) {
+    errors.push({ code: 'backing_observation_identity_mismatch', findingId: finding.findingId });
+    return null;
+  }
+  if (String(backing.memoryType || '').trim().toLowerCase() !== 'observation') {
+    errors.push({ code: 'backing_observation_wrong_type', findingId: finding.findingId });
+    return null;
+  }
+  if (ownership.index.rowHash !== finding.rowHash
+      || ownership.index.contentHash !== finding.contentHash
+      || !Array.isArray(backing.ancillaryRows)
+      || backing.parentTopology == null) {
+    errors.push({ code: 'backing_observation_evidence_mismatch', findingId: finding.findingId });
+    return null;
+  }
+  if (target.rowHash !== backing.rowHash || target.contentHash !== backing.contentHash) {
+    errors.push({ code: 'backing_observation_hash_mismatch', findingId: finding.findingId });
+    return null;
+  }
+  if (finding.contentHash !== backing.contentHash) {
+    errors.push({ code: 'backing_observation_content_mismatch', findingId: finding.findingId });
+    return null;
+  }
+
+  const row = exactSharedRow(db, target.tenantId, target.id);
+  if (!row) {
+    errors.push({ code: 'backing_observation_missing', findingId: finding.findingId });
+    return null;
+  }
+  if (String(row.memory_type || '').trim().toLowerCase() !== 'observation') {
+    errors.push({ code: 'backing_observation_wrong_type', findingId: finding.findingId });
+    return null;
+  }
+  const current = rowDescriptor('shared_memory', target.tenantId, target.id, row);
+  if (current.rowHash !== backing.rowHash || current.contentHash !== backing.contentHash) {
+    errors.push({ code: 'backing_observation_hash_mismatch', findingId: finding.findingId });
+    return null;
+  }
+
+  const vec0 = ownership?.vec0;
+  const owners = Array.isArray(vec0?.owners) ? vec0.owners : [];
+  if (!vec0?.exists) {
+    errors.push({ code: 'backing_observation_vector_missing', findingId: finding.findingId });
+  } else if (owners.length !== 1 || !sameValue(owners[0]?.locator, indexLocator)) {
+    errors.push({ code: 'backing_observation_vector_not_unique', findingId: finding.findingId });
+  }
+
+  return {
+    row,
+    finding: {
+      ...finding,
+      locator: backing.locator,
+      rowHash: backing.rowHash,
+      contentHash: backing.contentHash,
+      ancillaryRows: backing.ancillaryRows,
+    },
+  };
+}
+
 function parseLegacySharedMessage(row) {
   const payload = parseObject(row.content);
   if (!payload) return null;
@@ -1080,6 +1189,18 @@ export function planPrivateMessageResidueAdjudication(db, inventory, manifestInp
     } else if (!finding.supportedDispositions.includes(decision.disposition)) {
       errors.push({ code: 'disposition_not_supported_for_finding', findingId: decision.findingId });
     }
+    if (decision.target != null) {
+      strictKeys(
+        decision.target,
+        new Set(['table', 'tenantId', 'id', 'rowHash', 'contentHash']),
+        'decision.target',
+        errors
+      );
+      if (!['restore_mailbox', 'private_duplicate', 'quarantine_backing_observation']
+        .includes(decision.disposition)) {
+        errors.push({ code: 'unexpected_target', findingId: decision.findingId });
+      }
+    }
   }
   for (const finding of inventory.findings) {
     if (!decisionByFinding.has(finding.findingId)) {
@@ -1111,43 +1232,77 @@ export function planPrivateMessageResidueAdjudication(db, inventory, manifestInp
         } : {}),
       };
       normalized.push(normalizedDecision);
-      const row = rowForLocator(db, finding.locator, inventory.vectorStorage);
-      if (!row || valueHash(row) !== finding.rowHash) {
+      const findingRow = rowForLocator(db, finding.locator, inventory.vectorStorage);
+      if (!findingRow || valueHash(findingRow) !== finding.rowHash) {
         errors.push({ code: 'source_changed_during_plan', findingId: finding.findingId });
         continue;
       }
       if (decision.disposition === 'stale_vector_remove') {
-        vectorDeletes.set(decisionDeleteKey(finding.locator), finding.vectorOwnership);
+        const vectorKey = decisionDeleteKey(finding.locator);
+        const priorVector = vectorDeletes.get(vectorKey);
+        if (priorVector && !sameValue(priorVector, finding.vectorOwnership)) {
+          errors.push({ code: 'conflicting_vector_evidence', findingId: finding.findingId });
+        } else {
+          vectorDeletes.set(vectorKey, finding.vectorOwnership);
+        }
         continue;
       }
 
-      const key = decisionDeleteKey(finding.locator);
+      let effectiveFinding = finding;
+      let effectiveRow = findingRow;
+      let effectiveDisposition = decision.disposition;
+      if (decision.disposition === 'quarantine_backing_observation') {
+        const backing = validateBackingObservationQuarantine(
+          db,
+          finding,
+          normalizedDecision,
+          errors
+        );
+        if (!backing) continue;
+        effectiveFinding = backing.finding;
+        effectiveRow = backing.row;
+        effectiveDisposition = 'quarantine';
+      }
+
+      const key = decisionDeleteKey(effectiveFinding.locator);
       const prior = sourceActions.get(key);
-      if (prior && prior.disposition !== decision.disposition) {
+      if (prior && prior.disposition !== effectiveDisposition) {
         errors.push({ code: 'conflicting_source_dispositions', findingId: finding.findingId });
         continue;
       }
-      if (prior && !sameValue(prior.decision.target ?? null, decision.target ?? null)) {
+      if (prior && (
+        prior.finding.rowHash !== effectiveFinding.rowHash
+        || prior.finding.contentHash !== effectiveFinding.contentHash
+        || !sameValue(prior.finding.ancillaryRows, effectiveFinding.ancillaryRows)
+        || !sameValue(prior.finding.vectorOwnership, effectiveFinding.vectorOwnership)
+      )) {
+        errors.push({ code: 'conflicting_source_evidence', findingId: finding.findingId });
+        continue;
+      }
+      if (prior && effectiveDisposition !== 'quarantine'
+          && !sameValue(prior.decision.target ?? null, decision.target ?? null)) {
         errors.push({ code: 'conflicting_source_targets', findingId: finding.findingId });
         continue;
       }
       const action = prior || {
         findingIds: [],
-        finding,
+        finding: effectiveFinding,
         decision: normalizedDecision,
-        row,
-        disposition: decision.disposition,
+        row: effectiveRow,
+        disposition: effectiveDisposition,
+        authorizingDispositions: new Set(),
       };
       action.findingIds.push(finding.findingId);
+      action.authorizingDispositions.add(decision.disposition);
       sourceActions.set(key, action);
 
       if (decision.disposition === 'restore_mailbox') {
         const target = validateTarget(db, normalizedDecision.target, 'ai_messages', errors, finding.findingId);
-        if (target) action.restore = validateRestoreMailbox(row, target, normalizedDecision, errors);
+        if (target) action.restore = validateRestoreMailbox(findingRow, target, normalizedDecision, errors);
         action.targetRow = target;
       } else if (decision.disposition === 'private_duplicate') {
         const target = validateTarget(db, normalizedDecision.target, 'ai_messages', errors, finding.findingId);
-        if (target) validatePrivateDuplicate(row, target, normalizedDecision, errors);
+        if (target) validatePrivateDuplicate(findingRow, target, normalizedDecision, errors);
         action.targetRow = target;
       }
     }
@@ -1159,11 +1314,17 @@ export function planPrivateMessageResidueAdjudication(db, inventory, manifestInp
   const scheduledVectorDeletes = new Set(vectorDeletes.keys());
   for (const action of sourceActions.values()) {
     if (action.finding.vectorOwnership?.index) {
-      scheduledVectorDeletes.add(decisionDeleteKey(action.finding.vectorOwnership.index.locator));
-      vectorDeletes.set(
-        decisionDeleteKey(action.finding.vectorOwnership.index.locator),
-        action.finding.vectorOwnership
-      );
+      const vectorKey = decisionDeleteKey(action.finding.vectorOwnership.index.locator);
+      scheduledVectorDeletes.add(vectorKey);
+      const priorVector = vectorDeletes.get(vectorKey);
+      if (priorVector && !sameValue(priorVector, action.finding.vectorOwnership)) {
+        errors.push({
+          code: 'conflicting_vector_evidence',
+          findingId: action.finding.findingId,
+        });
+      } else {
+        vectorDeletes.set(vectorKey, action.finding.vectorOwnership);
+      }
     }
   }
 
@@ -1177,7 +1338,8 @@ export function planPrivateMessageResidueAdjudication(db, inventory, manifestInp
       if (backing.locator.table === 'ai_messages' || !scheduledSourceDeletes.has(backingKey)) {
         errors.push({
           code: 'vector_not_stale_or_source_not_scheduled_for_removal',
-          findingId: decisionByFinding.get(ownership.index.locator.id)?.findingId,
+          findingId: inventory.findings.find((finding) =>
+            sameValue(finding.locator, ownership.index.locator))?.findingId,
           locator: ownership.index.locator,
         });
       }
@@ -1204,6 +1366,7 @@ export function planPrivateMessageResidueAdjudication(db, inventory, manifestInp
     : null;
   const actions = [...sourceActions.values()].map((action) => ({
     disposition: action.disposition,
+    authorizingDispositions: [...action.authorizingDispositions].sort(),
     source: action.finding.locator,
     target: action.decision.target
       ? { table: action.decision.target.table, tenantId: action.decision.target.tenantId, id: action.decision.target.id }
@@ -1211,13 +1374,15 @@ export function planPrivateMessageResidueAdjudication(db, inventory, manifestInp
     findingIds: action.findingIds,
   }));
   for (const ownership of vectorDeletes.values()) {
+    const authorizingDecisions = normalized.filter((decision) =>
+      sameValue(decision.locator, ownership.index?.locator));
     actions.push({
       disposition: 'stale_vector_remove',
+      authorizingDispositions: [...new Set(authorizingDecisions
+        .map((decision) => decision.disposition))].sort(),
       source: ownership.index?.locator || null,
       target: null,
-      findingIds: normalized.filter((decision) =>
-        decision.disposition === 'stale_vector_remove'
-        && sameValue(decision.locator, ownership.index?.locator)).map((decision) => decision.findingId),
+      findingIds: authorizingDecisions.map((decision) => decision.findingId),
     });
   }
   return {
