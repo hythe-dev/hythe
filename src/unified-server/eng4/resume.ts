@@ -174,17 +174,20 @@ export function performResume(
     return loop;
   });
 
+  const resolvedAgentId = directory.resolveCanonicalAgent(params.agentId, tenantId).canonical;
+  if (!resolvedAgentId) throw new Error('Invalid agent identity');
+
   // Scoped messages only — TENANT-KEYED first (sol review 95eba75a: entity
   // UUIDs are not tenant secrets; without the tenant key, knowing another
-  // tenant's project UUID would leak its scoped messages), then matched on
-  // the resolved entity UUID columns.
+  // tenant's project UUID would leak its scoped messages), then exact-
+  // recipient-keyed and matched on the resolved entity UUID columns.
   // Oversized bodies stay REACHABLE: null body + reference handle (2(d)).
   const messageItems: InboxItem[] = (db.prepare(
     `SELECT id, from_agent, content, priority, created_at FROM ai_messages
-      WHERE tenant_id = ?
+      WHERE tenant_id = ? AND to_agent = ?
         AND ((project_id IS NOT NULL AND project_id = ?) OR (task_id IS NOT NULL AND task_id = ?))
       ORDER BY created_at DESC, id ASC`
-  ).all(tenantId, resolved.projectId, resolved.taskId) as any[]).map((r) => {
+  ).all(tenantId, resolvedAgentId, resolved.projectId, resolved.taskId) as any[]).map((r) => {
     const body = String(r.content ?? '');
     const base = {
       itemType: 'message' as const,
@@ -194,17 +197,16 @@ export function performResume(
       recordedAt: String(r.created_at ?? ''),
     };
     return body.length > MAX_INLINE_MESSAGE_BODY_CHARS
-      ? { ...base, body: null, handle: { kind: 'message' as const, uri: buildMessageUri(scopeKey, String(r.id)) } }
+      ? { ...base, body: null, handle: { kind: 'message' as const, uri: buildMessageUri(scopeKey, resolvedAgentId, String(r.id)) } }
       : { ...base, body, handle: null };
   });
 
   // Handoffs travel in the SAME section with the SAME accounting (A6).
   // Reading NEVER consumes (consumed_at untouched — this is a SELECT);
-  // ackedByMe is THIS caller's canonical-family view only. Selection is
+  // ackedByMe is THIS caller's exact opaque-principal view only. Selection is
   // resolved-UUID-only so it is IDENTICAL to handle dereference (sol
   // 037cfc22); legacy rows keyed by project NAME need a backfill mapping
   // at cutover — out of scope here.
-  const canonicalAgent = directory.resolveCanonicalAgent(params.agentId).canonical;
   const handoffItems: InboxItem[] = (db.prepare(
     `SELECT h.id, h.from_agent, h.summary, h.created_at,
             EXISTS(SELECT 1 FROM eng4_handoff_acks a
@@ -212,7 +214,7 @@ export function performResume(
        FROM session_handoffs h
       WHERE h.tenant_id = ? AND h.active = 1 AND h.project_id = ?
       ORDER BY h.created_at DESC, h.id ASC`
-  ).all(canonicalAgent, tenantId, resolved.projectId) as any[]).map((r) => {
+  ).all(resolvedAgentId, tenantId, resolved.projectId) as any[]).map((r) => {
     const body = String(r.summary ?? '');
     const base = {
       itemType: 'handoff' as const,

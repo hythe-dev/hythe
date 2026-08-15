@@ -1,0 +1,55 @@
+name: hythe-pavilion-production
+
+# Pavilion's reviewed production topology. This file contains no credentials;
+# API_KEY remains in the protected host runtime.env referenced below.
+services:
+  hythe:
+    image: "${HYTHE_IMAGE:?Set HYTHE_IMAGE to the reviewed immutable image reference}"
+    pull_policy: never
+    container_name: engram-v1
+    init: true
+    user: "1000:1000"
+    network_mode: bridge
+    restart: unless-stopped
+    stop_grace_period: 20s
+    env_file:
+      # Production uses the protected Pavilion path by default. CI overrides
+      # only the path with the tracked, non-secret example so Compose can
+      # validate this topology on a clean runner without production files.
+      - "${HYTHE_RUNTIME_ENV_FILE:-/home/tomcat65/engram-prod/migration-20260730/runtime.env}"
+    environment:
+      NODE_ENV: production
+      NEURAL_MCP_PORT: "6174"
+      MESSAGE_HUB_PORT: "3004"
+      # Phase 1 is intentionally compatibility-only. A reviewed cutover edits
+      # this to mixed, promotes principals lane-by-lane, then edits to required.
+      HYTHE_AGENT_AUTH_MODE: observe
+      NEURAL_DB_PATH: /app/data/engram.db
+      SQLITE_VEC_ALLOW_REMOTE_MODELS: "false"
+      SQLITE_VEC_REQUIRE_TRANSFORMERS: "true"
+      SQLITE_VEC_CACHE_DIR: /app/data/models
+      SQLITE_VEC_DIMENSIONS: "384"
+      SQLITE_VEC_MODEL: Xenova/all-MiniLM-L6-v2
+    ports:
+      - "127.0.0.1:6174:6174"
+      - "100.122.194.64:6174:6174"
+      - "127.0.0.1:3004:3004"
+      - "100.122.194.64:3004:3004"
+    volumes:
+      - type: bind
+        source: /home/tomcat65/engram-prod/data
+        target: /app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /home/tomcat65/engram-prod/cache/transformers
+        target: /app/data/models
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:6174/ready').then(async r=>{const b=await r.json();process.exit(r.status===200&&b.ready===true&&b.degraded===false?0:1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

@@ -153,6 +153,55 @@ f="$TMP/subdir/t16.md"
 bash "$KIT/setup.sh" "$f" "$TMP/new-block.md" >/dev/null
 check "T16 absent target created with single block" '[ -f "$f" ] && [ "$(count_blocks "$f")" -eq 1 ]'
 
+# T17-T19: Claude hook identity resolution must fail closed on alias conflicts.
+hook_input='{"cwd":"/tmp/hythe-client"}'
+hook_err="$TMP/t17.err"
+hook_out=$(env HYTHE_AGENT_ID=claude-a ENGRAM_AGENT_ID=claude-b \
+  bash "$KIT/claude-code/plugin/scripts/session-start.sh" <<<"$hook_input" 2>"$hook_err")
+rc=$?
+check "T17 session-start rejects conflicting identity aliases" \
+  '[ "$rc" -eq 2 ] && [ -z "$hook_out" ] && grep -qi "HYTHE_AGENT_ID.*ENGRAM_AGENT_ID.*conflict" "$hook_err"'
+
+hook_err="$TMP/t18.err"
+hook_out=$(env HYTHE_AGENT_ID=claude-a ENGRAM_AGENT_ID=claude-b \
+  bash "$KIT/claude-code/plugin/scripts/post-compaction.sh" <<<"$hook_input" 2>"$hook_err")
+rc=$?
+check "T18 post-compaction rejects conflicting identity aliases" \
+  '[ "$rc" -eq 2 ] && [ -z "$hook_out" ] && grep -qi "HYTHE_AGENT_ID.*ENGRAM_AGENT_ID.*conflict" "$hook_err"'
+
+hook_err="$TMP/t19.err"
+hook_out=$(env HYTHE_AGENT_ID=claude-stable ENGRAM_AGENT_ID=claude-stable \
+  bash "$KIT/claude-code/plugin/scripts/session-start.sh" <<<"$hook_input" 2>"$hook_err")
+rc=$?
+check "T19 matching identity aliases remain compatible" \
+  '[ "$rc" -eq 0 ] && [ ! -s "$hook_err" ] && grep -q '\''agentId: "claude-stable"'\'' <<<"$hook_out"'
+
+for hook in session-start.sh post-compaction.sh; do
+  hook_err="$TMP/t20-${hook}.err"
+  hook_out=$(env HYTHE_AGENT_ID='invalid identity' \
+    bash "$KIT/claude-code/plugin/scripts/$hook" <<<"$hook_input" 2>"$hook_err")
+  rc=$?
+  check "T20 $hook rejects invalid explicit identity without leaking it" \
+    '[ "$rc" -eq 2 ] && [ -z "$hook_out" ] && grep -qi "identity.*invalid" "$hook_err" && ! grep -q "invalid identity" "$hook_err"'
+done
+
+for hook in session-start.sh post-compaction.sh; do
+  hook_err="$TMP/t21-${hook}.err"
+  hook_out=$(env -u HYTHE_AGENT_ID -u ENGRAM_AGENT_ID FROM=transport-only \
+    bash "$KIT/claude-code/plugin/scripts/$hook" <<<"$hook_input" 2>"$hook_err")
+  rc=$?
+  check "T21 $hook rejects a missing logical identity instead of asking the model to choose one" \
+    '[ "$rc" -eq 2 ] && [ -z "$hook_out" ] && grep -qi "no explicit agent identity.*Restart.*HYTHE_AGENT_ID" "$hook_err" && ! grep -qi "ask the user" "$hook_err" && ! grep -q "transport-only" "$hook_err"'
+done
+
+# T22: the documented Claude flow binds the hook process as well as the MCP
+# bridge. `claude mcp add --env` alone does not populate hook child env.
+check "T22 Claude install docs require an ambient launch identity for hooks" \
+  'grep -q "HYTHE_AGENT_ID=claude-desktop claude" "$KIT/README.md" && grep -q "hooks are separate children" "$KIT/README.md"'
+
+check "T23 Codex instructions fail closed when identity is not model-visible" \
+  'grep -qi "MCP child-process env is not model-visible" "$KIT/codex/compact-prompt.md" && grep -qi "Never infer an identity" "$KIT/codex/instructions.md" && grep -qi "do not call any HYTHE identity-scoped tool" "$KIT/codex/compact-prompt.md"'
+
 echo "----"
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -77,11 +77,22 @@ describe('P0 message paging and context budgets', () => {
     expect(new Set(ids).size).toBe(7);
   });
 
-  it('counts the same alias, sender, type, and archive filters used by the page query', async () => {
+  it('counts the same exact recipient, sender, type, and archive filters used by the page query', async () => {
     const stamp = Date.now();
     const recipient = `paging-filter-rx-${stamp}`;
     const sender = `paging-filter-tx-${stamp}`;
     const otherSender = `paging-filter-other-${stamp}`;
+
+    await mcpCall(server, 'register_agent', {
+      agentId: recipient,
+      name: recipient,
+      capabilities: ['paging-test'],
+    });
+    await mcpCall(server, 'register_agent', {
+      agentId: sender,
+      name: sender,
+      capabilities: ['paging-test'],
+    });
 
     for (let index = 0; index < 3; index += 1) {
       await mcpCall(server, 'send_ai_message', {
@@ -105,8 +116,8 @@ describe('P0 message paging and context budgets', () => {
     });
 
     const first = await mcpCall(server, 'get_ai_messages', {
-      agentId: recipient,
-      from: sender,
+      agentId: `${recipient}-cli`,
+      from: `${sender}-cli`,
       messageType: 'task',
       unreadOnly: false,
       limit: 2,
@@ -114,7 +125,7 @@ describe('P0 message paging and context budgets', () => {
     expect(first).toMatchObject({ totalMessages: 3, returnedMessages: 2, hasMore: true, nextOffset: 2 });
 
     await mcpCall(server, 'archive_messages', {
-      agentId: recipient,
+      agentId: `${recipient}-cli`,
       messageIds: [first.messages[0].id],
     });
 
@@ -126,8 +137,8 @@ describe('P0 message paging and context budgets', () => {
       limit: 20,
     });
     const withArchived = await mcpCall(server, 'get_ai_messages', {
-      agentId: recipient,
-      from: sender,
+      agentId: `${recipient}-cli`,
+      from: `${sender}-cli`,
       messageType: 'task',
       unreadOnly: false,
       includeArchived: true,
@@ -136,6 +147,16 @@ describe('P0 message paging and context budgets', () => {
 
     expect(unarchived.totalMessages).toBe(2);
     expect(withArchived.totalMessages).toBe(3);
+
+    const baseHandle = await mcpCall(server, 'get_ai_messages', {
+      agentId: recipient,
+      from: sender,
+      messageType: 'task',
+      unreadOnly: false,
+      includeArchived: true,
+      limit: 20,
+    });
+    expect(baseHandle.totalMessages).toBe(0);
   });
 
   it('keeps unread pagination stable when each returned page is marked read', async () => {
@@ -234,8 +255,18 @@ describe('P0 message paging and context budgets', () => {
         VALUES (?, 'default', 'ai_message', ?, ?, '[]', ?)
       `);
       const stamp = Date.now();
-      const recipient = `legacy-page-rx-${stamp}`;
-      const sender = `legacy-page-tx-${stamp}`;
+      const recipient = `Legacy-Page-Rx-${stamp}`;
+      const sender = `Legacy-Page-Tx-${stamp}`;
+      await mcpCall(legacyServer, 'register_agent', {
+        agentId: recipient,
+        name: recipient,
+        capabilities: ['legacy-paging-test'],
+      });
+      await mcpCall(legacyServer, 'register_agent', {
+        agentId: sender,
+        name: sender,
+        capabilities: ['legacy-paging-test'],
+      });
       for (let index = 0; index < 7; index += 1) {
         insert.run(
           `legacy-page-${stamp}-${index}`,
@@ -252,8 +283,8 @@ describe('P0 message paging and context budgets', () => {
       insert.run(`legacy-malformed-${stamp}`, '{not-json', sender, '2026-07-12 12:01:00');
 
       const page = await mcpCall(legacyServer, 'get_ai_messages', {
-        agentId: recipient,
-        from: sender,
+        agentId: `${recipient}-cli`,
+        from: `${sender}-cli`,
         messageType: 'task',
         unreadOnly: false,
         compact: false,
@@ -272,6 +303,31 @@ describe('P0 message paging and context budgets', () => {
         'legacy page 2',
         'legacy page 1',
       ]);
+
+      const wrongCase = await mcpCall(legacyServer, 'get_ai_messages', {
+        agentId: `${recipient.toLowerCase()}-cli`,
+        from: `${sender.toLowerCase()}-cli`,
+        messageType: 'task',
+        unreadOnly: false,
+        compact: false,
+        limit: 20,
+      });
+      expect(wrongCase.totalMessages).toBe(0);
+      expect(legacyServer.getMemoryManager().countUnreadMessages(`${recipient.toLowerCase()}-cli`)).toBe(0);
+      expect(legacyServer.getMemoryManager().countUnreadMessages(`${recipient}-cli`)).toBe(7);
+
+      const wrongDetail = await (legacyServer as any)._handleToolCall('get_message_detail', {
+        agentId: `${recipient.toLowerCase()}-cli`,
+        messageId: `legacy-page-${stamp}-0`,
+        markAsRead: true,
+      });
+      expect(wrongDetail.isError).toBe(true);
+      const exactDetail = await mcpCall(legacyServer, 'get_message_detail', {
+        agentId: `${recipient}-cli`,
+        messageId: `legacy-page-${stamp}-0`,
+        markAsRead: false,
+      });
+      expect(exactDetail.content).toBe('legacy page 0');
     } finally {
       legacyServer.close();
     }

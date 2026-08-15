@@ -1,4 +1,7 @@
 import { MessageHubWebSocketServer } from './websocket-server.js';
+import { DEFAULT_MESSAGE_HUB_PORT } from './config.js';
+import type { AgentAuthMode } from '../agent-auth/types.js';
+import type { AgentCredentialStore } from '../agent-auth/credential-store.js';
 
 /**
  * Integration Bridge between Message Hub and existing MCP Server
@@ -11,10 +14,19 @@ export class MessageHubIntegration {
   private integrationPort: number;
   private mcpPort: number;
 
-  constructor(integrationPort: number = 3003, mcpPort: number = 5174) {
+  constructor(
+    integrationPort: number = DEFAULT_MESSAGE_HUB_PORT,
+    mcpPort: number = 5174,
+    credentialStore?: AgentCredentialStore,
+    agentAuthMode: AgentAuthMode = 'observe',
+  ) {
     this.integrationPort = integrationPort;
     this.mcpPort = mcpPort;
-    this.webSocketServer = new MessageHubWebSocketServer(integrationPort);
+    this.webSocketServer = new MessageHubWebSocketServer(
+      integrationPort,
+      credentialStore,
+      agentAuthMode,
+    );
     this.setupEventHandlers();
   }
 
@@ -31,13 +43,16 @@ export class MessageHubIntegration {
    */
   public async notifyAgentOfMessage(targetAgentId: string, messageData: any): Promise<number> {
     try {
+      if (typeof messageData?.tenantId !== 'string' || !messageData.tenantId) {
+        throw new Error('tenantId is required for Message Hub delivery');
+      }
       // Notify via WebSocket for real-time delivery
       const notifiedClients = this.webSocketServer.notifyNewMessage(
         messageData.messageId || `msg_${Date.now()}`,
         messageData.from,
         targetAgentId,
         messageData.content,
-        messageData.tenantId || 'default'
+        messageData.tenantId
       );
 
       console.log(`📨 Message notification for ${targetAgentId}: ${notifiedClients} connected client(s)`);
@@ -67,13 +82,19 @@ export class MessageHubIntegration {
    * Enhanced message processing that integrates with WebSocket notifications
    * This replaces the existing MCP server message handling with Hub-aware version
    */
-  public async processIncomingMessage(from: string, to: string, content: string, messageId: string): Promise<void> {
+  public async processIncomingMessage(
+    from: string,
+    to: string,
+    content: string,
+    messageId: string,
+    tenantId: string,
+  ): Promise<void> {
     try {
       // 1. Store message using existing MCP infrastructure (Cursor will enhance this)
       console.log(`📨 Processing message: ${from} → ${to} (${messageId})`);
       
       // 2. Immediately notify WebSocket clients for <1 second discovery
-      this.webSocketServer.notifyNewMessage(messageId, from, to, content);
+      this.webSocketServer.notifyNewMessage(messageId, from, to, content, tenantId);
       
       // 3. Log performance metrics
       const processingTime = Date.now();
@@ -85,6 +106,7 @@ export class MessageHubIntegration {
         from,
         to,
         content,
+        tenantId,
         processingTime,
         notificationSent: true
       });
@@ -98,13 +120,18 @@ export class MessageHubIntegration {
   /**
    * Mark message as read and notify clients
    */
-  public async markMessageAsRead(messageId: string, from: string, to: string): Promise<void> {
+  public async markMessageAsRead(
+    messageId: string,
+    from: string,
+    to: string,
+    tenantId: string,
+  ): Promise<void> {
     try {
       // Update read status (Cursor will implement SQLite update)
       console.log(`👁️ Marking message as read: ${messageId}`);
       
       // Notify WebSocket clients
-      this.webSocketServer.notifyMessageRead(messageId, from, to);
+      this.webSocketServer.notifyMessageRead(messageId, from, to, tenantId);
       
       console.log(`✅ Read status updated and notified: ${messageId}`);
     } catch (error) {
@@ -140,12 +167,17 @@ export class MessageHubIntegration {
         if (data.status === 'delivered' && data.messageId) {
           const body = req.body || {};
           if (body.from && body.to) {
+            const tenantId = req.requestContext?.tenantId;
+            if (typeof tenantId !== 'string' || !tenantId) {
+              return originalJson(data);
+            }
             // Trigger real-time notification
             this.webSocketServer.notifyNewMessage(
               data.messageId,
               body.from,
               body.to,
-              body.content || body.message
+              body.content || body.message,
+              tenantId,
             );
             console.log(`📡 Real-time notification sent for: ${data.messageId}`);
           }
@@ -165,18 +197,20 @@ export class MessageHubIntegration {
   public enhanceAgentDiscovery() {
     // When new agents are discovered, notify WebSocket clients
     return {
-      onAgentDiscovered: (agentId: string) => {
+      onAgentDiscovered: (agentId: string, tenantId: string) => {
         this.webSocketServer.broadcastEvent({
           type: 'agent.online',
           agentId,
+          tenantId,
           timestamp: new Date().toISOString()
         });
       },
       
-      onAgentLost: (agentId: string) => {
+      onAgentLost: (agentId: string, tenantId: string) => {
         this.webSocketServer.broadcastEvent({
           type: 'agent.offline',
           agentId,
+          tenantId,
           timestamp: new Date().toISOString()
         });
       }

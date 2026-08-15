@@ -6,11 +6,13 @@
  * bridge delegation, .env write-once safety, and that the publish payload
  * actually carries the bin + bridge. The bridge's live HTTP round-trip is
  * covered by internal/final-tree-smoke.mjs; this suite covers the CLI
- * surface an outsider touches first.
+ * surface an outsider touches first. Live bridge HTTP round-trips run against
+ * the hermetic server here; ENG4 resource transport is covered by
+ * contract-mcp-resources-http.test.ts.
  */
 import { describe, it, expect } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, statSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, statSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +24,9 @@ const isHytheDistribution = pkg.hytheDistribution === true;
 const cliName = isHytheDistribution ? 'hythe-mcp' : 'engram-mcp';
 const serverKey = isHytheDistribution ? 'hythe' : 'engram';
 const keyFileEnv = isHytheDistribution ? 'HYTHE_API_KEY_FILE' : 'ENGRAM_API_KEY_FILE';
+const agentIdEnv = isHytheDistribution ? 'HYTHE_AGENT_ID' : 'ENGRAM_AGENT_ID';
+const testAgentId = 'codex-public-client';
+const packageSpec = `${pkg.name}@${pkg.version}`;
 
 const run = (args: string[], opts: Record<string, unknown> = {}) =>
   spawnSync('node', [CLI, ...args], { encoding: 'utf8', timeout: 15000, ...opts });
@@ -33,8 +38,11 @@ const containsCredentialShapedToken = (text: string) =>
   );
 
 describe('package-selected CLI (bin install path)', () => {
-  it('package.json maps the selected single bin to an existing entrypoint and ships bin + bridge', () => {
-    expect(pkg.bin).toEqual({ [cliName]: 'bin/engram-mcp.cjs' });
+  it('package.json maps the client and operator bins to shipped entrypoints', () => {
+    expect(pkg.bin).toEqual({
+      [cliName]: 'bin/engram-mcp.cjs',
+      'hythe-agent-auth': 'dist/agent-auth/operator.js',
+    });
     expect(existsSync(CLI)).toBe(true);
     expect(pkg.files).toContain('bin/');
     expect(pkg.files).toContain('mcp-stdio-http-bridge.cjs');
@@ -46,6 +54,7 @@ describe('package-selected CLI (bin install path)', () => {
     expect(res.status).toBe(0);
     expect(res.stdout).toMatch(/stdio bridge/);
     expect(res.stdout).toContain(`${cliName} init`);
+    expect(res.stdout).toContain('--agent-id <agent-id>');
   });
 
   it('unknown commands fail loudly (exit 2), never silently fall through to the bridge', () => {
@@ -54,10 +63,10 @@ describe('package-selected CLI (bin install path)', () => {
     expect(res.stderr).toMatch(/unknown command 'frobnicate'/);
   });
 
-  it('init without --write-env emits secret-free credential-file config for all four clients', () => {
+  it('init without --write-env emits identity-bound, secret-free config for all four clients', () => {
     const dir = mkdtempSync(join(tmpdir(), 'engram-cli-'));
     try {
-      const res = run(['init'], { cwd: dir });
+      const res = run(['init', '--agent-id', testAgentId], { cwd: dir });
       const envPath = join(dir, '.env');
       expect(res.status).toBe(0);
       expect(existsSync(envPath)).toBe(false);
@@ -75,22 +84,100 @@ describe('package-selected CLI (bin install path)', () => {
       expect(start).toBeGreaterThan(-1);
       const block = JSON.parse(lines.slice(start + 1, end).join('\n').trim());
       expect(block.mcpServers[serverKey].command).toBe('npx');
-      expect(block.mcpServers[serverKey].args).toEqual(['-y', pkg.name]);
+      expect(block.mcpServers[serverKey].args).toEqual(['-y', packageSpec]);
       const clientEnv = block.mcpServers[serverKey].env;
-      expect(Object.keys(clientEnv).sort()).toEqual([keyFileEnv, 'MCP_HOST', 'MCP_PORT'].sort());
+      expect(Object.keys(clientEnv).sort()).toEqual([keyFileEnv, agentIdEnv, 'MCP_HOST', 'MCP_PORT'].sort());
       expect(clientEnv[keyFileEnv] === envPath).toBe(true);
+      expect(clientEnv[agentIdEnv]).toBe(testAgentId);
       expect(clientEnv.MCP_HOST === '127.0.0.1').toBe(true);
       expect(clientEnv.MCP_PORT === '6174').toBe(true);
       expect(Object.hasOwn(clientEnv, 'API_KEY')).toBe(false);
+      expect(res.stdout).toContain(`--env ${agentIdEnv}='${testAgentId}'`);
+      expect(res.stdout).toContain(`${agentIdEnv} = "${testAgentId}"`);
+      expect(res.stdout).toContain('Claude plugin hooks are separate child processes');
+      expect(res.stdout).toContain(`${agentIdEnv}='${testAgentId}' claude`);
+      expect(res.stdout).toContain(`--branch v${pkg.version}`);
+      expect(res.stdout).toContain('server source is not bundled');
+      expect(res.stdout).not.toContain('Start the server:  docker compose');
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('init rejects unknown, stray, duplicate flag, and typo arguments without creating files', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'engram-cli-unknown-'));
+    try {
+      const cases = [
+        ['--agent-auth-mod', 'required'],
+        ['stray-positional'],
+        ['--write-env', '--write-env'],
+      ];
+      for (const extra of cases) {
+        const res = run(['init', '--agent-id', testAgentId, ...extra], { cwd: dir });
+        expect(res.status, extra.join(' ')).toBe(2);
+        expect(res.stderr).toMatch(/unknown|stray|specified only once/i);
+        expect(existsSync(join(dir, '.env'))).toBe(false);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('starts Docker only from the exact matching server checkout and rejects stale lookalikes', () => {
+    const matching = run(['init', '--agent-id', testAgentId], { cwd: REPO });
+    expect(matching.status).toBe(0);
+    expect(matching.stdout).toContain('Start the server:  docker compose');
+    expect(matching.stdout).not.toContain('not an exact HYTHE');
+
+    const stale = mkdtempSync(join(tmpdir(), 'hythe-stale-checkout-'));
+    try {
+      mkdirSync(join(stale, 'src'));
+      mkdirSync(join(stale, 'docker'));
+      writeFileSync(join(stale, 'tsconfig.json'), '{}\n');
+      writeFileSync(join(stale, 'docker', 'Dockerfile'), 'FROM scratch\n');
+      writeFileSync(join(stale, 'docker', 'docker-compose.yml'), 'services: {}\n');
+      writeFileSync(join(stale, 'package.json'), JSON.stringify({
+        name: pkg.name,
+        version: '0.1.4',
+        hytheDistribution: true,
+      }));
+      writeFileSync(join(stale, 'package-lock.json'), JSON.stringify({
+        name: pkg.name,
+        version: '0.1.4',
+        packages: { '': { version: '0.1.4' } },
+      }));
+
+      const result = run(['init', '--agent-id', testAgentId], { cwd: stale });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`not an exact HYTHE v${pkg.version}`);
+      expect(result.stdout).toContain(`--branch v${pkg.version}`);
+      expect(result.stdout).not.toContain('Start the server:  docker compose');
+    } finally {
+      rmSync(stale, { recursive: true, force: true });
+    }
+  });
+
+  it('init requires one valid --agent-id and rejects missing, invalid, or duplicate values', () => {
+    const cases = [
+      { args: ['init'], error: /--agent-id.*required/i },
+      { args: ['init', '--agent-id'], error: /--agent-id.*value/i },
+      { args: ['init', '--agent-id', '   '], error: /--agent-id.*1.*100/i },
+      { args: ['init', '--agent-id', 'agent/other'], error: /--agent-id.*1.*100/i },
+      { args: ['init', '--agent-id', 'agent\nsmuggled'], error: /--agent-id.*1.*100/i },
+      { args: ['init', '--agent-id', 'a'.repeat(101)], error: /--agent-id.*1.*100/i },
+      { args: ['init', '--agent-id', 'agent-a', '--agent-id', 'agent-b'], error: /--agent-id.*once/i },
+    ];
+    for (const testCase of cases) {
+      const res = run(testCase.args);
+      expect(res.status, testCase.args.join(' ')).toBe(2);
+      expect(res.stderr).toMatch(testCase.error);
     }
   });
 
   it('init --write-env writes ./.env mode 600 once and REFUSES to overwrite (fail-closed)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'engram-cli-'));
     try {
-      const first = run(['init', '--write-env'], { cwd: dir });
+      const first = run(['init', '--write-env', '--agent-id', testAgentId], { cwd: dir });
       expect(first.status).toBe(0);
       const envPath = join(dir, '.env');
       const written = readFileSync(envPath, 'utf8');
@@ -102,7 +189,7 @@ describe('package-selected CLI (bin install path)', () => {
       expect(first.stdout.includes(envPath)).toBe(true);
       expect(statSync(envPath).mode & 0o777).toBe(0o600);
 
-      const second = run(['init', '--write-env'], { cwd: dir });
+      const second = run(['init', '--write-env', '--agent-id', testAgentId], { cwd: dir });
       expect(second.status).toBe(1);
       expect(second.stderr).toMatch(/refusing to overwrite/);
       expect(readFileSync(envPath, 'utf8')).toBe(written); // untouched
@@ -211,6 +298,7 @@ describe('package-selected CLI (bin install path)', () => {
       for (const credentialEnv of environments) {
         const env = {
           ...process.env,
+          [agentIdEnv]: testAgentId,
           MCP_HOST: base.hostname,
           MCP_PORT: base.port,
           MCP_BRIDGE_STATE_DIR: dir,
@@ -234,7 +322,12 @@ describe('package-selected CLI (bin install path)', () => {
 
   it('default mode hands the process to the stdio bridge (stays alive on stdin, exits on stdin close)', async () => {
     const child = spawn('node', [CLI], {
-      env: { ...process.env, MCP_HOST: '127.0.0.1', MCP_PORT: '1' },
+      env: {
+        ...process.env,
+        [agentIdEnv]: testAgentId,
+        MCP_HOST: '127.0.0.1',
+        MCP_PORT: '1',
+      },
       stdio: 'pipe',
     });
     const exited = new Promise<number | null>((resolveExit) => child.on('exit', (c) => resolveExit(c)));

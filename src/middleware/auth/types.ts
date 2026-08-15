@@ -8,6 +8,19 @@
  * This is the ONLY source of truth for tenant_id and user_id.
  * Tool args MUST NOT be trusted for identity.
  */
+import type {
+  AgentAuthMode,
+  AgentPrincipalState,
+} from '../../agent-auth/types.js';
+
+export interface BoundAgentPrincipal {
+  /** Exact, case-sensitive logical principal derived from the credential DB. */
+  agentId: string;
+  credentialId: string;
+  scopes: string[];
+  enforcementState: AgentPrincipalState;
+}
+
 export interface RequestContext {
   tenantId: string;
   userId: string | null;
@@ -18,6 +31,12 @@ export interface RequestContext {
   scopes: string[];
   mfaLevel: string | null;
   timezoneHint: string | null;
+  /** Independent agent proof layered on top of tenant/deployment auth. */
+  agentPrincipal: BoundAgentPrincipal | null;
+  /** True whenever the caller supplied the agent-key header, valid or not. */
+  agentCredentialPresented: boolean;
+  /** Server rollout mode captured once for deterministic authorization. */
+  agentAuthMode: AgentAuthMode;
 }
 
 /**
@@ -80,4 +99,7 @@ export const DEFAULT_REQUEST_CONTEXT: RequestContext = {
   scopes: [],
   mfaLevel: null,
   timezoneHint: null,
+  agentPrincipal: null,
+  agentCredentialPresented: false,
+  agentAuthMode: 'observe',
 };

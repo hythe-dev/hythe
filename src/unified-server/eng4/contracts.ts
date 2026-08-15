@@ -141,7 +141,7 @@ export interface StateSnapshot {
   parentStateId: string | null;
   /** sha256 of the canonical CONTENT envelope (resource bytes). */
   contentHash: string;
-  /** CANONICAL agent family — the one author rule (5868b61b #2). */
+  /** Exact opaque agent principal — the one author rule (5868b61b #2). */
   author: string;
   /** Raw asserted id, audit metadata only. */
   assertedAgentId: string;
@@ -212,7 +212,9 @@ export interface LoopChange {
  *
  * Snapshot/payload handles MUST be verifiable: contentHash + byteLength +
  * mediaType are required so a fetched body can be hash/size-checked.
- * Message/observation handles are reference-only (store rows, verified by id).
+ * Message/observation handles are reference-only. Message URIs bind the
+ * exact recipient as well as tenant, scope, and row id; they remain bearer
+ * capabilities unless the transport authenticates that recipient.
  */
 export type ContentHandle =
   | {
@@ -297,12 +299,11 @@ export interface ResumeParams {
   /**
    * ASSERTED caller identity (reviews b2e6fc7c #1 + 07b3906e #3): required
    * because the shared API key cannot distinguish agents; bounded to the
-   * platform's 100-char convention. IDENTITY SPLIT: the resolver maps the
-   * asserted id to its CANONICAL AGENT FAMILY (e.g. fable-engram-cli →
-   * fable-engram); authorship, ack ownership, and unread/ack views belong
-   * to the canonical family, while the raw asserted id is preserved in
-   * audit metadata. Two agents on the same scope get distinct views; two
-   * ALIASES of one agent get ONE view (alias tests pinned).
+   * platform's 100-char convention. The exact, case-sensitive, tenant-scoped
+   * handle owns authorship, acknowledgements, and unread views. Display names,
+   * metadata aliases, historical identity changes, and transport suffixes do
+   * not merge principals. Distinct asserted handles therefore keep distinct
+   * views; the raw asserted id is also preserved in audit metadata.
    */
   agentId: string;
   scope: ScopeRef;
@@ -372,9 +373,10 @@ export interface CheckpointParams {
   /**
    * ASSERTED caller identity (reviews b2e6fc7c #1 + 5868b61b #2). ONE
    * AUTHOR RULE: snapshot/fact authorship, ack ownership, and views belong
-   * to the CANONICAL AGENT FAMILY the resolver maps this to; the raw
-   * asserted id is preserved as AUDIT METADATA ONLY (assertedAgentId).
-   * The server never substitutes its own identity for either.
+   * to this exact, case-sensitive, tenant-scoped handle. No alias family or
+   * transport-suffix expansion is authorized. The same asserted id is kept
+   * as audit metadata (assertedAgentId); the server never substitutes its own
+   * identity.
    */
   agentId: string;
   scope: ScopeRef;

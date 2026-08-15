@@ -32,8 +32,8 @@ export interface EntityCandidate {
 export interface EntityDirectory {
   /** EXACT canonical-name/alias candidates within one tenant. */
   resolveEntityCandidatesExact(name: string, tenantId: string): EntityCandidate[];
-  /** Canonical agent family for an asserted agent id. */
-  resolveCanonicalAgent(agentId: string): { canonical: string; aliases: string[] };
+  /** Tenant-scoped canonical mailbox identity for an asserted agent id. */
+  resolveCanonicalAgent(agentId: string, tenantId: string): { canonical: string; aliases: string[] };
 }
 
 /** Deterministic storage scope key from resolved entity UUIDs (never names). */

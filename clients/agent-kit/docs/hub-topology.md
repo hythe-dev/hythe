@@ -26,10 +26,16 @@ chains and message state, and silent data loss. One hub, many clients.
    public internet. No port forwarding, no TLS certificates to manage.
 3. **Point clients at the hub** — every machine's agent config uses the same
    stdio bridge with `MCP_HOST` set to the hub's tailnet address (plus
-   `MCP_PORT` and the shared `API_KEY` from `npx -y @hythe/mcp init`), and
-   that machine's own `HYTHE_AGENT_ID` (e.g. `claude-desktop`,
-   `claude-laptop`). Distinct ids per machine: the inbox and attribution
-   model assume one identity per client lane.
+   `MCP_PORT` and the shared deployment/tenant credential file). Each client
+   lane also receives its own protected per-agent credential file (see the
+   [offline operator guide](../../../docs/AGENT-CREDENTIAL-OPERATOR.md)).
+   Generate each block with `npx -y @hythe/mcp@0.1.5 init --agent-id <agent-id>
+   --agent-key-file /absolute/path/to/<agent-id>.agent-key
+   --agent-auth-mode required` so it contains that machine's exact
+   `HYTHE_AGENT_ID` (e.g. `claude-desktop`, `claude-laptop`) plus a file
+   reference, never the token. Distinct ids and credentials per lane: the
+   inbox, attribution, rotation, and revocation model assumes one principal
+   per client lane.
 4. **Backups live with the hub** — scheduled snapshot + off-host copy.
    Laptops carry no memory state at all; a lost laptop loses nothing.
 

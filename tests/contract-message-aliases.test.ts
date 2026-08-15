@@ -14,7 +14,7 @@ async function mcpCall(server: NeuralMCPServer, toolName: string, args: Record<s
   }
 }
 
-describe('Message alias resolution', () => {
+describe('Exact message handles', () => {
   let server: NeuralMCPServer;
 
   beforeAll(() => {
@@ -51,7 +51,7 @@ describe('Message alias resolution', () => {
     delete process.env.ENABLE_ADVANCED_MEMORY;
   });
 
-  it('delivers cli-addressed messages to the registered canonical agent inbox', async () => {
+  it('does not deliver a cli-suffixed handle to the registered base inbox', async () => {
     const ts = Date.now();
     const receiver = `alias-rx-${ts}`;
     const sender = `alias-tx-${ts}`;
@@ -70,29 +70,36 @@ describe('Message alias resolution', () => {
     });
 
     expect(sent.sentCount).toBe(1);
-    expect(sent.recipients).toContain(receiver);
+    expect(sent.recipients).toContain(`${receiver}-cli`);
 
-    const inbox = await mcpCall(server, 'get_ai_messages', {
+    const baseInbox = await mcpCall(server, 'get_ai_messages', {
       agentId: receiver,
       unreadOnly: false,
       compact: false,
       limit: 10,
     });
+    expect(baseInbox.messages.some((message: any) => message.content.content === `alias delivery ${ts}`)).toBe(false);
 
-    const found = inbox.messages.find((message: any) => message.content.content === `alias delivery ${ts}`);
+    const cliInbox = await mcpCall(server, 'get_ai_messages', {
+      agentId: `${receiver}-cli`,
+      unreadOnly: false,
+      compact: false,
+      limit: 10,
+    });
+    const found = cliInbox.messages.find((message: any) => message.content.content === `alias delivery ${ts}`);
     expect(found).toBeTruthy();
-    expect(found.content.to).toBe(receiver);
+    expect(found.content.to).toBe(`${receiver}-cli`);
 
     const detail = await mcpCall(server, 'get_message_detail', {
-      agentId: receiver,
+      agentId: `${receiver}-cli`,
       messageId: found.id,
       markAsRead: false,
     });
-    expect(detail.to).toBe(receiver);
+    expect(detail.to).toBe(`${receiver}-cli`);
     expect(detail.content).toBe(`alias delivery ${ts}`);
   });
 
-  it('supports canonical sender filters and alias inbox reads for cli-suffixed senders', async () => {
+  it('keeps sender filters and inbox reads exact for cli-suffixed handles', async () => {
     const ts = Date.now();
     const receiver = `alias-filter-rx-${ts}`;
     const sender = `alias-filter-tx-${ts}`;
@@ -115,20 +122,36 @@ describe('Message alias resolution', () => {
       messageType: 'info',
     });
 
-    const inbox = await mcpCall(server, 'get_ai_messages', {
-      agentId: `${receiver}-cli`,
+    const baseSenderFilter = await mcpCall(server, 'get_ai_messages', {
+      agentId: receiver,
       from: sender,
       unreadOnly: false,
       compact: false,
       limit: 10,
     });
+    expect(baseSenderFilter.messages.some((message: any) => message.content.content === `alias sender filter ${ts}`)).toBe(false);
 
-    const found = inbox.messages.find((message: any) => message.content.content === `alias sender filter ${ts}`);
+    const exactSenderFilter = await mcpCall(server, 'get_ai_messages', {
+      agentId: receiver,
+      from: `${sender}-cli`,
+      unreadOnly: false,
+      compact: false,
+      limit: 10,
+    });
+    const found = exactSenderFilter.messages.find((message: any) => message.content.content === `alias sender filter ${ts}`);
     expect(found).toBeTruthy();
-    expect(found.content.from).toBe(sender);
+    expect(found.content.from).toBe(`${sender}-cli`);
+
+    const cliInbox = await mcpCall(server, 'get_ai_messages', {
+      agentId: `${receiver}-cli`,
+      unreadOnly: false,
+      compact: false,
+      limit: 10,
+    });
+    expect(cliInbox.messages.some((message: any) => message.content.content === `alias sender filter ${ts}`)).toBe(false);
   });
 
-  it('marks alias-addressed messages as read through the canonical inbox', async () => {
+  it('does not mark cli-addressed messages through the base inbox', async () => {
     const ts = Date.now();
     const receiver = `alias-mark-rx-${ts}`;
 
@@ -148,14 +171,19 @@ describe('Message alias resolution', () => {
     const marked = await mcpCall(server, 'mark_messages_read', {
       agentId: receiver,
     });
-    expect(marked.markedAsRead).toBeGreaterThanOrEqual(1);
+    expect(marked.markedAsRead).toBe(0);
 
     const unread = await mcpCall(server, 'get_ai_messages', {
-      agentId: receiver,
+      agentId: `${receiver}-cli`,
       unreadOnly: true,
       compact: false,
       limit: 10,
     });
-    expect(unread.messages.some((message: any) => message.content.content === `alias mark ${ts}`)).toBe(false);
+    expect(unread.messages.some((message: any) => message.content.content === `alias mark ${ts}`)).toBe(true);
+
+    const exactMarked = await mcpCall(server, 'mark_messages_read', {
+      agentId: `${receiver}-cli`,
+    });
+    expect(exactMarked.markedAsRead).toBeGreaterThanOrEqual(1);
   });
 });

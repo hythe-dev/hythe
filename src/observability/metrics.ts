@@ -27,6 +27,7 @@ const SENSITIVE_FIELDS = new Set([
 // Patterns that indicate sensitive content
 const SENSITIVE_PATTERNS = [
   /^nac_[a-f0-9]{64}$/i,           // API key format
+  /^hya1_[a-f0-9]{24}_[A-Za-z0-9_-]{43}$/, // Per-agent credential
   /^bearer\s+.+$/i,                 // Bearer tokens
   /^basic\s+.+$/i,                  // Basic auth
 ];
@@ -147,6 +148,8 @@ export const MetricNames = {
   AUTH_MISSING_KEY_TOTAL: 'auth_missing_key_total',
   AUTH_INVALID_KEY_TOTAL: 'auth_invalid_key_total',
   AUTH_MALFORMED_KEY_TOTAL: 'auth_malformed_key_total',
+  AGENT_AUTH_INVOCATIONS_TOTAL: 'agent_auth_invocations_total',
+  AGENT_AUTH_DENIALS_TOTAL: 'agent_auth_denials_total',
 
   // Rate limiting metrics
   RATE_LIMIT_GENERAL_EXCEEDED: 'rate_limit_general_exceeded_total',
@@ -200,6 +203,8 @@ class MetricsCollector {
     compactionRuns: 0
   };
   private compactionInterval: NodeJS.Timeout | null = null;
+  private initialCompactionImmediate: NodeJS.Immediate | null = null;
+  private activeScheduledCompactions = new Set<Promise<CompactionStats>>();
   private eventIdCounter = 0;
 
   constructor() {
@@ -235,30 +240,46 @@ class MetricsCollector {
     console.log(`📊 Starting event compaction (every ${this.retentionConfig.compactionIntervalMs}ms, ${this.retentionConfig.retentionHours}h retention)`);
 
     // Run compaction async in setInterval (non-blocking)
-    this.compactionInterval = setInterval(() => {
-      // Fire and forget - don't await to avoid blocking
-      this.runCompaction().catch(err => {
-        console.error('❌ Compaction error:', err);
-      });
-    }, this.retentionConfig.compactionIntervalMs);
+    this.compactionInterval = setInterval(() => this.scheduleCompaction(), this.retentionConfig.compactionIntervalMs);
 
     // Run initial compaction async (non-blocking)
-    setImmediate(() => {
-      this.runCompaction().catch(err => {
-        console.error('❌ Initial compaction error:', err);
-      });
+    this.initialCompactionImmediate = setImmediate(() => {
+      this.initialCompactionImmediate = null;
+      this.scheduleCompaction();
+    });
+  }
+
+  private scheduleCompaction(): void {
+    const task = this.runCompaction();
+    this.activeScheduledCompactions.add(task);
+    void task.catch(err => {
+      console.error('❌ Compaction error:', err);
+    }).finally(() => {
+      this.activeScheduledCompactions.delete(task);
     });
   }
 
   /**
    * Stop automatic event compaction
    */
-  stopCompaction(): void {
+  async stopCompaction(): Promise<void> {
+    const hadScheduledWork = Boolean(
+      this.compactionInterval ||
+      this.initialCompactionImmediate ||
+      this.activeScheduledCompactions.size > 0
+    );
     if (this.compactionInterval) {
       clearInterval(this.compactionInterval);
       this.compactionInterval = null;
-      console.log('📊 Event compaction stopped');
     }
+    if (this.initialCompactionImmediate) {
+      clearImmediate(this.initialCompactionImmediate);
+      this.initialCompactionImmediate = null;
+    }
+
+    const active = Array.from(this.activeScheduledCompactions);
+    if (active.length > 0) await Promise.allSettled(active);
+    if (hadScheduledWork) console.log('📊 Event compaction stopped');
   }
 
   /**
@@ -342,6 +363,8 @@ class MetricsCollector {
       { name: MetricNames.AUTH_MISSING_KEY_TOTAL, description: 'Total missing API key attempts' },
       { name: MetricNames.AUTH_INVALID_KEY_TOTAL, description: 'Total invalid API key attempts' },
       { name: MetricNames.AUTH_MALFORMED_KEY_TOTAL, description: 'Total malformed API key attempts' },
+      { name: MetricNames.AGENT_AUTH_INVOCATIONS_TOTAL, description: 'Agent-owned operations by rollout mode and proof type' },
+      { name: MetricNames.AGENT_AUTH_DENIALS_TOTAL, description: 'Denied agent-owned operations by rollout mode and bounded reason' },
       { name: MetricNames.RATE_LIMIT_GENERAL_EXCEEDED, description: 'Total general rate limit exceeded' },
       { name: MetricNames.RATE_LIMIT_MESSAGE_EXCEEDED, description: 'Total message rate limit exceeded' },
       { name: MetricNames.RATE_LIMIT_PREAUTH_EXCEEDED, description: 'Total pre-auth rate limit exceeded' },
@@ -683,6 +706,21 @@ export function recordAuthFailure(reason: 'missing_key' | 'invalid_key' | 'malfo
       break;
   }
   metrics.logEvent('warn', 'auth', `Auth failure: ${reason}`);
+}
+
+/** Bounded-label rollout telemetry; never includes an agent id or credential. */
+export function recordAgentAuthInvocation(
+  mode: 'observe' | 'mixed' | 'required',
+  proof: 'credential' | 'legacy',
+): void {
+  metrics.increment(MetricNames.AGENT_AUTH_INVOCATIONS_TOTAL, 1, { mode, proof });
+}
+
+export function recordAgentAuthDenial(
+  mode: 'observe' | 'mixed' | 'required',
+  reason: string,
+): void {
+  metrics.increment(MetricNames.AGENT_AUTH_DENIALS_TOTAL, 1, { mode, reason });
 }
 
 // Rate limiter metrics (extended for multi-tenant support)

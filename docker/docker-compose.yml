@@ -16,6 +16,9 @@ services:
     environment:
       - NEURAL_MCP_PORT=6174
       - MESSAGE_HUB_PORT=3004
+      # Compatibility-first rollout. Change only after provisioning and
+      # canarying every exact client principal.
+      - HYTHE_AGENT_AUTH_MODE=observe
       - NODE_ENV=production
       # DB truth (review 6f2cf4e9 #3): explicit path on the mounted volume —
       # matches BACKUP-AND-RESTORE.md; never the legacy default filename.
@@ -23,10 +26,13 @@ services:
       - SQLITE_VEC_CACHE_DIR=/app/data/models
       - SQLITE_VEC_DIMENSIONS=384
       - SQLITE_VEC_MODEL=Xenova/all-MiniLM-L6-v2
+      # The image binds an independently locked module path and fails startup
+      # rather than mixing token-hash vectors into a transformer-built index.
+      - SQLITE_VEC_REQUIRE_TRANSFORMERS=true
     volumes:
       - engram_data:/app/data
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:6174/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:6174/ready').then(async r=>{const b=await r.json();process.exit(r.status===200&&b.ready===true&&b.degraded===false?0:1)}).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3

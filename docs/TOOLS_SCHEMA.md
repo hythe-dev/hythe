@@ -75,7 +75,7 @@ Parameters
   "properties": {
     "agentId": {
       "type": "string",
-      "description": "Optional source agent ID for observation attribution. This is accepted inside the operator/API-key trust boundary and becomes shared_memory.created_by; Phase C gate evidence also requires operator-pinned observation IDs and exact hash/scope bindings."
+      "description": "Source agent ID for observation attribution. With per-agent proof the server injects and authorizes the exact authenticated principal; observe-mode legacy calls may still supply it explicitly. The effective value becomes shared_memory.created_by."
     },
     "mode": {
       "type": "string",
@@ -480,7 +480,7 @@ Parameters
 ```
 
 ### get_ai_messages
-Retrieve messages for an AI agent with filtering and real offset pagination. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale. SHARED INBOX NOTE: When monitoring another agent's inbox (e.g. claude-desktop checking codex), use unreadOnly: false — the target agent marks its own messages read during execution, so unreadOnly: true returns 0.
+Retrieve messages for the calling agent's exact inbox with filtering and real offset pagination. Identity-bound client bridges require agentId to match the configured lane identity. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale.
 
 Parameters
 
@@ -526,7 +526,7 @@ Parameters
     },
     "unreadOnly": {
       "type": "boolean",
-      "description": "Only return unread messages (default: true). This is the recommended way to check your inbox. Set to false when monitoring a shared inbox — other agents mark their own messages read.",
+      "description": "Only return unread messages (default: true). This is the recommended way to check your own exact inbox.",
       "default": true
     },
     "compact": {
@@ -662,7 +662,7 @@ Parameters
 ```
 
 ### set_agent_identity
-Update an agent's public identity and optionally re-register the MCP bridge automatically
+Temporarily disabled during migration to tenant-scoped stable principals. Calls fail without changing identity history; register an exact handle with register_agent instead.
 
 Parameters
 
@@ -884,7 +884,8 @@ Parameters
         "agentId": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 100
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9_.:-]+$"
         },
         "scope": {
           "type": "object",
@@ -956,6 +957,7 @@ Parameters
           "type": "string",
           "minLength": 1,
           "maxLength": 100,
+          "pattern": "^[A-Za-z0-9_.:-]+$",
           "description": "Agent opening the session"
         },
         "projectId": {
@@ -999,7 +1001,8 @@ Parameters
       "type": "string",
       "minLength": 1,
       "maxLength": 100,
-      "description": "ASSERTED caller identity (platform max 100); authorship is recorded under the CANONICAL agent family, with the raw asserted id preserved in audit metadata."
+      "pattern": "^[A-Za-z0-9_.:-]+$",
+      "description": "ASSERTED exact opaque caller identity (platform max 100); case and transport-looking suffixes are identity-significant, and the raw asserted id is preserved in audit metadata."
     },
     "scope": {
       "type": "object",

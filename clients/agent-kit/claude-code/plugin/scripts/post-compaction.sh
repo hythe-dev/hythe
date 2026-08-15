@@ -5,7 +5,14 @@
 #
 # Pattern adapted from Gentleman-Programming/engram (MIT) — see NOTICE.
 
-AGENT_ID="${HYTHE_AGENT_ID:-${ENGRAM_AGENT_ID:-}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=resolve-agent-id.sh
+source "$SCRIPT_DIR/resolve-agent-id.sh"
+if ! hythe_resolve_agent_id; then
+  hythe_identity_error >&2
+  exit 2
+fi
+AGENT_ID="$HYTHE_RESOLVED_AGENT_ID"
 
 INPUT=$(cat)
 if command -v jq >/dev/null 2>&1; then
@@ -18,16 +25,8 @@ PROJECT=$(basename "${CWD:-unknown}" | tr '[:upper:]' '[:lower:]')
 echo "CRITICAL INSTRUCTION POST-COMPACTION — follow these steps IN ORDER:"
 echo ""
 
-if [ -n "$AGENT_ID" ]; then
-  printf '1. FIRST: call mcp__hythe__checkpoint with the content of the compacted summary above (agentId: "%s", project hint: "%s"). This preserves what was accomplished before compaction — if you skip it and the session dies, that work history is gone.\n\n' "$AGENT_ID" "$PROJECT"
-  printf '2. THEN: call mcp__hythe__resume with agentId: "%s" to recover session history and current observations. Read the returned context carefully — it tells you what was being worked on.\n\n' "$AGENT_ID"
-else
-  cat <<'NOID'
-1. HYTHE_AGENT_ID is not set. Ask the user which agent identity applies,
-   then perform steps 1-2 with it (checkpoint the compacted summary, then resume).
-
-NOID
-fi
+printf '1. FIRST: call mcp__hythe__checkpoint with the content of the compacted summary above (agentId: "%s", project hint: "%s"). This preserves what was accomplished before compaction — if you skip it and the session dies, that work history is gone.\n\n' "$AGENT_ID" "$PROJECT"
+printf '2. THEN: call mcp__hythe__resume with agentId: "%s" to recover session history and current observations. Read the returned context carefully — it tells you what was being worked on.\n\n' "$AGENT_ID"
 
 cat <<'STEPS'
 3. If you need detail on a specific topic, call mcp__hythe__search_entities
