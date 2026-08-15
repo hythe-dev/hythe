@@ -7,7 +7,7 @@ Protocol the agent actually follows.
 
 > Transition note: during the server's phased migration, the working MCP
 > config key and tool prefix remain the legacy names; new installs should
-> use the config printed by `npx -y @hythe/mcp@0.1.6 init --agent-id <agent-id>`.
+> use the config printed by `npx -y @hythe/mcp@0.1.7 init --agent-id <agent-id>`.
 
 Nothing in this kit touches the server. It is hooks, prompt files, and setup
 glue on the client side only.
@@ -33,7 +33,7 @@ a credential for that exact id into a dedicated local file by following the
 generate the client block with:
 
 ```bash
-npx -y @hythe/mcp@0.1.6 init --agent-id claude-desktop \
+npx -y @hythe/mcp@0.1.7 init --agent-id claude-desktop \
   --agent-key-file /absolute/path/to/claude-desktop.agent-key \
   --agent-auth-mode required
 ```
@@ -70,7 +70,7 @@ arguments, config JSON/TOML, or URLs.
   credential.
 - **Name-agnostic where possible.** Directory and script names avoid the
   product name; new installs use the `hythe` MCP server key and
-  `mcp__hythe__*` tool names (printed by `npx -y @hythe/mcp@0.1.6 init --agent-id <agent-id>`).
+  `mcp__hythe__*` tool names (printed by `npx -y @hythe/mcp@0.1.7 init --agent-id <agent-id>`).
 - **Agent identity** comes from `HYTHE_AGENT_ID` (e.g. `claude-desktop`);
   the legacy `ENGRAM_AGENT_ID` alias is honored only when it agrees. Hooks
   reject conflicting aliases and refuse to guess a missing identity. For

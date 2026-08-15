@@ -1,5 +1,14 @@
 # Security
 
+## 0.1.7 dual-proof agent authorization
+
+Version 0.1.7 preserves 0.1.6's dual-proof authorization and shared-knowledge
+boundaries. Its offline residue adjudicator adds one narrowly scoped,
+owner-approved quarantine path for a vector with a uniquely proven observation
+backing row. The path requires exact tenant, identifier, row hash, content hash,
+type, ancillary topology, vector ownership, and raw target-field parity; any
+ambiguity or drift fails closed before mutation.
+
 ## 0.1.6 dual-proof agent authorization
 
 Version 0.1.6 preserves the dual-proof authorization model introduced in
