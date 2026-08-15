@@ -140,6 +140,78 @@ function completeQuarantineManifest(inventory) {
   };
 }
 
+const BACKING_OBSERVATION_DISPOSITION = 'quarantine_backing_observation';
+
+function findingFor(inventory, issueCode, id) {
+  const finding = inventory.findings.find(({ issue, locator }) =>
+    issue.code === issueCode && locator.id === id);
+  assert.ok(finding, `missing ${issueCode} finding for ${id}`);
+  return finding;
+}
+
+function decisionFor(manifest, finding) {
+  const decision = manifest.decisions.find(({ findingId }) => findingId === finding.findingId);
+  assert.ok(decision, `missing manifest decision for ${finding.findingId}`);
+  return decision;
+}
+
+function targetFor(descriptor) {
+  return {
+    table: descriptor.locator.table,
+    tenantId: descriptor.locator.tenantId,
+    id: descriptor.locator.id,
+    rowHash: descriptor.rowHash,
+    contentHash: descriptor.contentHash,
+  };
+}
+
+function backingObservationFor(finding) {
+  const matches = finding.vectorOwnership?.backingRows?.filter(({ locator }) =>
+    locator.table === 'shared_memory') || [];
+  assert.equal(matches.length, 1, `expected one shared_memory backing row for ${finding.findingId}`);
+  return matches[0];
+}
+
+function quarantineBackingObservation(manifest, finding, target = null) {
+  const decision = decisionFor(manifest, finding);
+  decision.disposition = BACKING_OBSERVATION_DISPOSITION;
+  decision.target = target || targetFor(backingObservationFor(finding));
+  return decision;
+}
+
+function assertBackingPolicyRejection(plan, expectedCode) {
+  assert.equal(plan.ready, false);
+  assert.ok(plan.errors.some(({ code }) => code === expectedCode), JSON.stringify(plan.errors));
+  assert.equal(plan.errors.some(({ code }) => code === 'invalid_disposition'), false,
+    JSON.stringify(plan.errors));
+  assert.equal(plan.errors.some(({ code }) => code === 'disposition_not_supported_for_finding'), false,
+    JSON.stringify(plan.errors));
+}
+
+function rebindInventoryFingerprint(inventory) {
+  inventory.contentFingerprint = testHash({
+    schemaVersion: inventory.schemaVersion,
+    sourceMigration: inventory.sourceMigration,
+    sourceFingerprint: inventory.sourceFingerprint,
+    vectorStorage: inventory.vectorStorage,
+    logicalDatabase: inventory.database.logical,
+    findings: inventory.findings,
+  });
+  inventory.inventoryFingerprint = testHash({
+    contentFingerprint: inventory.contentFingerprint,
+    pathIdentity: inventory.database.pathIdentity,
+  });
+}
+
+function actionFor(plan, disposition, table, id) {
+  const matches = plan.actions.filter((action) =>
+    action.disposition === disposition
+    && action.source?.table === table
+    && action.source?.id === id);
+  assert.equal(matches.length, 1, JSON.stringify(plan.actions));
+  return matches[0];
+}
+
 test('inventory is read-only, hash-bound, and body-free', async () => {
   const fixture = makeFixture();
   const before = statSync(fixture.dbPath).size;
@@ -286,6 +358,650 @@ test('plan refuses a vec0 deletion while an unscheduled public vector still owns
   db.close();
   assert.equal(plan.ready, false);
   assert.ok(plan.errors.some(({ code }) => code === 'vec0_row_has_unscheduled_owner'));
+});
+
+test('quarantine_backing_observation merges with source quarantine and removes its vector', async () => {
+  const fixture = makeFixture();
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  const sourceFinding = findingFor(
+    inventory,
+    'orphan_private_observation',
+    'orphan-observation'
+  );
+  const backing = backingObservationFor(vectorFinding);
+  assert.equal(backing.memoryType, 'observation');
+  assert.equal(backing.locator.tenantId, vectorFinding.locator.tenantId);
+  assert.equal(backing.locator.id, vectorFinding.locator.id);
+  assert.equal(backing.contentHash, vectorFinding.contentHash);
+
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const planningDb = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(planningDb, inventory, manifest);
+  planningDb.close();
+  assert.ok(vectorFinding.supportedDispositions.includes(BACKING_OBSERVATION_DISPOSITION));
+  assert.equal(plan.ready, true, JSON.stringify(plan.errors));
+  assert.equal(plan.counts.byDisposition[BACKING_OBSERVATION_DISPOSITION], 1);
+  const sourceAction = actionFor(plan, 'quarantine', 'shared_memory', 'orphan-observation');
+  assert.deepEqual(sourceAction.authorizingDispositions, [
+    'quarantine',
+    BACKING_OBSERVATION_DISPOSITION,
+  ]);
+  assert.deepEqual(sourceAction.findingIds, [sourceFinding.findingId, vectorFinding.findingId]);
+  const vectorAction = actionFor(
+    plan,
+    'stale_vector_remove',
+    'neural_vec_index',
+    'orphan-observation'
+  );
+  assert.deepEqual(vectorAction.authorizingDispositions, [BACKING_OBSERVATION_DISPOSITION]);
+  assert.deepEqual(vectorAction.findingIds, [vectorFinding.findingId]);
+
+  const report = await runPrivateMessageResidueAdjudication({
+    dbPath: fixture.dbPath,
+    mode: 'execute',
+    manifest,
+    confirm: plan.confirmationToken,
+    backupPath: join(fixture.directory, 'backing-observation-backup.db'),
+    reportPath: join(fixture.directory, 'backing-observation-report.json'),
+  });
+  assert.equal(report.status, 'applied', JSON.stringify(report));
+  assert.equal(report.applied.quarantinedRows, 1);
+  assert.equal(report.applied.sharedRowsDeleted, 1);
+  assert.equal(report.applied.vectorIndexRowsDeleted, 2);
+  assert.equal(report.applied.vec0RowsDeleted, 2);
+
+  const after = new Database(fixture.dbPath, { readonly: true });
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM shared_memory
+    WHERE tenant_id = 'tenant-a' AND id = 'orphan-observation'
+  `).get().count, 0);
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM neural_vec_index
+    WHERE tenant_id = 'tenant-a' AND memory_id = 'orphan-observation'
+  `).get().count, 0);
+  const quarantine = after.prepare(`
+    SELECT finding_ids_json, disposition
+    FROM private_message_residue_quarantine
+    WHERE tenant_id = 'tenant-a' AND row_id = 'orphan-observation'
+  `).get();
+  assert.equal(quarantine.disposition, 'quarantine');
+  assert.deepEqual(
+    JSON.parse(quarantine.finding_ids_json).sort(),
+    [sourceFinding.findingId, vectorFinding.findingId].sort()
+  );
+  after.close();
+});
+
+test('quarantine_backing_observation handles the production-shaped ambiguous public-parent case', async () => {
+  const fixture = makeFixture();
+  const secretBody = 'PRODUCTION-229-PRIVATE-OBSERVATION-BODY '.repeat(120);
+  const observationContent = JSON.stringify({
+    entityName: 'Ambiguous Public Parent',
+    contents: [secretBody],
+    metadata: { source: 'add_observations' },
+  });
+  const setup = new Database(fixture.dbPath);
+  setup.exec(`
+    DELETE FROM graph_lookup_keys WHERE memory_id = 'orphan-observation';
+    DELETE FROM entity_lookup_identity_links WHERE memory_id = 'orphan-observation';
+    DELETE FROM entity_context_facets WHERE source_row_id = 'orphan-observation';
+    DELETE FROM neural_vec_index;
+    DELETE FROM shared_memory_vec;
+    DELETE FROM shared_memory WHERE id = 'orphan-observation';
+  `);
+  setup.prepare(`
+    INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by)
+    VALUES ('public-parent-one', 'tenant-a', 'entity', ?, 'public-agent')
+  `).run(JSON.stringify({
+    name: 'Ambiguous Public Parent',
+    type: 'project',
+    observations: [],
+  }));
+  setup.prepare(`
+    INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by)
+    VALUES ('public-parent-two', 'tenant-a', 'entity', ?, 'public-agent')
+  `).run(JSON.stringify({
+    name: 'Ambiguous Public Parent LLC',
+    type: 'project',
+    observations: [],
+  }));
+  setup.prepare(`
+    INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by)
+    VALUES ('production-229-observation', 'tenant-a', 'observation', ?, 'sender-a')
+  `).run(observationContent);
+  setup.exec(`
+    INSERT INTO graph_lookup_keys VALUES ('tenant-a', 'production-229-observation');
+    INSERT INTO entity_lookup_identity_links VALUES ('tenant-a', 'production-229-observation');
+    INSERT INTO entity_context_facets VALUES ('tenant-a', 'production-229-observation');
+    INSERT INTO shared_memory_vec (rowid, embedding) VALUES (229, '[2,2,9]');
+  `);
+  setup.prepare(`
+    INSERT INTO neural_vec_index (memory_id, tenant_id, memory_type, content, vector_rowid)
+    VALUES ('production-229-observation', 'tenant-a', 'observation', ?, 229)
+  `).run(observationContent);
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  assert.equal(inventory.counts.findings, 1);
+  assert.deepEqual(inventory.counts.byIssueCode, { unrepresented_private_vector: 1 });
+  assert.equal(inventory.findings.some(({ locator }) =>
+    locator.table === 'shared_memory' && locator.id === 'production-229-observation'), false);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'production-229-observation'
+  );
+  const backing = backingObservationFor(vectorFinding);
+  assert.equal(backing.memoryType, 'observation');
+  assert.equal(backing.contentHash, vectorFinding.contentHash);
+  assert.deepEqual(
+    backing.ancillaryRows.map(({ table }) => table).sort(),
+    ['entity_context_facets', 'entity_lookup_identity_links', 'graph_lookup_keys']
+  );
+  assert.ok(backing.ancillaryRows.every(({ rows }) => rows.length === 1));
+
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const planningDb = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(planningDb, inventory, manifest);
+  planningDb.close();
+  assert.equal(plan.ready, true, JSON.stringify(plan.errors));
+  const sourceAction = actionFor(
+    plan,
+    'quarantine',
+    'shared_memory',
+    'production-229-observation'
+  );
+  assert.deepEqual(sourceAction.authorizingDispositions, [BACKING_OBSERVATION_DISPOSITION]);
+  assert.deepEqual(sourceAction.findingIds, [vectorFinding.findingId]);
+  const vectorAction = actionFor(
+    plan,
+    'stale_vector_remove',
+    'neural_vec_index',
+    'production-229-observation'
+  );
+  assert.deepEqual(vectorAction.authorizingDispositions, [BACKING_OBSERVATION_DISPOSITION]);
+  assert.deepEqual(vectorAction.findingIds, [vectorFinding.findingId]);
+
+  const reportPath = join(fixture.directory, 'production-229-report.json');
+  const report = await runPrivateMessageResidueAdjudication({
+    dbPath: fixture.dbPath,
+    mode: 'execute',
+    manifest,
+    confirm: plan.confirmationToken,
+    backupPath: join(fixture.directory, 'production-229-backup.db'),
+    reportPath,
+  });
+  assert.equal(report.status, 'applied', JSON.stringify(report));
+  assert.equal(report.applied.quarantinedRows, 1);
+  assert.equal(report.applied.sharedRowsDeleted, 1);
+  assert.equal(report.applied.vectorIndexRowsDeleted, 1);
+  assert.equal(report.applied.vec0RowsDeleted, 1);
+  assert.equal(report.applied.graphLookupRowsDeleted, 1);
+  assert.equal(report.applied.identityLinkRowsDeleted, 1);
+  assert.equal(report.applied.contextFacetRowsDeleted, 1);
+  assert.equal(JSON.stringify(report).includes(secretBody), false);
+  assert.equal(readFileSync(reportPath, 'utf8').includes(secretBody), false);
+
+  const after = new Database(fixture.dbPath, { readonly: true });
+  const quarantine = after.prepare(`
+    SELECT finding_ids_json, row_json
+    FROM private_message_residue_quarantine
+    WHERE tenant_id = 'tenant-a' AND row_id = 'production-229-observation'
+  `).all();
+  assert.equal(quarantine.length, 1);
+  assert.deepEqual(JSON.parse(quarantine[0].finding_ids_json), [vectorFinding.findingId]);
+  assert.ok(quarantine[0].row_json.includes(secretBody));
+  for (const [table, column] of [
+    ['graph_lookup_keys', 'memory_id'],
+    ['entity_lookup_identity_links', 'memory_id'],
+    ['entity_context_facets', 'source_row_id'],
+  ]) {
+    assert.equal(after.prepare(`
+      SELECT COUNT(*) AS count FROM ${table}
+      WHERE tenant_id = 'tenant-a' AND ${column} = 'production-229-observation'
+    `).get().count, 0);
+  }
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM neural_vec_index
+    WHERE tenant_id = 'tenant-a' AND memory_id = 'production-229-observation'
+  `).get().count, 0);
+  assert.equal(after.prepare('SELECT COUNT(*) AS count FROM shared_memory_vec WHERE rowid = 229')
+    .get().count, 0);
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM shared_memory
+    WHERE tenant_id = 'tenant-a' AND id = 'production-229-observation'
+  `).get().count, 0);
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM shared_memory
+    WHERE tenant_id = 'tenant-a' AND id IN ('public-parent-one', 'public-parent-two')
+  `).get().count, 2);
+  after.close();
+});
+
+test('quarantine merge rejects conflicting composite vector ownership evidence', () => {
+  const fixture = makeFixture();
+  const inventory = inventoryFor(fixture.dbPath);
+  const sourceFinding = findingFor(
+    inventory,
+    'orphan_private_observation',
+    'orphan-observation'
+  );
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  assert.deepEqual(sourceFinding.vectorOwnership, vectorFinding.vectorOwnership);
+  const backing = backingObservationFor(vectorFinding);
+  backing.parentTopology = {
+    ...backing.parentTopology,
+    tamperedCompositeEvidence: true,
+  };
+  assert.notDeepEqual(sourceFinding.vectorOwnership, vectorFinding.vectorOwnership);
+  vectorFinding.evidenceHash = testHash({
+    priorEvidenceHash: vectorFinding.evidenceHash,
+    vectorOwnership: vectorFinding.vectorOwnership,
+  });
+  rebindInventoryFingerprint(inventory);
+
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assert.equal(plan.ready, false);
+  assert.ok(plan.errors.some(({ code, findingId }) =>
+    code === 'conflicting_source_evidence' && findingId === vectorFinding.findingId),
+  JSON.stringify(plan.errors));
+  const retainedAction = actionFor(plan, 'quarantine', 'shared_memory', 'orphan-observation');
+  assert.deepEqual(retainedAction.authorizingDispositions, ['quarantine']);
+  assert.deepEqual(retainedAction.findingIds, [sourceFinding.findingId]);
+});
+
+test('quarantine_backing_observation rejects a missing explicit target', () => {
+  const fixture = makeFixture();
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  const manifest = completeQuarantineManifest(inventory);
+  decisionFor(manifest, vectorFinding).disposition = BACKING_OBSERVATION_DISPOSITION;
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'backing_observation_identity_mismatch');
+});
+
+test('quarantine_backing_observation rejects unknown target fields before normalization', () => {
+  const fixture = makeFixture();
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  decisionFor(manifest, vectorFinding).target.unexpected = 'must-not-be-normalized-away';
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assert.equal(plan.ready, false);
+  assert.ok(plan.errors.some(({ code, field }) =>
+    code === 'unknown_field' && field === 'decision.target.unexpected'), JSON.stringify(plan.errors));
+});
+
+test('stale_vector_remove and quarantine reject unexpected targets', () => {
+  for (const disposition of ['stale_vector_remove', 'quarantine']) {
+    const fixture = makeFixture();
+    const inventory = inventoryFor(fixture.dbPath);
+    const vectorFinding = findingFor(
+      inventory,
+      'unrepresented_private_vector',
+      'orphan-observation'
+    );
+    const sourceFinding = findingFor(
+      inventory,
+      'orphan_private_observation',
+      'orphan-observation'
+    );
+    const manifest = completeQuarantineManifest(inventory);
+    const finding = disposition === 'stale_vector_remove' ? vectorFinding : sourceFinding;
+    const decision = decisionFor(manifest, finding);
+    assert.equal(decision.disposition, disposition);
+    decision.target = targetFor(backingObservationFor(vectorFinding));
+    const db = new Database(fixture.dbPath, { readonly: true });
+    const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+    db.close();
+    assert.equal(plan.ready, false, disposition);
+    assert.ok(plan.errors.some(({ code, findingId }) =>
+      code === 'unexpected_target' && findingId === finding.findingId), JSON.stringify(plan.errors));
+  }
+});
+
+test('quarantine_backing_observation rejects ambiguous or multiple backing rows', () => {
+  const fixture = makeFixture();
+  const setup = new Database(fixture.dbPath);
+  setup.exec(`
+    INSERT INTO ai_messages
+      (id, legacy_shared_memory_id, tenant_id, from_agent, to_agent, content)
+    VALUES
+      ('orphan-observation', NULL, 'tenant-a', 'sender-a', 'recipient-a', 'same opaque id'),
+      ('other-mailbox', 'orphan-observation', 'tenant-a', 'sender-a', 'recipient-a', 'legacy link');
+  `);
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  assert.equal(vectorFinding.vectorOwnership.backingRows.length, 3);
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'backing_observation_not_unique');
+});
+
+test('quarantine_backing_observation requires exact backing tenant and id parity', () => {
+  for (const [field, value] of [
+    ['tenantId', 'tenant-b'],
+    ['id', 'different-observation'],
+  ]) {
+    const fixture = makeFixture();
+    const inventory = inventoryFor(fixture.dbPath);
+    const vectorFinding = findingFor(
+      inventory,
+      'unrepresented_private_vector',
+      'orphan-observation'
+    );
+    const manifest = completeQuarantineManifest(inventory);
+    const target = targetFor(backingObservationFor(vectorFinding));
+    target[field] = value;
+    quarantineBackingObservation(manifest, vectorFinding, target);
+    const db = new Database(fixture.dbPath, { readonly: true });
+    const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+    db.close();
+    assertBackingPolicyRejection(plan, 'backing_observation_identity_mismatch');
+  }
+});
+
+test('quarantine_backing_observation requires exact vector and backing content parity', () => {
+  const fixture = makeFixture();
+  const mismatchedVectorContent = JSON.stringify({
+    entityName: 'lost-private-parent',
+    contents: ['DIFFERENT-PRIVATE-VECTOR-CONTENT'],
+    metadata: { source: 'add_observations' },
+  });
+  const setup = new Database(fixture.dbPath);
+  setup.prepare(`
+    UPDATE neural_vec_index SET content = ?
+    WHERE tenant_id = 'tenant-a' AND memory_id = 'orphan-observation'
+  `).run(mismatchedVectorContent);
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  const backing = backingObservationFor(vectorFinding);
+  assert.notEqual(backing.contentHash, vectorFinding.contentHash);
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'backing_observation_content_mismatch');
+});
+
+test('quarantine_backing_observation requires current hash-bound target evidence', () => {
+  for (const field of ['rowHash', 'contentHash']) {
+    const fixture = makeFixture();
+    const inventory = inventoryFor(fixture.dbPath);
+    const vectorFinding = findingFor(
+      inventory,
+      'unrepresented_private_vector',
+      'orphan-observation'
+    );
+    const manifest = completeQuarantineManifest(inventory);
+    const target = targetFor(backingObservationFor(vectorFinding));
+    target[field] = '0'.repeat(64);
+    quarantineBackingObservation(manifest, vectorFinding, target);
+    const db = new Database(fixture.dbPath, { readonly: true });
+    const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+    db.close();
+    assertBackingPolicyRejection(plan, 'backing_observation_hash_mismatch');
+  }
+});
+
+test('quarantine_backing_observation refuses a vec0 row with an unscheduled owner', () => {
+  const fixture = makeFixture();
+  const setup = new Database(fixture.dbPath);
+  setup.prepare(`
+    INSERT INTO neural_vec_index (memory_id, tenant_id, memory_type, content, vector_rowid)
+    SELECT id, tenant_id, memory_type, content, 41 FROM shared_memory WHERE id = 'public-entity'
+  `).run();
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'vec0_row_has_unscheduled_owner');
+});
+
+test('quarantine_backing_observation rejects a non-observation shared-memory backing row', () => {
+  const fixture = makeFixture();
+  const setup = new Database(fixture.dbPath);
+  setup.prepare(`
+    UPDATE shared_memory SET memory_type = 'entity'
+    WHERE tenant_id = 'tenant-a' AND id = 'orphan-observation'
+  `).run();
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  assert.equal(backingObservationFor(vectorFinding).memoryType, 'entity');
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'backing_observation_wrong_type');
+});
+
+test('quarantine_backing_observation rejects a missing backing row', () => {
+  const fixture = makeFixture();
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(inventory, 'unrepresented_private_vector', 'vector-only');
+  assert.deepEqual(vectorFinding.vectorOwnership.backingRows, []);
+  const manifest = completeQuarantineManifest(inventory);
+  quarantineBackingObservation(manifest, vectorFinding, {
+    table: 'shared_memory',
+    tenantId: vectorFinding.locator.tenantId,
+    id: vectorFinding.locator.id,
+    rowHash: 'b'.repeat(64),
+    contentHash: vectorFinding.contentHash,
+  });
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'backing_observation_missing');
+});
+
+test('quarantine_backing_observation rejects a conflicting source action', () => {
+  const fixture = makeFixture();
+  const body = 'CONFLICTING-RESTORE-BODY '.repeat(180);
+  const content = JSON.stringify({
+    name: 'msg-detail-conflict-mail',
+    type: 'message_detail',
+    observations: [body],
+    createdBy: 'sender-a',
+  });
+  const setup = new Database(fixture.dbPath);
+  setup.prepare(`
+    INSERT INTO ai_messages
+      (id, legacy_shared_memory_id, tenant_id, from_agent, to_agent, content)
+    VALUES ('conflict-mail', NULL, 'tenant-a', 'sender-a', 'recipient-a', ?)
+  `).run(body);
+  setup.prepare(`
+    INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by)
+    VALUES ('conflict-observation', 'tenant-a', 'observation', ?, 'sender-a')
+  `).run(content);
+  setup.prepare("INSERT INTO shared_memory_vec (rowid, embedding) VALUES (77, '[7,7]')").run();
+  setup.prepare(`
+    INSERT INTO neural_vec_index (memory_id, tenant_id, memory_type, content, vector_rowid)
+    VALUES ('conflict-observation', 'tenant-a', 'observation', ?, 77)
+  `).run(content);
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const detailFinding = findingFor(inventory, 'orphan_message_detail', 'conflict-observation');
+  const mailbox = detailFinding.parentTopology.bodyMatchMessages.find(({ locator }) =>
+    locator.id === 'conflict-mail');
+  assert.ok(mailbox);
+  const vectorTemplate = findingFor(inventory, 'unrepresented_private_vector', 'vector-only');
+  const vectorEvidence = detailFinding.vectorOwnership.index;
+  assert.ok(vectorEvidence);
+  const vectorFinding = {
+    ...structuredClone(vectorTemplate),
+    findingId: `PMRA-${testHash({ conflict: vectorEvidence }).slice(0, 24)}`,
+    issue: {
+      code: 'unrepresented_private_vector',
+      memoryType: 'observation',
+      reason: 'unresolved_private_shaped_observation',
+    },
+    locator: vectorEvidence.locator,
+    rowHash: vectorEvidence.rowHash,
+    contentHash: vectorEvidence.contentHash,
+    parentTopology: null,
+    vectorOwnership: structuredClone(detailFinding.vectorOwnership),
+    ancillaryRows: [],
+    evidenceHash: testHash({
+      conflict: vectorEvidence,
+      backingRows: detailFinding.vectorOwnership.backingRows,
+    }),
+    supportedDispositions: [
+      ...new Set([
+        ...vectorTemplate.supportedDispositions,
+        BACKING_OBSERVATION_DISPOSITION,
+      ]),
+    ],
+  };
+  inventory.findings.push(vectorFinding);
+  rebindInventoryFingerprint(inventory);
+  const manifest = completeQuarantineManifest(inventory);
+  const detailDecision = decisionFor(manifest, detailFinding);
+  detailDecision.disposition = 'restore_mailbox';
+  detailDecision.target = targetFor(mailbox);
+  quarantineBackingObservation(manifest, vectorFinding);
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assertBackingPolicyRejection(plan, 'conflicting_source_dispositions');
+});
+
+test('stale_vector_remove remains strict for a live unscheduled backing observation', () => {
+  const fixture = makeFixture();
+  const safePublicObservation = JSON.stringify({
+    entityName: 'public-entity',
+    contents: ['public observation'],
+    metadata: { entityId: 'public-entity', source: 'add_observations' },
+  });
+  const setup = new Database(fixture.dbPath);
+  setup.prepare(`
+    UPDATE shared_memory SET content = ?
+    WHERE tenant_id = 'tenant-a' AND id = 'orphan-observation'
+  `).run(safePublicObservation);
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const vectorFinding = findingFor(
+    inventory,
+    'unrepresented_private_vector',
+    'orphan-observation'
+  );
+  assert.equal(inventory.findings.some(({ locator }) =>
+    locator.table === 'shared_memory' && locator.id === 'orphan-observation'), false);
+  assert.equal(backingObservationFor(vectorFinding).memoryType, 'observation');
+  const manifest = completeQuarantineManifest(inventory);
+  assert.equal(decisionFor(manifest, vectorFinding).disposition, 'stale_vector_remove');
+  const db = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(db, inventory, manifest);
+  db.close();
+  assert.equal(plan.ready, false);
+  assert.ok(plan.errors.some(({ code }) =>
+    code === 'vector_not_stale_or_source_not_scheduled_for_removal'), JSON.stringify(plan.errors));
+});
+
+test('ordinary orphan message-detail quarantine remains valid', async () => {
+  const fixture = makeFixture();
+  const body = 'QUARANTINED-DETAIL-BODY '.repeat(180);
+  const setup = new Database(fixture.dbPath);
+  setup.prepare(`
+    INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by)
+    VALUES ('detail-quarantine', 'tenant-a', 'entity', ?, 'sender-a')
+  `).run(JSON.stringify({
+    name: 'msg-detail-no-mailbox',
+    type: 'message_detail',
+    observations: [body],
+    createdBy: 'sender-a',
+  }));
+  setup.close();
+
+  const inventory = inventoryFor(fixture.dbPath);
+  const detailFinding = findingFor(inventory, 'orphan_message_detail', 'detail-quarantine');
+  const manifest = completeQuarantineManifest(inventory);
+  assert.equal(decisionFor(manifest, detailFinding).disposition, 'quarantine');
+  const planningDb = new Database(fixture.dbPath, { readonly: true });
+  const plan = planPrivateMessageResidueAdjudication(planningDb, inventory, manifest);
+  planningDb.close();
+  assert.equal(plan.ready, true, JSON.stringify(plan.errors));
+
+  const report = await runPrivateMessageResidueAdjudication({
+    dbPath: fixture.dbPath,
+    mode: 'execute',
+    manifest,
+    confirm: plan.confirmationToken,
+    backupPath: join(fixture.directory, 'detail-quarantine-backup.db'),
+    reportPath: join(fixture.directory, 'detail-quarantine-report.json'),
+  });
+  assert.equal(report.status, 'applied', JSON.stringify(report));
+  const after = new Database(fixture.dbPath, { readonly: true });
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM private_message_residue_quarantine
+    WHERE tenant_id = 'tenant-a' AND row_id = 'detail-quarantine'
+  `).get().count, 1);
+  assert.equal(after.prepare(`
+    SELECT COUNT(*) AS count FROM shared_memory
+    WHERE tenant_id = 'tenant-a' AND id = 'detail-quarantine'
+  `).get().count, 0);
+  after.close();
 });
 
 test('plan explicitly refuses dispositions that need external adapters', () => {

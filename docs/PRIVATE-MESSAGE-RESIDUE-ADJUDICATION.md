@@ -39,7 +39,10 @@ The inventory contains no message or observation bodies. For every migration
 
 Copy `manifestTemplate` to a separate mode-0600 JSON file. Set one disposition
 for every decision. Do not remove or add findings and do not alter any evidence
-field. Targeted mailbox dispositions must add an exact target object:
+field. Targeted mailbox dispositions must add an exact target object. A
+`quarantine_backing_observation` decision must use the same shape and copy the
+sole exact descriptor from `vectorOwnership.backingRows` as its `shared_memory`
+target:
 
 ```json
 {
@@ -151,6 +154,7 @@ foreign-key checks to pass. Migration 007 itself is not executed.
 | `restore_mailbox` | Restores the one body from an orphan `message_detail` row to a selected `ai_messages` row, then removes the shared detail and derivatives. | Same tenant; canonical name exactly `msg-detail-<message-id>`; exact sender and embedded creator parity; exact target row evidence; target already contains either that exact body or an exact pointer to that detail row. It never overwrites an unrelated body. |
 | `private_duplicate` | Removes a legacy shared `ai_message` duplicate and its derivatives. | Exact tenant, sender, recipient, and body equality with the selected mailbox row; exact source and target evidence. |
 | `stale_vector_remove` | Removes an unrepresented vector-index row and its uniquely accounted vec0 row. | No live backing row, or every backing shared row is removed by the same plan; every vec0 owner is scheduled for removal. |
+| `quarantine_backing_observation` | Quarantines the one exact live observation backing an `unrepresented_private_vector`, then removes that observation's graph derivatives, vector-index row, and uniquely owned vec0 row. The manifest must name the backing row as an exact `shared_memory` target. | Issue reason is `unresolved_private_shaped_observation`; vector and backing are observations with identical tenant, ID, and content hash; one backing row; current target hashes match; explicit parent/ancillary evidence; existing uniquely owned vec0. Any ambiguity or competing action refuses. |
 | `public_relink` | Refused in this version. | A graph-lookup rebuild implementation and vector re-embedding are required before this can be automated safely. |
 | `archive_then_remove_private` | Refused in this version. | A cryptographic archive adapter must prove that the exact plaintext row commitment is present in encrypted, access-controlled custody. |
 | `public_vector_rebuild` | Refused in this version. | A pinned offline embedding model/runtime and exact post-rebuild vector verification are required. |
@@ -158,6 +162,13 @@ foreign-key checks to pass. Migration 007 itself is not executed.
 The recognized-but-unimplemented dispositions fail with
 `manual_adapter_required`. They are never silently treated as quarantine or
 deletion.
+
+`quarantine_backing_observation` is deliberately narrower than a general
+"delete the vector" operation. It expands into one ordinary quarantine action
+for the explicitly targeted source row plus one vector deletion, and merges
+only with an identical quarantine already authorized for that same row. Plain
+`stale_vector_remove` continues to refuse a vector that has any live backing
+row not removed by the same plan.
 
 ## Quarantine is not physical erasure
 
