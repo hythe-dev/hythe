@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Honor latency SLO time windows with timestamped samples, statistically meaningful
+  percentile sample floors, current-evaluation alert metadata, and automatic stale
+  alert recovery instead of retaining up to 1,000 lifetime samples.
+
 ## 0.1.7 - 2026-08-14
 
 - Add the hash-bound `quarantine_backing_observation` adjudication disposition
