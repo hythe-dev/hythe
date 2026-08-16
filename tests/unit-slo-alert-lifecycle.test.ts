@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MetricNames, metrics } from '../src/observability/metrics.js';
 import { recordMCPLatency, sloMonitor } from '../src/observability/slo.js';
 
 describe('SLO latency alert lifecycle', () => {
@@ -6,6 +7,7 @@ describe('SLO latency alert lifecycle', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-16T00:00:00Z'));
     sloMonitor.reset();
+    metrics.setGauge(MetricNames.VECTOR_CONNECTED, 1);
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
   });
 

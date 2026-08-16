@@ -5138,7 +5138,7 @@ export class NeuralMCPServer {
       }
 
       console.log('🌟 Capabilities:');
-      console.log('   🧠 Knowledge Graph (SQLite + Weaviate)');
+      console.log('   🧠 Knowledge Graph (SQLite + sqlite-vec)');
       console.log('   💬 AI Agent Messaging');
       console.log('   🌐 Cross-Platform Path Translation');
       console.log('   📈 Observability & SLOs');

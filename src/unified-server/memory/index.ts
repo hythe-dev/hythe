@@ -43,7 +43,6 @@ import {
 } from './schema.js';
 import {
   setSystemConnected,
-  recordSQLiteFallback,
   setDualWriteEnabled,
   recordDualWriteResult,
   recordMemoryReadLatency,
@@ -93,8 +92,6 @@ export class MemoryManager {
   /** Expose database reference for tenant resolver initialization */
   getDb(): Database.Database { return this.db; }
   public vectorClient?: SqliteVecClient;
-  // Compatibility alias for existing call sites and payloads.
-  public weaviateClient?: SqliteVecClient;
   private isAdvancedSystemsEnabled: boolean = false;
   private isDualWriteEnabled: boolean = false;
   private confidentialEntityReferenceCache = new Map<string, Set<string>>();
@@ -156,11 +153,9 @@ export class MemoryManager {
       const advancedEnabled = process.env.ENABLE_ADVANCED_MEMORY !== 'false';
       if (!advancedEnabled) {
         console.log('⏭️ Advanced memory systems disabled by ENABLE_ADVANCED_MEMORY=false');
-        setSystemConnected('weaviate', false);
+        setSystemConnected('vector', false);
         this.vectorClient = undefined;
-        this.weaviateClient = undefined;
         this.isAdvancedSystemsEnabled = false;
-        recordSQLiteFallback();
         return;
       }
 
@@ -168,16 +163,13 @@ export class MemoryManager {
       try {
         this.vectorClient = new SqliteVecClient(this.db);
         await this.vectorClient.initialize();
-        // Legacy alias while external status payloads still reference "weaviate".
-        this.weaviateClient = this.vectorClient;
-        setSystemConnected('weaviate', true);
+        setSystemConnected('vector', true);
         metrics.logEvent('info', 'systems', 'sqlite-vec client initialized');
       } catch (vectorError) {
         console.warn('⚠️ sqlite-vec initialization failed:', vectorError);
-        setSystemConnected('weaviate', false);
+        setSystemConnected('vector', false);
         metrics.logEvent('error', 'systems', 'sqlite-vec client initialization failed', { error: String(vectorError) });
         this.vectorClient = undefined;
-        this.weaviateClient = undefined;
       }
 
       this.isAdvancedSystemsEnabled = !!this.vectorClient;
@@ -186,11 +178,10 @@ export class MemoryManager {
         console.log('✅ Advanced memory systems initialized (partial or full)');
       } else {
         console.log('⚠️ No advanced systems available - SQLite-only mode');
-        recordSQLiteFallback();
       }
 
       // Startup tombstone drain: retry any failed vector deletes from previous sessions.
-      void this.retryFailedWeaviateDeletes(100).then((result) => {
+      void this.retryFailedVectorDeletes(100).then((result) => {
         if (result.attempted > 0) {
           console.log(`🪦 Startup tombstone drain: ${result.succeeded}/${result.attempted} succeeded, ${result.failed} failed`);
         }
@@ -202,7 +193,7 @@ export class MemoryManager {
       console.warn('⚠️ Advanced memory systems initialization failed:', error);
       console.log('🔄 Falling back to SQLite-only mode');
       metrics.logEvent('error', 'systems', 'All advanced systems failed - SQLite fallback', { error: String(error) });
-      recordSQLiteFallback();
+      setSystemConnected('vector', false);
       this.isAdvancedSystemsEnabled = false;
     }
   }
@@ -430,7 +421,7 @@ export class MemoryManager {
         ON data_trash(tenant_id, retired_at DESC)
     `);
 
-    // Weaviate tombstone table for failed vector deletes (Phase A)
+    // Legacy-named tombstone table retained to avoid a production migration.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS failed_weaviate_deletes (
         id TEXT PRIMARY KEY,
@@ -5192,11 +5183,9 @@ export class MemoryManager {
     deleted: number;
     vectorCleanup: number;
     vectorFailures: number;
-    weaviateCleanup: number;
-    weaviateFailures: number;
   }> {
     if (ids.length === 0) {
-      return { deleted: 0, vectorCleanup: 0, vectorFailures: 0, weaviateCleanup: 0, weaviateFailures: 0 };
+      return { deleted: 0, vectorCleanup: 0, vectorFailures: 0 };
     }
 
     // This is the common sink for generic graph mutation handlers. Inspect the
@@ -5251,16 +5240,13 @@ export class MemoryManager {
 
     // Fire-and-forget: drain any pending tombstones while we're at it
     if (vectorFailures > 0) {
-      void this.retryFailedWeaviateDeletes(25).catch(() => {});
+      void this.retryFailedVectorDeletes(25).catch(() => {});
     }
 
     return {
       deleted: result.changes,
       vectorCleanup,
-      vectorFailures,
-      // Legacy aliases for existing API consumers.
-      weaviateCleanup: vectorCleanup,
-      weaviateFailures: vectorFailures
+      vectorFailures
     };
   }
 
@@ -5272,7 +5258,7 @@ export class MemoryManager {
     newContent: string,
     contentIndex: number | undefined,
     tenantId: string
-  ): Promise<{ updated: boolean; vectorReindexed: boolean; weaviateReindexed: boolean }> {
+  ): Promise<{ updated: boolean; vectorReindexed: boolean }> {
     // Fetch current row (constrained to observations only)
     const row = this.db.prepare(
       "SELECT id, content, created_by, owner_actor_type, owner_actor_id FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'observation'"
@@ -5338,15 +5324,13 @@ export class MemoryManager {
           ).run(uuidv4(), obsId, tenantId, err?.message || 'unknown');
         } catch { /* non-fatal */ }
         // Fire-and-forget: drain pending tombstones
-        void this.retryFailedWeaviateDeletes(25).catch(() => {});
+        void this.retryFailedVectorDeletes(25).catch(() => {});
       }
     }
 
     return {
       updated: true,
-      vectorReindexed,
-      // Legacy alias for existing API consumers.
-      weaviateReindexed: vectorReindexed
+      vectorReindexed
     };
   }
 
@@ -5390,7 +5374,7 @@ export class MemoryManager {
    * Retry failed vector deletes from the tombstone queue.
    * Processes oldest-first, removes on success, bumps retry_count on failure.
    */
-  async retryFailedWeaviateDeletes(limit = 100): Promise<{ attempted: number; succeeded: number; failed: number }> {
+  async retryFailedVectorDeletes(limit = 100): Promise<{ attempted: number; succeeded: number; failed: number }> {
     if (!this.vectorClient) return { attempted: 0, succeeded: 0, failed: 0 };
 
     const rows = this.db.prepare(

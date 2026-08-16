@@ -7,7 +7,7 @@
  * Tracks:
  * - Migration/reconciliation statistics
  * - Authentication events (rate limits, invalid keys)
- * - Advanced systems health (Redis, Neo4j, Weaviate fallbacks)
+ * - Advanced systems health (Redis and sqlite-vec fallbacks)
  * - API request metrics
  */
 
@@ -165,11 +165,8 @@ export const MetricNames = {
   // Advanced systems metrics
   REDIS_CONNECTED: 'redis_connected_info',
   REDIS_FALLBACK_TOTAL: 'redis_fallback_total',
-  NEO4J_CONNECTED: 'neo4j_connected_info',
-  NEO4J_FALLBACK_TOTAL: 'neo4j_fallback_total',
-  WEAVIATE_CONNECTED: 'weaviate_connected_info',
-  WEAVIATE_FALLBACK_TOTAL: 'weaviate_fallback_total',
-  SQLITE_FALLBACK_TOTAL: 'sqlite_fallback_total',
+  VECTOR_CONNECTED: 'vector_connected_info',
+  VECTOR_FALLBACK_TOTAL: 'vector_fallback_total',
 
   // Dual-write metrics
   DUAL_WRITE_ENABLED: 'dual_write_enabled_info',
@@ -374,9 +371,7 @@ class MetricsCollector {
       { name: MetricNames.RATE_LIMIT_TENANT_MESSAGE_QUOTA_EXCEEDED, description: 'Total tenant message quota exceeded' },
       { name: MetricNames.RATE_LIMITER_FALLBACK_TOTAL, description: 'Total rate limiter fallbacks to memory' },
       { name: MetricNames.REDIS_FALLBACK_TOTAL, description: 'Total Redis fallback events' },
-      { name: MetricNames.NEO4J_FALLBACK_TOTAL, description: 'Total Neo4j fallback events' },
-      { name: MetricNames.WEAVIATE_FALLBACK_TOTAL, description: 'Total Weaviate fallback events' },
-      { name: MetricNames.SQLITE_FALLBACK_TOTAL, description: 'Total SQLite-only fallback events' },
+      { name: MetricNames.VECTOR_FALLBACK_TOTAL, description: 'Total sqlite-vec fallback events' },
       { name: MetricNames.DUAL_WRITE_SUCCESS_TOTAL, description: 'Total successful dual-writes' },
       { name: MetricNames.DUAL_WRITE_FAILURE_TOTAL, description: 'Total failed dual-writes' },
       { name: MetricNames.API_REQUESTS_TOTAL, description: 'Total API requests' },
@@ -391,8 +386,7 @@ class MetricsCollector {
     const gaugeDefs: Array<{ name: string; description: string }> = [
       { name: MetricNames.RATE_LIMITER_BACKEND, description: 'Current rate limiter backend (0=memory, 1=redis)' },
       { name: MetricNames.REDIS_CONNECTED, description: 'Redis connection status (0=disconnected, 1=connected)' },
-      { name: MetricNames.NEO4J_CONNECTED, description: 'Neo4j connection status (0=disconnected, 1=connected)' },
-      { name: MetricNames.WEAVIATE_CONNECTED, description: 'Weaviate connection status (0=disconnected, 1=connected)' },
+      { name: MetricNames.VECTOR_CONNECTED, description: 'sqlite-vec connection status (0=disconnected, 1=connected)' },
       { name: MetricNames.DUAL_WRITE_ENABLED, description: 'Dual-write mode status (0=disabled, 1=enabled)' }
     ];
 
@@ -764,24 +758,21 @@ export function setRateLimiterBackend(backend: 'memory' | 'redis'): void {
 }
 
 // Advanced systems metrics
-export function setSystemConnected(system: 'redis' | 'neo4j' | 'weaviate', connected: boolean): void {
-  const metricName = system === 'redis' ? MetricNames.REDIS_CONNECTED
-    : system === 'neo4j' ? MetricNames.NEO4J_CONNECTED
-      : MetricNames.WEAVIATE_CONNECTED;
+export function setSystemConnected(system: 'redis' | 'vector', connected: boolean): void {
+  const metricName = system === 'redis' ? MetricNames.REDIS_CONNECTED : MetricNames.VECTOR_CONNECTED;
   metrics.setGauge(metricName, connected ? 1 : 0);
 
   if (!connected) {
-    const fallbackMetric = system === 'redis' ? MetricNames.REDIS_FALLBACK_TOTAL
-      : system === 'neo4j' ? MetricNames.NEO4J_FALLBACK_TOTAL
-        : MetricNames.WEAVIATE_FALLBACK_TOTAL;
+    const fallbackMetric = system === 'redis' ? MetricNames.REDIS_FALLBACK_TOTAL : MetricNames.VECTOR_FALLBACK_TOTAL;
     metrics.increment(fallbackMetric);
-    metrics.logEvent('warn', 'systems', `${system} disconnected - falling back`);
+    metrics.logEvent(
+      'warn',
+      'systems',
+      system === 'vector'
+        ? 'sqlite-vec unavailable - using SQLite-only mode'
+        : 'redis disconnected - falling back'
+    );
   }
-}
-
-export function recordSQLiteFallback(): void {
-  metrics.increment(MetricNames.SQLITE_FALLBACK_TOTAL);
-  metrics.logEvent('warn', 'systems', 'Fell back to SQLite-only mode');
 }
 
 // Dual-write metrics

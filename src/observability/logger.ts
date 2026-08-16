@@ -21,7 +21,7 @@ export type LogCategory =
   | 'api'        // API requests/responses
   | 'auth'       // Authentication events
   | 'rate_limit' // Rate limiting
-  | 'systems'    // Backend system events (Redis, Neo4j, etc.)
+  | 'systems'    // Backend system events (Redis, sqlite-vec, etc.)
   | 'memory'     // Memory operations
   | 'migration'  // Data migrations
   | 'reconciliation' // Data sync

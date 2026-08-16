@@ -141,7 +141,6 @@ describe('Direct-message payload isolation', () => {
       },
     ]);
     (manager as any).vectorClient = { storeMemory, searchMemories };
-    (manager as any).weaviateClient = (manager as any).vectorClient;
     (manager as any).isAdvancedSystemsEnabled = true;
 
     const sent = await mcpCall(server, 'send_ai_message', {
@@ -399,7 +398,6 @@ describe('Direct-message payload isolation', () => {
     const db = manager.getDb();
     (manager as any).isAdvancedSystemsEnabled = false;
     (manager as any).vectorClient = undefined;
-    (manager as any).weaviateClient = undefined;
     const privateName = `private-large-parent-${suffix}`;
     const privateAlias = `private-large-alias-${suffix}`;
     const observationSecret = `large-private-observation-${suffix}`;
