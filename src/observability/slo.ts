@@ -22,6 +22,8 @@ export interface SLOThreshold {
   description: string;
   p95Ms?: number;
   p99Ms?: number;
+  minP95Samples?: number;
+  minP99Samples?: number;
   maxCount?: number;  // For error/fallback counts
   windowSeconds: number;
 }
@@ -32,24 +34,29 @@ export const SLOConfig: Record<string, SLOThreshold> = {
     description: 'MCP request latency',
     p95Ms: 300,
     p99Ms: 600,
+    minP95Samples: 20,
+    minP99Samples: 100,
     windowSeconds: 300  // 5-minute window
   },
   WS_FANOUT_LATENCY: {
     name: 'ws_fanout_latency',
     description: 'WebSocket fan-out latency',
     p95Ms: 200,
+    minP95Samples: 20,
     windowSeconds: 300
   },
   MEMORY_READ_LATENCY: {
     name: 'memory_read_latency',
     description: 'Memory read operation latency',
     p95Ms: 250,
+    minP95Samples: 20,
     windowSeconds: 300
   },
   MEMORY_WRITE_LATENCY: {
     name: 'memory_write_latency',
     description: 'Memory write operation latency',
     p95Ms: 400,
+    minP95Samples: 20,
     windowSeconds: 300
   },
   SQLITE_FALLBACK: {
@@ -79,8 +86,40 @@ export interface Alert {
   value: number;
   threshold: number;
   timestamp: Date;
+  currentValue: number;
+  lastEvaluatedAt: Date;
+  sampleCount: number;
+  windowStartedAt?: Date;
   resolved: boolean;
   resolvedAt?: Date;
+  resolutionReason?: string;
+}
+
+interface LatencySample {
+  value: number;
+  observedAtMs: number;
+}
+
+interface AlertEvaluation {
+  currentValue: number;
+  evaluatedAt: Date;
+  sampleCount: number;
+  windowStartedAt?: Date;
+}
+
+export interface SLOStatus {
+  healthy: boolean;
+  value?: number;
+  threshold?: number;
+  p95Ms?: number;
+  p99Ms?: number;
+  p95ThresholdMs?: number;
+  p99ThresholdMs?: number;
+  sampleCount?: number;
+  windowSeconds?: number;
+  evidenceState?: 'current' | 'insufficient_data';
+  oldestSampleAt?: Date;
+  newestSampleAt?: Date;
 }
 
 // ============================================================================
@@ -90,7 +129,7 @@ export interface Alert {
 class SLOMonitor {
   private alerts: Map<string, Alert> = new Map();
   private alertCallbacks: Array<(alert: Alert) => void> = [];
-  private latencyBuffers: Map<string, number[]> = new Map();
+  private latencyBuffers: Map<string, LatencySample[]> = new Map();
   private readonly maxBufferSize = 1000;
   private checkInterval: NodeJS.Timeout | null = null;
 
@@ -137,10 +176,15 @@ class SLOMonitor {
   recordLatency(sloName: string, latencyMs: number): void {
     const buffer = this.latencyBuffers.get(sloName);
     if (buffer) {
-      buffer.push(latencyMs);
+      const nowMs = Date.now();
+      buffer.push({ value: latencyMs, observedAtMs: nowMs });
+      const config = Object.values(SLOConfig).find(candidate => candidate.name === sloName);
+      if (config) {
+        this.pruneLatencyBuffer(buffer, config, nowMs);
+      }
       // Keep buffer bounded
       if (buffer.length > this.maxBufferSize) {
-        buffer.shift();
+        buffer.splice(0, buffer.length - this.maxBufferSize);
       }
     }
 
@@ -174,39 +218,84 @@ class SLOMonitor {
    */
   private checkLatencySLO(config: SLOThreshold): void {
     const buffer = this.latencyBuffers.get(config.name);
-    if (!buffer || buffer.length < 10) return; // Need minimum samples
+    if (!buffer) return;
 
-    const sorted = [...buffer].sort((a, b) => a - b);
-    const p95Index = Math.floor(sorted.length * 0.95);
-    const p99Index = Math.floor(sorted.length * 0.99);
-    const p95 = sorted[p95Index];
-    const p99 = sorted[p99Index];
+    const nowMs = Date.now();
+    this.pruneLatencyBuffer(buffer, config, nowMs);
+    const sorted = buffer.map(sample => sample.value).sort((a, b) => a - b);
+    const evaluatedAt = new Date(nowMs);
+    const windowStartedAt = buffer[0] ? new Date(buffer[0].observedAtMs) : undefined;
 
     // Check p95
-    if (config.p95Ms && p95 > config.p95Ms) {
-      this.fireAlert({
-        sloName: config.name,
-        severity: 'warning',
-        message: `${config.description} p95 (${p95.toFixed(0)}ms) exceeds threshold (${config.p95Ms}ms)`,
-        value: p95,
-        threshold: config.p95Ms
-      });
-    } else {
-      this.resolveAlert(`${config.name}_warning`);
+    const minP95Samples = config.minP95Samples ?? 20;
+    if (config.p95Ms && sorted.length >= minP95Samples) {
+      const p95 = this.nearestRank(sorted, 0.95);
+      if (p95 > config.p95Ms) {
+        this.fireAlert({
+          sloName: config.name,
+          severity: 'warning',
+          message: `${config.description} p95 (${p95.toFixed(0)}ms) exceeds threshold (${config.p95Ms}ms)`,
+          value: p95,
+          threshold: config.p95Ms
+        }, {
+          currentValue: p95,
+          evaluatedAt,
+          sampleCount: sorted.length,
+          windowStartedAt,
+        });
+      } else {
+        this.resolveAlert(`${config.name}_warning`, 'current_window_recovered');
+      }
+    } else if (config.p95Ms) {
+      this.resolveAlert(`${config.name}_warning`, 'insufficient_current_samples');
     }
 
     // Check p99
-    if (config.p99Ms && p99 > config.p99Ms) {
-      this.fireAlert({
-        sloName: config.name,
-        severity: 'critical',
-        message: `${config.description} p99 (${p99.toFixed(0)}ms) exceeds threshold (${config.p99Ms}ms)`,
-        value: p99,
-        threshold: config.p99Ms
-      });
-    } else {
-      this.resolveAlert(`${config.name}_critical`);
+    const minP99Samples = config.minP99Samples ?? 100;
+    if (config.p99Ms && sorted.length >= minP99Samples) {
+      const p99 = this.nearestRank(sorted, 0.99);
+      if (p99 > config.p99Ms) {
+        this.fireAlert({
+          sloName: config.name,
+          severity: 'critical',
+          message: `${config.description} p99 (${p99.toFixed(0)}ms) exceeds threshold (${config.p99Ms}ms)`,
+          value: p99,
+          threshold: config.p99Ms
+        }, {
+          currentValue: p99,
+          evaluatedAt,
+          sampleCount: sorted.length,
+          windowStartedAt,
+        });
+      } else {
+        this.resolveAlert(`${config.name}_critical`, 'current_window_recovered');
+      }
+    } else if (config.p99Ms) {
+      this.resolveAlert(`${config.name}_critical`, 'insufficient_current_samples');
     }
+  }
+
+  private pruneLatencyBuffer(
+    buffer: LatencySample[],
+    config: SLOThreshold,
+    nowMs: number,
+  ): void {
+    const cutoffMs = nowMs - config.windowSeconds * 1000;
+    let firstCurrentIndex = 0;
+    while (
+      firstCurrentIndex < buffer.length
+      && buffer[firstCurrentIndex].observedAtMs < cutoffMs
+    ) {
+      firstCurrentIndex += 1;
+    }
+    if (firstCurrentIndex > 0) {
+      buffer.splice(0, firstCurrentIndex);
+    }
+  }
+
+  private nearestRank(sorted: number[], percentile: number): number {
+    const index = Math.max(0, Math.ceil(sorted.length * percentile) - 1);
+    return sorted[index];
   }
 
   /**
@@ -289,19 +378,32 @@ class SLOMonitor {
   /**
    * Fire an alert
    */
-  private fireAlert(params: Omit<Alert, 'id' | 'timestamp' | 'resolved'>): void {
+  private fireAlert(
+    params: Omit<Alert, 'id' | 'timestamp' | 'currentValue' | 'lastEvaluatedAt' | 'sampleCount' | 'windowStartedAt' | 'resolved' | 'resolvedAt' | 'resolutionReason'>,
+    evaluation?: AlertEvaluation,
+  ): void {
     const alertKey = `${params.sloName}_${params.severity}`;
     const existing = this.alerts.get(alertKey);
 
     // Don't re-fire if already active
     if (existing && !existing.resolved) {
+      existing.currentValue = evaluation?.currentValue ?? params.value;
+      existing.lastEvaluatedAt = evaluation?.evaluatedAt ?? new Date();
+      existing.sampleCount = evaluation?.sampleCount ?? existing.sampleCount;
+      existing.windowStartedAt = evaluation?.windowStartedAt;
       return;
     }
+
+    const evaluatedAt = evaluation?.evaluatedAt ?? new Date();
 
     const alert: Alert = {
       id: `alert_${Date.now()}_${Math.random().toString(36).substring(7)}`,
       ...params,
-      timestamp: new Date(),
+      timestamp: evaluatedAt,
+      currentValue: evaluation?.currentValue ?? params.value,
+      lastEvaluatedAt: evaluatedAt,
+      sampleCount: evaluation?.sampleCount ?? 0,
+      windowStartedAt: evaluation?.windowStartedAt,
       resolved: false
     };
 
@@ -330,11 +432,13 @@ class SLOMonitor {
   /**
    * Resolve an alert
    */
-  private resolveAlert(alertKey: string): void {
+  private resolveAlert(alertKey: string, reason: string = 'recovered'): void {
     for (const [key, alert] of this.alerts) {
       if (key.startsWith(alertKey) && !alert.resolved) {
         alert.resolved = true;
         alert.resolvedAt = new Date();
+        alert.lastEvaluatedAt = alert.resolvedAt;
+        alert.resolutionReason = reason;
         console.log(`✅ [SLO RESOLVED] ${alert.sloName}: ${alert.message}`);
         metrics.logEvent('info', 'slo', `Alert resolved: ${alert.sloName}`);
       }
@@ -360,22 +464,42 @@ class SLOMonitor {
   /**
    * Get SLO status summary
    */
-  getSLOStatus(): Record<string, { healthy: boolean; value?: number; threshold?: number }> {
-    const status: Record<string, { healthy: boolean; value?: number; threshold?: number }> = {};
+  getSLOStatus(): Record<string, SLOStatus> {
+    const status: Record<string, SLOStatus> = {};
 
     for (const [key, config] of Object.entries(SLOConfig)) {
       const buffer = this.latencyBuffers.get(config.name);
       const activeAlert = this.getActiveAlerts().find(a => a.sloName === config.name);
 
-      if (buffer && buffer.length > 0) {
-        const sorted = [...buffer].sort((a, b) => a - b);
-        const p95Index = Math.floor(sorted.length * 0.95);
-        const p95 = sorted[p95Index];
+      if (buffer) {
+        this.pruneLatencyBuffer(buffer, config, Date.now());
+        const sorted = buffer.map(sample => sample.value).sort((a, b) => a - b);
+        const hasCurrentEvidence = (
+          (config.p99Ms !== undefined && sorted.length >= (config.minP99Samples ?? 100))
+          || (config.p95Ms !== undefined && sorted.length >= (config.minP95Samples ?? 20))
+        );
+        const p95 = config.p95Ms !== undefined && sorted.length >= (config.minP95Samples ?? 20)
+          ? this.nearestRank(sorted, 0.95)
+          : undefined;
+        const p99 = config.p99Ms !== undefined && sorted.length >= (config.minP99Samples ?? 100)
+          ? this.nearestRank(sorted, 0.99)
+          : undefined;
 
         status[config.name] = {
           healthy: !activeAlert,
           value: p95,
-          threshold: config.p95Ms
+          threshold: config.p95Ms,
+          p95Ms: p95,
+          p99Ms: p99,
+          p95ThresholdMs: config.p95Ms,
+          p99ThresholdMs: config.p99Ms,
+          sampleCount: sorted.length,
+          windowSeconds: config.windowSeconds,
+          evidenceState: hasCurrentEvidence ? 'current' : 'insufficient_data',
+          oldestSampleAt: buffer[0] ? new Date(buffer[0].observedAtMs) : undefined,
+          newestSampleAt: buffer[buffer.length - 1]
+            ? new Date(buffer[buffer.length - 1].observedAtMs)
+            : undefined,
         };
       } else {
         status[config.name] = {
