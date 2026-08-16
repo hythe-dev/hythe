@@ -8,7 +8,7 @@
  * - Memory read: p95 <250ms
  * - Memory write: p95 <400ms
  * - Availability: 99.9%
- * - Fallback events: alert on any SQLite fallback
+ * - Vector availability: alert while sqlite-vec is unavailable
  */
 
 import { metrics, MetricNames } from './metrics.js';
@@ -59,10 +59,10 @@ export const SLOConfig: Record<string, SLOThreshold> = {
     minP95Samples: 20,
     windowSeconds: 300
   },
-  SQLITE_FALLBACK: {
-    name: 'sqlite_fallback',
-    description: 'SQLite fallback events (should be 0)',
-    maxCount: 0,  // Any fallback is an alert
+  VECTOR_FALLBACK: {
+    name: 'vector_fallback',
+    description: 'sqlite-vec availability',
+    maxCount: 0,
     windowSeconds: 60
   },
   AVAILABILITY: {
@@ -206,7 +206,7 @@ class SLOMonitor {
       }
     }
 
-    // Check SQLite fallback
+    // Check current backend availability and cumulative Redis fallback events.
     this.checkFallbackSLO();
 
     // Check availability
@@ -298,26 +298,24 @@ class SLOMonitor {
     return sorted[index];
   }
 
-  /**
-   * Check SQLite fallback SLO
-   */
+  /** Check current backend availability. Cumulative counters are telemetry only. */
   private checkFallbackSLO(): void {
-    const fallbackCount = metrics.getCounter(MetricNames.SQLITE_FALLBACK_TOTAL);
+    const vectorConnected = metrics.getGauge(MetricNames.VECTOR_CONNECTED);
+    const fallbackCount = metrics.getCounter(MetricNames.VECTOR_FALLBACK_TOTAL);
 
-    if (fallbackCount > 0) {
+    if (vectorConnected !== 1) {
       this.fireAlert({
-        sloName: 'sqlite_fallback',
+        sloName: 'vector_fallback',
         severity: 'critical',
-        message: `SQLite fallback detected (${fallbackCount} events). Advanced systems unavailable.`,
-        value: fallbackCount,
-        threshold: 0
+        message: `sqlite-vec unavailable; running in SQLite-only mode (${fallbackCount} fallback events).`,
+        value: vectorConnected,
+        threshold: 1
       });
+    } else {
+      this.resolveAlert('vector_fallback_critical', 'vector_backend_recovered');
     }
 
-    // Also check individual system fallbacks
     const redisFallback = metrics.getCounter(MetricNames.REDIS_FALLBACK_TOTAL);
-    const neo4jFallback = metrics.getCounter(MetricNames.NEO4J_FALLBACK_TOTAL);
-    const weaviateFallback = metrics.getCounter(MetricNames.WEAVIATE_FALLBACK_TOTAL);
 
     if (redisFallback > 0) {
       this.fireAlert({
@@ -329,25 +327,6 @@ class SLOMonitor {
       });
     }
 
-    if (neo4jFallback > 0) {
-      this.fireAlert({
-        sloName: 'neo4j_fallback',
-        severity: 'warning',
-        message: `Neo4j fallback detected (${neo4jFallback} events)`,
-        value: neo4jFallback,
-        threshold: 0
-      });
-    }
-
-    if (weaviateFallback > 0) {
-      this.fireAlert({
-        sloName: 'weaviate_fallback',
-        severity: 'warning',
-        message: `Weaviate fallback detected (${weaviateFallback} events)`,
-        value: weaviateFallback,
-        threshold: 0
-      });
-    }
   }
 
   /**

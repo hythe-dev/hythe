@@ -266,6 +266,44 @@ describe('Codex Follow-ups', () => {
       // These fields prove the tombstone codepath is wired
       expect(typeof result.vectorCleanup).toBe('number');
       expect(typeof result.vectorFailures).toBe('number');
+      expect(result).not.toHaveProperty('weaviateCleanup');
+      expect(result).not.toHaveProperty('weaviateFailures');
+    });
+  });
+
+  describe('Vector backend compatibility surface', () => {
+    it('reports sqlite-vec as the real backend while retaining equal legacy status aliases', async () => {
+      const readyRes = await fetch(`${BASE_URL}/ready`);
+      expect(readyRes.status).toBe(200);
+      const ready = await readyRes.json();
+      expect(ready.ready).toBe(true);
+      expect(ready.degraded).toBe(false);
+      expect(ready.systems.vector).toBe(true);
+      expect(ready.systems.weaviate).toBe(ready.systems.vector);
+
+      const statusRes = await fetch(`${BASE_URL}/system/status`, {
+        headers: { 'X-API-Key': API_KEY },
+      });
+      expect(statusRes.status).toBe(200);
+      const status = await statusRes.json();
+      expect(status.databases.vector.backend).toBe('sqlite-vec');
+      expect(status.databases.weaviate.backend).toBe('sqlite-vec');
+      expect(status.databases.weaviate.connected).toBe(status.databases.vector.connected);
+      expect(status.advanced.weaviate).toEqual(status.advanced.vector);
+    });
+
+    it('exports truthful vector metrics without ghost backend metrics', async () => {
+      const metricsRes = await fetch(`${BASE_URL}/metrics`, {
+        headers: { 'X-API-Key': API_KEY },
+      });
+      expect(metricsRes.status).toBe(200);
+      const body = await metricsRes.text();
+      expect(body).toContain('vector_connected_info 1');
+      expect(body).toContain('vector_fallback_total 0');
+      expect(body).not.toContain('weaviate_connected_info');
+      expect(body).not.toContain('weaviate_fallback_total');
+      expect(body).not.toContain('neo4j_connected_info');
+      expect(body).not.toContain('neo4j_fallback_total');
     });
   });
 });

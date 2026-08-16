@@ -111,38 +111,6 @@ export interface GraphQueryResult {
   }>;
 }
 
-export interface MemorySystemConfig {
-  vectorDatabase: {
-    type: 'weaviate' | 'sqlite-vec';
-    host: string;
-    port: number;
-    apiKey?: string;
-  };
-  graphDatabase: {
-    type: 'neo4j';
-    host: string;
-    port: number;
-    username: string;
-    password: string;
-  };
-  cache: {
-    type: 'redis';
-    host: string;
-    port: number;
-    ttl: number;
-  };
-  consolidation: {
-    enabled: boolean;
-    interval: number;
-    threshold: number;
-  };
-  embedding: {
-    model: string;
-    dimensions: number;
-    batchSize: number;
-  };
-}
-
 // Neural AI Platform Types
 export interface MemoryImportance {
   memoryId: string;

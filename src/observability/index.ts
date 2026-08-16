@@ -19,7 +19,6 @@ export {
   setRateLimiterBackend,
   // Systems
   setSystemConnected,
-  recordSQLiteFallback,
   // Dual-write
   setDualWriteEnabled,
   recordDualWriteResult,
