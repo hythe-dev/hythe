@@ -432,18 +432,12 @@ export async function performRelatedContextDiscovery(
     };
   }
 
-  const definitions = rootEntities
-    .map((entity) => directory.getEntityDefinition(entity.id, tenantId))
-    .map((value) => compactText(value, 1000))
-    .filter((value): value is string => value !== null);
-  const scopeCurrent = rootEntities.flatMap((entity) => {
-    const current = directory.getCurrentObservation(entity.name, tenantId, 25).current;
-    const fragments = [current?.canonicalFact, ...(Array.isArray(current?.contents) ? current.contents : [])];
-    return fragments.map((value) => compactText(value, 750)).filter((value): value is string => value !== null);
-  });
-  const semanticQuery = [intent, ...rootEntities.map((entity) => entity.name), ...definitions, ...scopeCurrent]
-    .join('\n')
-    .slice(0, 4000);
+  // The semantic query is the caller's intent, verbatim. Mixing in scope
+  // names, definitions, or the scope's own current observations makes the
+  // nearest neighbors the scope's own rows, which are then discarded as root
+  // matches — the intent stops conditioning the ranking at all. Scope
+  // conditioning comes from the graph leg and root filtering, not the query.
+  const semanticQuery = intent.slice(0, 4000);
 
   const candidateMap = new Map<string, CandidateAccumulator>();
   const entityReferenceCache = new Map<string, EntityInfo | null>();
@@ -460,10 +454,15 @@ export async function performRelatedContextDiscovery(
     return created;
   };
 
-  const semanticLimit = Math.min(
+  const semanticAttachBudget = Math.min(
     RELATED_CONTEXT_LIMITS.maxSemanticSeeds,
     Math.max(candidateLimit * 3, candidateLimit),
   );
+  // Fetch the full seed window regardless of the attach budget: hits on the
+  // root scope entity are filtered below without consuming the budget, so a
+  // scope with many of its own observations near the query cannot starve the
+  // attachable seeds behind them.
+  const semanticFetchLimit = RELATED_CONTEXT_LIMITS.maxSemanticSeeds;
   let semanticSearch: RelatedContextSemanticSearch;
   const semanticTimeoutMs = clampInteger(
     process.env.RELATED_CONTEXT_SEARCH_TIMEOUT_MS,
@@ -474,7 +473,7 @@ export async function performRelatedContextDiscovery(
   let semanticTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     semanticSearch = await Promise.race([
-      directory.searchRelatedContextSemantic(semanticQuery, tenantId, semanticLimit),
+      directory.searchRelatedContextSemantic(semanticQuery, tenantId, semanticFetchLimit),
       new Promise<RelatedContextSemanticSearch>((_, reject) => {
         semanticTimer = setTimeout(
           () => reject(new Error(`semantic discovery exceeded ${semanticTimeoutMs}ms`)),
@@ -492,18 +491,28 @@ export async function performRelatedContextDiscovery(
     if (semanticTimer) clearTimeout(semanticTimer);
   }
 
-  for (const result of semanticSearch.results.slice(0, semanticLimit)) {
+  let semanticSeedsAttached = 0;
+  let semanticSeedsRootFiltered = 0;
+  for (const result of semanticSearch.results.slice(0, semanticFetchLimit)) {
+    if (semanticSeedsAttached >= semanticAttachBudget) break;
     examinedCount++;
     const memoryType = String(result.memoryType || '').trim().toLowerCase();
     if (!['entity', 'observation', 'relation'].includes(memoryType)) continue;
     const payload = parseContent(result.content);
     if (!payload || directory.isConfidentialGraphRow(memoryType, payload, tenantId)) continue;
     const similarity = clampScore(result.semanticSimilarity);
+    let attached = false;
+    let rootTouched = false;
     for (const reference of semanticEntityReferences(memoryType, payload)) {
       const entity = uniqueEntityForReference(directory, tenantId, reference, entityReferenceCache);
       if (!entity) continue;
+      if (rootIdSet.has(entity.id)) {
+        rootTouched = true;
+        continue;
+      }
       const candidate = ensureCandidate(entity);
       if (!candidate) continue;
+      attached = true;
       if (!candidate.semanticMatches.some((match) => match.memoryId === result.id)) {
         candidate.semanticMatches.push({
           memoryId: String(result.id),
@@ -514,7 +523,19 @@ export async function performRelatedContextDiscovery(
         });
       }
     }
+    if (attached) semanticSeedsAttached++;
+    else if (rootTouched) semanticSeedsRootFiltered++;
   }
+  // Backend success with zero candidate attribution is a starved leg, not a
+  // healthy one. Say so instead of letting the ranking silently degenerate to
+  // graph adjacency.
+  const semanticStarved = semanticSearch.results.length > 0 && semanticSeedsAttached === 0;
+  const semanticDegraded = semanticSearch.degraded || semanticStarved;
+  const semanticReasons = semanticStarved
+    ? [...semanticSearch.reasons, semanticSeedsRootFiltered > 0
+        ? 'semantic_seeds_root_scope_only'
+        : 'semantic_seeds_unattributable']
+    : [...semanticSearch.reasons];
 
   let graphDegraded = false;
   const graphReasons: string[] = [];
@@ -706,12 +727,12 @@ export async function performRelatedContextDiscovery(
   });
 
   limited.forEach((candidate, index) => { candidate.rank = index + 1; });
-  const reasons = [...new Set([...semanticSearch.reasons, ...graphReasons])].sort();
+  const reasons = [...new Set([...semanticReasons, ...graphReasons])].sort();
   const result = {
     ...baseEnvelope,
     candidates: limited,
     degraded: {
-      semantic: semanticSearch.degraded,
+      semantic: semanticDegraded,
       graph: graphDegraded,
       reasons,
     },
