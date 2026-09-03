@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | **DRAFT v5** — revised after codex-hythe reviews aad3973c, 19826044, 89c01374 and 12281537 (all CHANGES REQUESTED); for re-review before any code. §2.10 is **RULED**: the H-series is `resultVersion: 3` (Tomas, 2026-09-03). |
-| Author | claude-hythe, 2026-09-03 |
+| Status | **DRAFT v5.1 / TAKEOVER REVIEW COMPLETE** — codex-hythe incorporated review 12281537 and closed the remaining cutover ambiguity after claude-hythe was temporarily disabled. Ready for owner review before any code. §2.10 is **RULED**: the H-series is `resultVersion: 3` (Tomas, 2026-09-03). |
+| Author | claude-hythe through v5; codex-hythe takeover revision v5.1, 2026-09-03 |
 | Provenance | Field report cc554c26 (claude-desktop-ws01) items 1–3 and 6; codex-hythe adversarial review b8456917 findings 1–3 and Q1–Q3; data audit 1e5d0dc6 HIGH 1; PR #8 reviews 5e486718 / 882d39c7; PR #9 reviews b2641137 / 99735a88 Q4; design review aad3973c findings 1–8 and Q1–Q9; design re-review 19826044 findings 1–4, precision items, and Q1–Q4; design re-review 89c01374 blockers 1–4 and open-question rulings; design re-review 12281537 issues 1–4 and §9 answers |
 | Gates | Nothing in this note is authorized to ship. Each section ends with the PR it would become; every PR needs its own review. No Pavilion action is implied. |
 
@@ -20,11 +20,11 @@ These gaps are why the field report's two most-requested features — `record` (
 This note proposes, in dependency order:
 
 - **A. An advancing current-head pointer** — an explicit, scope-level, same-scope-constrained pointer to the current head itself. A write whose parent *is* the pointed head advances the pointer atomically; a write from any other parent keeps its branch but never advances it. There is no anchor and no "max revision among descendants"; a broken pointer is reported as invalid, never guessed around.
-- **B. Atomic, integrity-bound reconciliation** — a checkpoint operation that names the exact expected live-head set and the expected pointer (both CAS), chooses one survivor, retires the rest, resolves divergent values **causally** (strict by default), and binds the normalized reconciliation record into the verified snapshot payload. Snapshots are never deleted.
+- **B. Version foundation plus atomic, integrity-bound reconciliation** — H2 first installs append-only fact/loop versions, an exact per-ledger-tuple coverage manifest, dual writes, and a verified backfill for every ledger-bound snapshot. H3 reconciliation then names the exact expected live-head set and pointer (both CAS), chooses one survivor, retires the rest, resolves divergent values **causally** (strict by default), and binds the normalized reconciliation record into the verified snapshot payload. Snapshots are never deleted.
 - **C. Versioned checkpoint operations** — an explicit `operation` discriminant (`write` | `record` | `patch` | `reconcile`) on `resultVersion: 3`. `record` and `patch` require the pointed head as parent and **conflict** instead of branching; they materialize the parent's state from its hash-verified payload. Legacy `write`, its v1 fingerprint, and the frozen v2 shapes stay byte-identical.
-- **D. Versioned fact/loop materialization** — append-only, integrity-bound version rows keyed by snapshot and change ordinal, verified as an exact bidirectional set against the hash-verified payloads and the digest-verified ledger *before* selection; the v3 view selects, per fact/loop, the newest version on the **accepted-value lineage** (the pointed head's parent chain plus what reconcile snapshots wrote themselves — merge inputs are causal history, never a source of accepted values) and surfaces everything else as divergent until a reconcile resolves it causally. The in-place tables remain for frozen v1 only.
+- **D. Versioned fact/loop materialization and selection** — append-only, integrity-bound coverage and version rows keyed by snapshot and change ordinal are verified as exact bidirectional sets against hash-verified payloads and the digest-verified ledger *before* selection. The v3 view selects the newest proven version on the **accepted-value lineage** and surfaces everything else as divergent until a reconcile resolves it causally. Rows without proven versions are never promoted into authoritative sections; the in-place tables remain the frozen v1/v2 view only.
 
-Order: C depends on A; D depends on B; nothing depends on D. Everything new that `resume` returns is a budgeted section; `asOf` gains only fixed-size fields. **Release rule (§2.10):** H1–H3 are internal-only increments of the v3 schema; v3 is published and Pavilion-deployed as a public schema only once H4 finalizes it.
+Implementation order: H1 pointer → H2 version foundation → H3 reconciliation → H4 v3 read surfaces → H5 record/patch. Everything new that `resume` returns is a budgeted section; `asOf` gains only fixed-size fields. **Release rule (§2.10):** H1–H4 are internal-only increments of the v3 schema; v3 is published and Pavilion-deployed as a public schema only once H5 finalizes it.
 
 ## 1. Facts on the ground (verified 2026-09-03)
 
@@ -51,7 +51,7 @@ Order: C depends on A; D depends on B; nothing depends on D. Everything new that
 7. **Closed accounting.** Anything new that `resume` returns beyond fixed-size scalars is a budgeted section with coverage, cursor, and explicit completeness.
 8. **Same-scope by structure** (aad3973c finding 1). Every new cross-reference between snapshots, and between a scope and a snapshot, is enforced structurally — composite keys on `(tenant_id, scope_key, state_id)` — not by convention.
 9. **Fail closed, never fail open** (aad3973c finding 2). An invariant violation is reported as invalid; it never degrades to a guess.
-10. **Result-version gate** (19826044 finding 4 — **RULED by Tomas, 2026-09-03: `resultVersion: 3`**; 89c01374 blocker 3). PRs #8/#9 define exact `resultVersion: 2` shapes, and the queue independently permits a #7+#8+#9 Pavilion deploy. H1 adds required `asOf` fields, a `heads` section and its coverage; H4 changes `currentFacts`/`openLoops` items and adds `divergentValues`. Therefore: **v2 stays exactly as #8/#9 shipped it** (frozen, deployable independently of this note); the **H-series is `resultVersion: 3`** = v2 + H-series fields, exact objects, same conditional-spread fingerprint rule (`resultVersion` bound into the checkpoint fingerprint only when ≠ 1). A v3 request on a server that only knows v2 fails input validation, never degrades. **Partial-release rule:** because H4 changes v3's `currentFacts`/`openLoops` items and adds `divergentValues`, the exact v3 schema is not final until H4. H1–H3 therefore merge to main as *internal* increments — contract-tested, not published to npm and not deployed to Pavilion as a public v3 schema. v3 is published/deployed once, after H4. Allocating a result version per increment was considered and rejected (four public versions for one feature). Everywhere below, "v3" means this single final version and "v2+" no longer appears.
+10. **Result-version gate** (19826044 finding 4 — **RULED by Tomas, 2026-09-03: `resultVersion: 3`**; 89c01374 blocker 3). PRs #8/#9 define exact `resultVersion: 2` shapes, and the queue independently permits a #7+#8+#9 Pavilion deploy. H1 adds required `asOf` fields and `heads`; H4 changes `currentFacts`/`openLoops` and adds `divergentValues`/`legacyValues`; H5 adds the final operation variants. Therefore: **v2 stays exactly as #8/#9 shipped it** (frozen, deployable independently of this note); the **H-series is `resultVersion: 3`** = v2 + H-series fields, exact objects, same conditional-spread fingerprint rule (`resultVersion` bound into the checkpoint fingerprint only when ≠ 1). A v3 request on a server that only knows v2 fails input validation, never degrades. **Partial-release rule:** the exact v3 schema is not final until H5. H1–H4 therefore merge to main as *internal* increments — contract-tested, not published to npm and not deployed to Pavilion as a public v3 schema. v3 is published/deployed once, after H5. Allocating a result version per increment was considered and rejected (five public versions for one feature). Everywhere below, "v3" means this single final version and "v2+" no longer appears.
 
 ## 3. A — The advancing current-head pointer
 
@@ -116,7 +116,7 @@ else:
 
 This is unconditional on `operation`: a legacy v1 `write` on the pointed head advances the pointer too (there is no way to extend the current head *without* becoming current, which is what "current" means), and a legacy `write` on any other parent never advances it. `reconcile` sets the pointer explicitly (§4). Nothing else can move it.
 
-**The A→B / A→C attack** (89c01374): pointer at A; a write A→B advances the pointer to B; a stale writer later writes A→C. C's parent is A ≠ pointer (B), so the pointer stays at B; C is a live divergent head with a higher revision and it is **not** current. Under v3 the old anchor rule would have picked C by revision; under v4 revision never enters the decision. This is a contract test in H1.
+**The A→B / A→C attack** (89c01374): pointer at A; a write A→B advances the pointer to B; a stale writer later writes A→C. C's parent is A ≠ pointer (B), so the pointer stays at B; C is a live divergent head with a higher revision and it is **not** current. An earlier draft's anchor rule would have picked C by revision; in v5.1 revision never enters the decision. This is a contract test in H1.
 
 **Concurrent children.** In the present single-process synchronous better-sqlite3 model two writers cannot interleave inside the transaction, so exactly one of two writes on the same pointed head runs first and advances the pointer; the second sees a parent that is no longer the pointer: `write` branches (frozen CAS) without advancing, `record`/`patch` conflict (§5.1). If independent writer processes are ever supported, the advance must run under an immediate write transaction with `SQLITE_BUSY` treated as retryable (19826044 Q8).
 
@@ -155,7 +155,7 @@ asOf.divergentHeadCount: integer      -- live heads other than the effective cur
 asOf.retiredHeadCount: integer
 ```
 
-The head list itself becomes a **budgeted v3 section** `heads` (aad3973c finding 6), ordered right after `capsule`: items are `{ stateId, revision, author, recordedAt, isCurrent, parentRetired }` for every live head, with coverage/cursor/completeness like every other section. Under H1 there are no retirements yet, so `parentRetired` is a required field that is always `false`; H2 starts setting it without changing the item shape (19826044 precision item). v1 `asOf.conflicts` and the frozen v2 bundle are unchanged.
+The head list itself becomes a **budgeted v3 section** `heads` (aad3973c finding 6), ordered right after `capsule`: items are `{ stateId, revision, author, recordedAt, isCurrent, parentRetired }` for every live head, with coverage/cursor/completeness like every other section. Under H1/H2 there are no retirements yet, so `parentRetired` is a required field that is always `false`; H3 starts setting it without changing the item shape (19826044 precision item). v1 `asOf.conflicts` and the frozen v2 bundle are unchanged.
 
 → **PR H1** (internal increment of v3): unique index, immutability + no-delete triggers, `eng4_scope_current` as a pointer, the advance rule in every checkpoint transaction, the resolver, first-write pointer, resume v3 `asOf` fields and `heads` section; v2 input schemas reject H-series fields. Contract tests: the A→B / A→C attack (pointer stays at B, C is divergent, `working` is B's); concurrent-children semantics; every `selection` value including `invalid-designation` (constructed by direct SQL); cross-scope pointer rejected by FK; per-column snapshot UPDATE, second digest write and DELETE rejected; v1 and v2 bundles byte-identical; `heads` budget omission with cursor.
 
@@ -173,10 +173,10 @@ The head list itself becomes a **budgeted v3 section** `heads` (aad3973c finding
   "survivor": "<stateId>",                 // ∈ expectedHeads
   "reason": "required free text",
   "strict": true,                          // default true (§6.3); false is the audited escape hatch
-  "resolutions": [ { "kind": "fact"|"loop", "id": "...", "divergentStateId": "...", "decision": "accept"|"reject" } ],
+  "resolutions": [ { "kind": "fact"|"loop", "id": "...", "divergentStateId": "...", "decision": "accept"|"reject", "acceptedOrdinal": 0 /* accept only */ } ],
   "rejectLineages": ["<divergent head stateId>", ...],   // optional shorthand: expands server-side to per-value rejects (§6.3)
   "state": {...},                          // full v1 working state — the reconciled truth
-  // factChanges / loopChanges / events / evidenceRefs as in write (an accept normally comes with the re-asserting change)
+  // factChanges / loopChanges / events / evidenceRefs as in write (every accept MUST name its matching re-asserting change)
 }
 ```
 
@@ -219,9 +219,9 @@ CREATE TABLE IF NOT EXISTS eng4_head_retirements (
 
 On idempotent replay of a reconcile, the server re-reads `eng4_snapshot_merge_inputs`, `eng4_head_retirements` and `eng4_divergence_resolutions` for the snapshot and verifies **exact parity** with the `reconciliation` record in the hash-verified payload: same input set, same retired set, same resolution set (including the deterministic expansion of `rejectLineages`), `snapshot.parent_state_id == payload.survivor`, every retirement's `retired_by_state_id == this snapshot`, and the pointer row (if still pointing here) consistent.
 
-**Resolution rows are also verified on every ordinary v3 `resume`** (12281537 issue 2): a row counts only if (a) the snapshot named by `resolved_by_state_id` is on the *current* accepted lineage, and (b) the row is present, byte-for-byte, in that snapshot's hash-verified `reconciliation.resolutions` (after expansion). A row that fails either test is a corruption → `CheckpointIntegrityError` for the resume; a direct `INSERT` of a well-formed same-scope row can therefore never mark a value resolved, because no immutable payload vouches for it. Any missing, extra, or altered row → `CheckpointIntegrityError`, never a reconstructed answer. This is the same fail-closed shape PR #8 uses for the change ledger.
+**Resolution rows are also verified on every ordinary v3 `resume`** (12281537 issue 2): the server derives the expected resolution set from every hash-verified reconciliation payload on the current accepted lineage, compares it bidirectionally by cardinality, keys, decision and accepted ordinal to the table rows for those snapshots, and then validates every `accept` against the referenced digest-verified change-ledger row and canonical payload value. A row counts only if its `resolved_by_state_id` is on the current accepted lineage. Missing, extra, or altered rows are corruption → `CheckpointIntegrityError`; a direct `INSERT` of a well-formed same-scope row can therefore never mark a value resolved because no immutable payload vouches for it. This is the same fail-closed shape PR #8 uses for the change ledger.
 
-### 4.4 `liveHeads()` after H2
+### 4.4 `liveHeads()` after H3
 
 A live head is a snapshot with **no child in its scope and no row in `eng4_head_retirements`**. Retired snapshots remain fetchable resources; `changesSince` still walks them.
 
@@ -243,7 +243,7 @@ Extending a retired parent with `operation: write` stays legal under the frozen 
 
 ## 5. C — Versioned checkpoint operations: `record` and `patch`
 
-Gated on H1; H2 recommended first so `conflict` has a way out.
+Scheduled as H5: gated on H1's pointer and H3's reconciliation so every `conflict` has a way out; H2/H4 supply the authoritative value model used by the final public v3 bundle.
 
 ### 5.1 Discriminant
 
@@ -302,13 +302,36 @@ CREATE TRIGGER IF NOT EXISTS trg_eng4_fact_versions_immutable BEFORE UPDATE ON e
 CREATE TRIGGER IF NOT EXISTS trg_eng4_fact_versions_no_delete BEFORE DELETE ON eng4_fact_versions
   BEGIN SELECT RAISE(ABORT, 'eng4: fact versions are append-only'); END;
 -- eng4_loop_versions + its two triggers: same shape over the loop columns, FK to (tenant_id, scope_key, loop_id).
+
+CREATE TABLE IF NOT EXISTS eng4_version_coverage (
+  tenant_id TEXT NOT NULL, scope_key TEXT NOT NULL, state_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('fact','loop')), ordinal INTEGER NOT NULL,
+  change_id TEXT NOT NULL,
+  disposition TEXT NOT NULL CHECK (disposition IN ('materialized','unversioned')),
+  reason TEXT CHECK (reason IS NULL OR reason IN ('pre-h2-inherited-owner')),
+  CHECK ((disposition = 'materialized' AND reason IS NULL) OR
+         (disposition = 'unversioned' AND reason IS NOT NULL)),
+  PRIMARY KEY (tenant_id, state_id, kind, ordinal),
+  FOREIGN KEY (tenant_id, state_id, kind, ordinal)
+    REFERENCES eng4_snapshot_changes(tenant_id, state_id, kind, ordinal),
+  FOREIGN KEY (tenant_id, scope_key, state_id)
+    REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+);
+-- UPDATE and DELETE are forbidden by append-only triggers as for version tables.
 ```
 
-A version in scope P can no longer reference a fact owned by scope Q; "append-only" is enforced by triggers, not prose.
+A version in scope P can no longer reference a fact owned by scope Q; "append-only" is enforced by triggers, not prose. The coverage manifest gives every digest-bound ledger tuple exactly one explicit disposition, so an intentionally unversioned historical change is distinguishable from a deleted or missing version row.
 
-**Integrity binding — bidirectional, before selection** (89c01374 blocker 4). A missing version row is invisible to a check that only inspects returned rows: selection would silently fall back to an older value. So the v3 read path first **enumerates the expected set** of version tuples `(state_id, kind, ordinal, change_id, value)` from two already-verified sources — the hash-verified payloads of every snapshot in the lineages under consideration (the accepted lineage plus every divergent lineage in play, §6.3) and the digest-verified change ledger `eng4_snapshot_changes` (which is where generated ids come from) — then compares that set to the version rows for those snapshots by **cardinality, keys and values**. Any missing, extra, or mismatched row → `CheckpointIntegrityError` for the whole resume; selection runs only on a verified set. H4's corruption fixture drops the append-only trigger, deletes one expected version row, and proves v3 resume fails closed.
+**Integrity binding — bidirectional, before selection** (89c01374 blocker 4). A missing version row is invisible to a check that only inspects returned rows: selection would silently fall back to an older value. The durable cutover marker is the existing immutable `eng4_state_snapshots.changes_hash`:
 
-Every materialization (`write`, `record`, `patch`, `reconcile`) appends version rows **and** performs today's in-place update. The in-place tables are the frozen v1/v2 view (last-writer-wins, unchanged); versions are the v3 view. The same `factId` may appear more than once in one checkpoint; the total order over versions **within one lineage** is `(snapshot revision, change ordinal)` — that order is never used to compare across lineages (§6.3).
+- `changes_hash IS NOT NULL` means the snapshot has a digest-verified ledger and therefore **must** have one exact coverage row per ledger tuple; tuples marked `materialized` must have the exact version value implied by that ledger and its hash-verified payload, while `unversioned` is permitted only for a historical value that cannot be reconstructed exactly;
+- `changes_hash IS NULL` is pre-ledger history and must have zero ledger, coverage, and version rows. Its fact/loop effects remain unversioned and non-authoritative in v3 until explicitly re-asserted. A ledger row under a null digest is corruption, not legacy history.
+
+H2 installs the version and coverage tables and, in the same migration, performs a **verified backfill of every existing snapshot with non-null `changes_hash`**. For each such snapshot it verifies payload integrity and ledger digest/contiguity, emits one coverage row per `(state_id, kind, ordinal, change_id)`, and inserts a version whenever the complete post-change value is reconstructible. Fact changes and loop creations are reconstructible from the payload, ledger, snapshot metadata and immutable rows. A historical loop update that omitted `owner` may have inherited an overwritten pre-ledger value; if that exact value cannot be proven, its coverage is `unversioned` with reason `pre-h2-inherited-owner` instead of guessing. Any integrity failure—or any null-digest snapshot that already has ledger, coverage, or version rows—aborts the migration. The backfill is all-or-nothing. Only after it succeeds are dual writes enabled for all subsequent `write`, `record`, `patch`, and `reconcile` operations, regardless of requested result version; those writes know the materialized result and therefore always emit `materialized` coverage plus an exact version. This removes the ambiguous state where a missing version could be mistaken for intentional pre-version history.
+
+The v3 read path enumerates the expected tuples for every snapshot in the lineages under consideration and compares them to coverage and version rows by **cardinality, keys, disposition, deterministic reason and values** before selection. A null-digest snapshot with any ledger/coverage/version row; a missing, extra or mismatched coverage row; a version for `unversioned` coverage; or a missing, extra or mismatched version for `materialized` coverage is `CheckpointIntegrityError` for the whole resume. H2's direct database tests exercise the verifier before the public read model exists; H4 exercises the same verifier through `resume`. Corruption fixtures drop an append-only trigger, delete one coverage row or one expected version row, and prove fail-closed behavior.
+
+Every post-H2 materialization appends version rows **and** performs today's in-place update. The in-place tables are the frozen v1/v2 view (last-writer-wins, unchanged); versions are the v3 view. The same `factId` may appear more than once in one checkpoint; the total order over versions **within one lineage** is `(snapshot revision, change ordinal)` — that order is never used to compare across lineages (§6.3).
 
 ### 6.3 v3 selection: the accepted-value lineage, and causal resolution of divergence
 
@@ -317,11 +340,13 @@ Two ancestries, kept apart (19826044 finding 1):
 - **`historicalAncestry(head)`** — everything reachable backwards through `parent_state_id` **and** `eng4_snapshot_merge_inputs`. Causal history; what resources and `changesSince` walk. Never a source of accepted values.
 - **`acceptedLineage`** — the pointed head and its `parent_state_id` chain. A reconcile snapshot is on this line, so whatever the reconcile **itself** wrote is accepted; the branches it merged are not.
 
-For each `fact_id` / `loop_id`, `resume` v3 returns the newest version (order `(revision, ordinal)` *within the accepted lineage*) whose `state_id ∈ acceptedLineage`. Every version outside the accepted lineage is a **divergent value**, returned in the budgeted section `divergentValues` (`{ kind, id, lineageHead, stateId, revision, ordinal, value, isV1CurrentValue, resolved }`), never merged silently.
+For each `fact_id` / `loop_id`, `resume` v3 first finds the newest **coverage tuple** (order `(revision, ordinal)` *within the accepted lineage*) whose `state_id ∈ acceptedLineage`. It returns the corresponding version only when that tuple is `materialized`; an `unversioned` newest tuple suppresses the id under §6.4 and never falls back to an older value. Every materialized version outside the accepted lineage is a **divergent value**, returned in the budgeted section `divergentValues` (`{ kind, id, lineageHead, stateId, revision, ordinal, value, isV1CurrentValue, resolved }`), never merged silently.
 
-**Divergent lineages and terminal values.** For a fact/loop, a *divergent lineage* is the chain of any live or retired head that is not on the accepted lineage, taken from its fork point with the accepted lineage forward. Its *terminal value* is the newest version of that id on that chain. Only terminal values need resolving; interior versions are history.
+**Divergent lineages and terminal changes.** For a fact/loop, a *divergent lineage* is the chain of any live or retired head that is not on the accepted lineage, taken from its fork point with the accepted lineage forward. Its *terminal change* is the newest coverage tuple for that id on that chain. A `materialized` terminal has a terminal value; an `unversioned` terminal is opaque. Only terminal changes need resolving; interior versions are history.
 
-**Resolution is causal, never revision-relative** (89c01374 blocker 2). A divergent terminal value is *resolved* iff a **verified** (§4.3) `eng4_divergence_resolutions` row exists for `(kind, id, divergentStateId = that terminal version's state_id)` written by a reconcile snapshot on the accepted lineage. Revision numbers play no part: survivor S holding *good@12* while non-survivor R holds *bad@11* leaves *bad* **unresolved** — it is a terminal value on a divergent lineage with no resolution row (the counterexample test).
+An H2-backfilled terminal tuple whose coverage is `unversioned` is an **opaque terminal**: its id and provenance are proven but its historical value is not. Reconcile may only `reject` it (directly or through `rejectLineages`); `accept` cannot pass exact-value verification. It may not remain unresolved even with `strict: false`, because v3 has no truthful value to expose in `divergentValues`. The typed error lists `(kind, id, divergentStateId, reason)`, and the branch can instead be extended with a complete re-assertion before reconciliation. An unversioned terminal on the survivor lineage remains non-authoritative under §6.4 unless the reconcile itself re-asserts it.
+
+**Resolution is causal, never revision-relative** (89c01374 blocker 2). A divergent terminal change is *resolved* iff a **verified** (§4.3) `eng4_divergence_resolutions` row exists for `(kind, id, divergentStateId = that terminal change's state_id)` written by a reconcile snapshot on the accepted lineage. Revision numbers play no part: survivor S holding *good@12* while non-survivor R holds *bad@11* leaves *bad* **unresolved** — it is a terminal value on a divergent lineage with no resolution row (the counterexample test).
 
 **`accept` is bound to a matching change in the same request** (12281537 issue 2). An `accept` resolution is valid only if the reconcile's own `factChanges`/`loopChanges` contain, at a stated ordinal, a change for that id whose canonical value (RFC 8785 over the fields the version stores) **equals** the divergent terminal value; the resolution row records `accepted_ordinal`, and the reconciliation payload binds `(kind, id, divergentStateId, decision, acceptedOrdinal)`. An `accept` without such a change is a typed error and nothing is written — strict can never pass with an accept while the accepted lineage still holds the old value. A `reject` needs no change (the accepted value or absence stands) but is payload-bound the same way. **`rejectLineages`** (Q4) is a shorthand limited to exact live-or-retired divergent head ids named in the request: it expands deterministically, inside the CAS transaction, to per-terminal-value rejects, sorted, and the expansion is written into the payload; the raw sorted shorthand is what the fingerprint binds so replay can locate the snapshot before recomputation, after which payload/row expansion parity is verified. Overlapping or contradictory explicit resolutions are rejected.
 
@@ -329,18 +354,22 @@ For each `fact_id` / `loop_id`, `resume` v3 returns the newest version (order `(
 CREATE TABLE IF NOT EXISTS eng4_divergence_resolutions (
   tenant_id TEXT NOT NULL, scope_key TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('fact','loop')), change_id TEXT NOT NULL,
-  divergent_state_id TEXT NOT NULL,         -- the terminal version's snapshot
+  divergent_state_id TEXT NOT NULL,         -- the terminal change's snapshot
   resolved_by_state_id TEXT NOT NULL,       -- the reconcile snapshot (on the accepted lineage)
   decision TEXT NOT NULL CHECK (decision IN ('accept','reject')),
   accepted_ordinal INTEGER,                 -- NOT NULL iff decision='accept': the reconcile's own change that re-asserts the value
+  CHECK ((decision = 'accept' AND accepted_ordinal IS NOT NULL) OR
+         (decision = 'reject' AND accepted_ordinal IS NULL)),
   PRIMARY KEY (tenant_id, scope_key, kind, change_id, divergent_state_id),
   FOREIGN KEY (tenant_id, scope_key, divergent_state_id)   REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
-  FOREIGN KEY (tenant_id, scope_key, resolved_by_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+  FOREIGN KEY (tenant_id, scope_key, resolved_by_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
+  FOREIGN KEY (tenant_id, resolved_by_state_id, kind, accepted_ordinal)
+    REFERENCES eng4_snapshot_changes(tenant_id, state_id, kind, ordinal)
 );
 -- append-only triggers as for version tables
 ```
 
-**Reconcile behaviour.** A reconcile enumerates every unresolved divergent terminal value across the heads it is merging, matches them against its `resolutions`, and — under `strict: true`, the **default** (89c01374 ruling on §9.2) — fails with a typed error listing the unresolved `(kind, id, divergentStateId)` tuples if any remain, writing nothing. `strict: false` is the audited escape hatch: the reconcile commits, `reconciled.unresolvedDivergent` carries the counts, and the values stay listed as divergent with `resolved: false` until a later reconcile resolves them.
+**Reconcile behaviour.** A reconcile enumerates every unresolved divergent terminal change across the heads it is merging and matches them against its `resolutions`. Opaque terminals must be rejected as described above. For materialized terminals, `strict: true`, the **default** (89c01374 ruling on §9.2), fails with a typed error listing the unresolved `(kind, id, divergentStateId)` tuples if any remain, writing nothing. `strict: false` is the audited escape hatch for materialized values only: the reconcile commits, `reconciled.unresolvedDivergent` carries the counts, and the values stay listed as divergent with `resolved: false` until a later reconcile resolves them.
 
 Codex's v2 attack (S *good@10*, R *bad@12*, reconcile picks S without touching F): under strict default the reconcile is **refused** until it carries a resolution for F; under `strict: false` it commits with *good* accepted and *bad* listed divergent/unresolved. Either way *bad* never becomes accepted by revision.
 
@@ -348,29 +377,29 @@ Codex's v2 attack (S *good@10*, R *bad@12*, reconcile picks S without touching F
 
 Provenance on every v3 item: `{ stateId, revision, ordinal, outsideAcceptedLineage: boolean }`.
 
-### 6.4 Rows that predate H4
+### 6.4 Rows without a proven H2 version
 
-A fact/loop id with **no verified version on the accepted lineage is never authoritative in v3 — whether or not a pointer exists** (12281537 issue 1). It is omitted from `currentFacts`/`openLoops` and exposed only in the non-authoritative section `legacyValues` as `{ kind, id, value: <in-place row>, provenance: null, accepted: false }`. The suppressed ids are accounted in `currentFacts`/`openLoops` coverage as `omittedReason: 'unversioned'`, `includedCount: 0` for those ids, `totalCount` including them, `contentComplete: false`, `nextCursor: null`, with `legacyValues` as the explicit alternate retrieval path (12281537 Q3). The id becomes authoritative only when a reconcile (or any later write on the accepted lineage) re-asserts it — creating a verified version — or when a **proven backfill** creates one. The attack this closes: a legacy scope where the survivor's last write of F was *good* but the in-place row holds *bad* from the losing branch; the first strict reconcile has no version rows to see the divergence, so with no F change it commits — and F must then be **absent** from accepted facts with *bad* still in `legacyValues`, never promoted by the mere existence of a pointer (H4 test). Core H4 ships deterministic `null` provenance for every pre-H4 row — no flag, no second truth mode (19826044 Q4). PR #8's ledger allows the backfill for changes written since #8 (`eng4_snapshot_changes` gives `(state_id, kind, ordinal, change_id)`; the verified payload gives the values), reconstructed with full provenance for that window and nothing older, as a **separate reviewed migration PR after H4**.
+A fact/loop id whose **newest accepted-lineage change has no verified materialized version is never authoritative in v3 — whether or not an older version or pointer exists** (12281537 issue 1). It is omitted from `currentFacts`/`openLoops` and exposed only in the non-authoritative section `legacyValues` as `{ kind, id, value: <in-place row>, provenance: null, accepted: false }`. The suppressed ids are accounted in `currentFacts`/`openLoops` coverage as `omittedReason: 'unversioned'`, `includedCount: 0` for those ids, `totalCount` including them, `contentComplete: false`, `nextCursor: null`, with `legacyValues` as the explicit alternate retrieval path (12281537 Q3). The id becomes authoritative only when a reconcile (or any later write on the accepted lineage) re-asserts it — creating a verified version — or through H2's proven ledger-bound backfill. Anything older than the ledger remains unknowable and cannot be backfilled by inference. The attack this closes: a legacy scope where the survivor's last write of F was *good* but the in-place row holds *bad* from the losing branch; the first strict reconcile has no version rows to see the divergence, so with no F change it commits — and F must then be **absent** from accepted facts with *bad* still in `legacyValues`, never promoted by the mere existence of a pointer (H4 test). Core H4 ships deterministic `null` provenance for every genuinely unversioned row — no flag, no second truth mode (19826044 Q4).
 
 ### 6.5 Legacy scopes (no pointer) under v3 — no accepted values
 
 A non-empty scope without a pointer (pre-H1, never reconciled) has **no accepted lineage**, and v3 does not synthesize one from max revision (89c01374 ruling on §9.4): `currentFacts` and `openLoops` are returned **empty** with coverage `omittedReason: 'undesignated'`, `includedCount: 0`, `totalCount: <suppressed legacy-row count>`, `contentComplete: false`, `nextCursor: null` (12281537 Q3), and the in-place rows are exposed only in the non-authoritative budgeted section `legacyValues`. `working` keeps the explicitly flagged `max-revision` legacy selection from H1 (it is a whole snapshot, not a merged value). The scope leaves this mode with its first `reconcile` — after which §6.4 still governs every id that has no verified version on the new accepted lineage. That first reconcile on `hythe-rehydration-loop` is the acceptance canary.
 
-→ **PR H2** (internal increment of v3; depends on H1; **the data foundation for reconciliation**): unique same-scope parents, two version tables with append-only triggers, dual materialization on every op, bidirectional version-set verification. No read-model change yet beyond the tests. → **PR H4** (depends on H3): `acceptedLineage` vs `historicalAncestry` (one deduplicating indexed recursive CTE each, computed on demand — fork points are **not** persisted on retirement rows because a later reconcile can choose a different survivor and move them, 12281537 Q2; cache only after profiling, keyed by pointer + head/resolution set + schema version), v3 selection, `divergentValues` and `legacyValues` sections, `'undesignated'`/`'unversioned'` coverage, `null` provenance for pre-H4 rows. Contract tests (H2 + H4 together): the §6.1 attack; the §6.3 merge-input attack (S good@10, R bad@12) under strict (refused) and non-strict (good accepted, bad divergent); the **lower-revision counterexample** (S good@12, R bad@11 → bad still unresolved); the **unversioned-after-reconcile attack** (legacy scope, survivor's F=good unversioned, in-place F=bad from the losing branch, strict reconcile with no F change → F absent from accepted facts, bad in `legacyValues`); loop close off-lineage stays open; version row tampering/deletion rejected by trigger; **corruption fixture**: trigger dropped, one expected version deleted → v3 resume fails closed; cross-scope version rejected by FK; payload/ledger mismatch fails closed; pre-H4 rows report `null`; legacy scope returns empty accepted sections + `legacyValues`; budget omission of `divergentValues` with cursor.
+→ **PR H2** (internal increment of v3; depends on H1; **the data foundation for reconciliation**): unique same-scope parents, version and coverage tables with append-only triggers, transactional verified backfill of every non-null-`changes_hash` snapshot, explicit `unversioned` coverage where an exact historical result is unprovable, dual materialization on every later operation, and the shared bidirectional verifier exercised directly in tests. No public read-model change. → **PR H4** (depends on H3): `acceptedLineage` vs `historicalAncestry` (one deduplicating indexed recursive CTE each, computed on demand — fork points are **not** persisted on retirement rows because a later reconcile can choose a different survivor and move them, 12281537 Q2; cache only after profiling, keyed by pointer + head/resolution set + schema version), v3 selection, `divergentValues` and `legacyValues` sections, `'undesignated'`/`'unversioned'` coverage, and `null` provenance for genuinely unversioned rows. Contract tests (H2 + H4 together): verified-backfill success and all-or-nothing failure; null-digest rows plus missing/extra coverage fail closed; omitted-owner historical loop update becomes explicit `unversioned` coverage; every post-H2 tuple is `materialized`; opaque divergent terminals must be rejected even under non-strict reconcile; the §6.1 attack; the §6.3 merge-input attack (S good@10, R bad@12) under strict (refused) and non-strict (good accepted, bad divergent); the **lower-revision counterexample** (S good@12, R bad@11 → bad still unresolved); the **unversioned-after-reconcile attack** (legacy scope, survivor's F=good unversioned, in-place F=bad from the losing branch, strict reconcile with no F change → F absent from accepted facts, bad in `legacyValues`); loop close off-lineage stays open; version/coverage row tampering or deletion rejected by trigger; **corruption fixtures**: triggers dropped, one expected coverage or version row deleted → v3 resume fails closed; cross-scope version rejected by FK; payload/ledger mismatch fails closed; legacy scope returns empty accepted sections + `legacyValues`; budget omission of `divergentValues` with cursor.
 
 ## 7. Rollout and acceptance
 
 | Step | Content | Gate | Acceptance canary (on an internal build; v3 is public only after H5) |
 |---|---|---|---|
 | H1 | advancing pointer, resolver, immutability/no-delete triggers, resume v3 `asOf` + `heads` | codex acceptance of this note | the A→B / A→C attack test; `resume` v3 on `hythe-rehydration-loop` reports `selection: 'max-revision'`, `liveHeadCount: 13`, a complete `heads` section with `parentRetired: false` throughout; a fresh scope's first write sets the pointer; direct-SQL cross-scope pointer, per-column snapshot UPDATE, second digest write, and DELETE are all rejected; v2 requests carrying H-series fields fail validation |
-| H2 | versioned fact/loop materialization + dual writes + bidirectional parity (data foundation) | codex review; H1 merged | every checkpoint on `hythe-rehydration-loop` from H2 on produces verified version rows; corruption fixture fails closed |
-| H3 | reconcile: head mechanics + causal resolution (strict) + resolution verification | codex review; **H2 merged** | one `reconcile` on `hythe-rehydration-loop` naming all 13 heads and the null pointer; strict refusal until resolutions are supplied; afterwards `divergentHeadCount: 0`, `retiredHeadCount: 12`, the pointer is the reconcile snapshot, every retired snapshot resource resolves, replay parity holds |
-| H4 | v3 read model: accepted-lineage selection, `divergentValues`, `legacyValues`, coverage reasons | codex review; H3 merged | the §6.1, §6.3, lower-revision and unversioned-after-reconcile attack tests; legacy scope reports no accepted values; pre-H4 rows report `null` |
+| H2 | versioned fact/loop materialization + exact coverage manifest + verified ledger-bound backfill + dual writes + bidirectional parity (data foundation) | codex review; H1 merged | every ledger tuple gets exact `materialized` or justified `unversioned` coverage or the migration rolls back; null-digest history has no ledger/coverage/version rows; every later checkpoint produces verified materialized coverage and version rows; direct verifier corruption fixtures fail closed |
+| H3 | reconcile: head mechanics + causal resolution (strict) + resolution verification | codex review; **H2 merged** | one `reconcile` on `hythe-rehydration-loop` naming all 13 heads and the null pointer; strict refusal until materialized terminals are resolved and every opaque terminal is rejected; afterwards `divergentHeadCount: 0`, `retiredHeadCount: 12`, the pointer is the reconcile snapshot, every retired snapshot resource resolves, replay parity holds |
+| H4 | v3 read model: accepted-lineage selection, `divergentValues`, `legacyValues`, coverage reasons | codex review; H3 merged | the §6.1, §6.3, lower-revision and unversioned-after-reconcile attack tests; legacy scope reports no accepted values; genuinely pre-ledger rows report `null` |
 | H5 | `record` / `patch`; **finalizes and publishes v3** | codex review; H1 and H3 merged (H4 for the publish) | `record` against a non-pointer parent → `conflict`; a pointer-parent `record` returns loop ids without a `resume` round-trip and advances the pointer (field report item 2 closed end to end) |
 
 Order is H1 → H2 → H3 → H4 → H5 (12281537 issue 3: version data precedes any retirement of a branch). H1–H4 merge to main as internal increments: contract-tested, not published to npm, not deployed to Pavilion as a public schema. The first v3 publish/deploy follows H5 and is itself deploy-gated by the owner.
 
-## 8. Resolved in v2 (from review aad3973c)
+## 8. Resolved in design draft v2 (from review aad3973c)
 
 | # | Finding | Resolution |
 |---|---|---|
@@ -391,7 +420,7 @@ From re-review 19826044:
 | 2 | H4 versions not same-scope or integrity-safe | unique `(tenant, scope, id)` parents, composite FKs at both ends, append-only triggers, read-path verification against verified payload + verified ledger (§6.2) |
 | 3 | snapshot immutability trigger incomplete | exactly one legal transition (`changes_hash` NULL→NOT NULL, all other columns identical), DELETE forbidden, per-column tests, table_info parity test (§3.1) |
 | 4 | v2 release-freeze dependency | explicit gate: H-series on `resultVersion: 3` recommended, v2 stays as shipped; needs owner ruling (§2.10) |
-| p | `parentRetired` before H2 | required, constant `false` under H1; shape unchanged by H2 (§3.5) |
+| p | `parentRetired` before retirement support | required, constant `false` under H1/H2; shape unchanged when H3 begins setting it (§3.5) |
 | p | reconcile parity scope | also verifies `parent_state_id == survivor` and every `retired_by_state_id == this snapshot` (§4.3) |
 | p | version total order | `(snapshot revision, change ordinal)`; same id may repeat within a checkpoint (§6.2) |
 
@@ -401,7 +430,7 @@ From re-review 89c01374:
 |---|---|---|
 | 1 | anchor + max-revision-among-descendants still promotes a stale parent (A→B, A→C) | `eng4_scope_current` is an **advancing pointer to the head**; a write advances it only if its parent is the pointed head; no revision comparison anywhere in selection; A→B/A→C is a contract test; concurrent-child semantics stated (§3.2, §3.2a, §3.3) |
 | 2 | divergence resolution was revision-relative | causal resolution: divergent lineages' terminal values must be resolved by an explicit `eng4_divergence_resolutions` row written by a reconcile on the accepted lineage; lower-revision counterexample (S good@12, R bad@11) is a test; strict by default (§6.3) |
-| 3 | v3 ruling contradicted by v2 references; partial release would re-freeze | every H-series clause now says v3; v2 input schemas reject H-series fields; H1–H3 are internal increments, v3 published only after H4 (§0, §2.2, §2.10, §4, §5, §7) |
+| 3 | v3 ruling contradicted by v2 references; partial release would re-freeze | every H-series clause now says v3; v2 input schemas reject H-series fields; H1–H4 are internal increments, v3 published only after H5 (§0, §2.2, §2.10, §4, §5, §7) |
 | 4 | missing version rows undetectable | bidirectional exact-set parity (cardinality, keys, values) against verified payloads + ledger **before** selection; corruption fixture with trigger dropped (§6.2) |
 | q | §9.2 strict default | strict by default; `strict: false` audited escape hatch (§4.1, §6.3) |
 | q | §9.3 trigger construction | static audited SQL + `table_info` coverage test + per-column mutation tests; no generated SQL (§3.1) |
@@ -422,11 +451,19 @@ From re-review 12281537:
 
 Q1–Q9 answers are incorporated where cited.
 
-## 9. Open questions for re-review
+From codex-hythe takeover audit v5.1:
 
-1. **H2 without a read-model change.** H2 writes version rows and verifies them but v3 `resume` does not yet read them (that is H4). Is a data-only increment acceptable as a merge, or should H2 at least expose the parity check through a diagnostics-only path so Pavilion's internal build can be verified before H3?
-2. **`accept` equality (§6.3).** Canonical equality of the re-asserted change to the divergent terminal value is strict by design. Is there a legitimate "accept with amendment" case (accept the divergent claim but correct a ref), and if so should it be modelled as `reject` + a fresh change rather than a looser `accept`?
-3. **`legacyValues` budget priority.** It is non-authoritative; I propose it goes last in the v3 section order so it is the first thing a tight budget omits. Agree?
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | version parity could not distinguish an intentional historical gap from a deleted version | exact append-only `eng4_version_coverage` row for every digest-bound ledger tuple; bidirectional ledger/coverage/version verification (§6.2) |
+| 2 | a historical loop update that omitted `owner` may not be reconstructible from the payload after later in-place writes | never guess: mark that tuple `unversioned` with the constrained reason; never fall back to an older accepted value; opaque divergent terminals can only be rejected (§6.2–6.4) |
+
+## 9. Takeover rulings (v5.1)
+
+1. **H2 remains data-only.** It exposes no diagnostics-only public path: that would create a third primitive and a temporary contract. H2 acceptance uses direct migration/database contract tests for verified backfill, dual writes and the shared parity verifier. H4 invokes the same verifier through `resume` before v3 can be published.
+2. **`accept` equality stays exact.** “Accept with amendment” is modelled as `reject` of the divergent terminal value plus a fresh accepted-lineage change. Loosening equality would make `accept` ambiguous and weaken the audit record.
+3. **`legacyValues` is last in v3 section order.** It is non-authoritative and therefore the first section omitted under a tight budget. Its coverage and cursor still obey the closed-accounting contract; authoritative sections are never displaced to include it.
+4. **No persisted fork-point cache.** Fork points are derived by a deduplicating indexed recursive CTE because a later reconcile may choose a different survivor. Any future cache requires profiling evidence and keys on the pointer, relevant head/resolution set, and schema version.
 
 ## 10. Explicitly out of scope
 
