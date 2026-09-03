@@ -4797,6 +4797,74 @@ export class MemoryManager {
     }
   }
 
+  /**
+   * Rehydration capsules for an entity (resume resultVersion=2): every
+   * observation whose metadata.kind === 'capsule' that is NOT superseded by
+   * any observation on the entity, newest first. Supersession is computed
+   * over ALL of the entity's observations (bounded window), so a non-capsule
+   * observation that supersedes a capsule still retires it — but an unrelated
+   * newer append never hides one (data-audit HIGH 1, 2026-09-03).
+   */
+  getCapsuleObservations(
+    entityId: string,
+    tenantId: string
+  ): { capsules: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
+    const entityRow = this.db.prepare(
+      `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
+    ).get(entityId, tenantId) as { content: string } | undefined;
+    if (!entityRow) return { capsules: [], candidatesConsidered: 0 };
+    let entityName: string | null = null;
+    try {
+      const content = JSON.parse(entityRow.content || '{}');
+      if (this.isConfidentialMessageSearchItem('entity', content)) return { capsules: [], candidatesConsidered: 0 };
+      entityName = typeof content?.name === 'string' ? content.name : null;
+    } catch {
+      return { capsules: [], candidatesConsidered: 0 };
+    }
+    if (!entityName) return { capsules: [], candidatesConsidered: 0 };
+    const canonicalKey = this.normalizeEntityLookup(entityName);
+
+    const rows = this.db.prepare(`
+      SELECT sm.id, sm.content, sm.created_by, sm.created_at
+      FROM graph_lookup_keys glk
+      JOIN shared_memory sm
+        ON sm.id = glk.memory_id AND sm.tenant_id = glk.tenant_id
+      WHERE glk.tenant_id = ?
+        AND glk.lookup_key = ?
+        AND glk.memory_type = 'observation'
+        AND glk.key_kind = 'entity_name'
+        AND sm.memory_type = 'observation'
+      ORDER BY sm.created_at DESC, sm.rowid DESC
+      LIMIT 500
+    `).all(tenantId, canonicalKey) as Array<{ id: string; content: string; created_by: string; created_at: string }>;
+
+    const parsed = rows.map((row) => {
+      let content: any;
+      try { content = JSON.parse(row.content); } catch { content = { raw: row.content }; }
+      return { row, content };
+    }).filter(({ row }) => !this.isConfidentialGraphRow('observation', row.content, tenantId));
+
+    const supersededIds = new Set<string>();
+    for (const { content } of parsed) {
+      const supersedes = Array.isArray(content?.metadata?.supersedes)
+        ? content.metadata.supersedes
+        : Array.isArray(content?.supersedes) ? content.supersedes : [];
+      for (const id of supersedes) if (typeof id === 'string' && id.trim()) supersededIds.add(id.trim());
+    }
+
+    const capsules = parsed
+      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !supersededIds.has(row.id))
+      .map(({ row, content }) => ({
+        observationId: String(row.id),
+        entityId,
+        recordedAt: String(content?.timestamp || row.created_at),
+        author: String(content?.addedBy || row.created_by || ''),
+        canonicalFact: typeof content?.metadata?.canonicalFact === 'string' ? content.metadata.canonicalFact : null,
+        contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
+      }));
+    return { capsules, candidatesConsidered: parsed.length };
+  }
+
   findEntitiesByNameOrAlias(entityName: string, tenantId: string): any[] {
     const queryVariants = new Set(this.entityQueryVariants(entityName));
     if (queryVariants.size === 0) return [];

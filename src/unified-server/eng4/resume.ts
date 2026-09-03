@@ -31,11 +31,13 @@
  */
 import type DatabaseType from 'better-sqlite3';
 import type {
+  CapsuleObservation,
   ContentHandle,
   CurrentFact,
   InboxItem,
   OpenLoop,
   ResumeBundle,
+  ResumeCapsule,
   ResumeParams,
   ResumeSectionName,
   SectionCoverage,
@@ -52,6 +54,13 @@ export const MAX_INLINE_MESSAGE_BODY_CHARS = 2000;
 export interface ResumeDirectory extends EntityDirectory {
   /** Charter/creation prose for an entity — NEVER current state. */
   getEntityDefinition(entityId: string, tenantId: string): string | null;
+  /**
+   * Every observation on the entity with metadata.kind === 'capsule' that is
+   * NOT superseded by any observation on that entity, newest first, plus the
+   * number of observations examined. Selection is BY KIND: an unrelated newer
+   * append must not hide a capsule (data-audit HIGH 1, 2026-09-03).
+   */
+  getCapsuleObservations(entityId: string, tenantId: string): { capsules: CapsuleObservation[]; candidatesConsidered: number };
 }
 
 const SECTION_ORDER: readonly ResumeSectionName[] = [
@@ -107,11 +116,15 @@ export function performResume(
   const coverageOf = (entries: Array<[ResumeSectionName, SectionCoverage]>) =>
     Object.fromEntries(entries) as Record<ResumeSectionName, SectionCoverage>;
 
+  const resultVersion: 1 | 2 = params.resultVersion === 2 ? 2 : 1;
+  const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0 };
+
   if (!resolved.scopeKey) {
     // Fail-closed resolution: explicit nulls (+ candidates when ambiguous),
     // all sections empty but ACCOUNTED — never a silently-empty bundle.
     return {
-      schemaVersion: 1,
+      schemaVersion: resultVersion,
+      ...(resultVersion === 2 ? { capsule: emptyCapsule } : {}),
       resolvedScope: resolved,
       asOf: { assembledAt, stateId: null, revision: null, stateAgeSec: null, stale: true, conflicts: [] },
       definition: null,
@@ -142,11 +155,20 @@ export function performResume(
     : null;
 
   const working: WorkingState | null = currentRow ? JSON.parse(currentRow.state_json) : null;
-  const definition = resolved.projectId
-    ? directory.getEntityDefinition(resolved.projectId, tenantId)
-    : resolved.taskId
-      ? directory.getEntityDefinition(resolved.taskId, tenantId)
-      : null;
+  const scopeEntityId = resolved.projectId ?? resolved.taskId ?? null;
+  const definition = scopeEntityId ? directory.getEntityDefinition(scopeEntityId, tenantId) : null;
+
+  // --- Capsule (v2 only): selected BY KIND, never by recency alone. The
+  // newest unsuperseded kind=capsule observation is current; any others are
+  // conflicts the lane must reconcile. Distinct from `definition` (immutable
+  // founding prose) and from get_current_observation (newest of ANY kind).
+  const capsule: ResumeCapsule | null = resultVersion === 2
+    ? (() => {
+        if (!scopeEntityId) return emptyCapsule;
+        const { capsules, candidatesConsidered } = directory.getCapsuleObservations(scopeEntityId, tenantId);
+        return { current: capsules[0] ?? null, conflicts: capsules.slice(1), candidatesConsidered };
+      })()
+    : null;
 
   // --- Section item sources (all SELECT-only).
   const scopeRow = db.prepare(
@@ -360,7 +382,8 @@ export function performResume(
   }
 
   return {
-    schemaVersion: 1,
+    schemaVersion: resultVersion,
+    ...(capsule ? { capsule } : {}),
     resolvedScope: resolved,
     asOf: {
       assembledAt,

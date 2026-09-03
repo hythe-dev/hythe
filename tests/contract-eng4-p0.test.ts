@@ -1127,6 +1127,7 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
     },
     resolveCanonicalAgent: (agentId) => ({ canonical: agentId, aliases: [agentId] }),
     getEntityDefinition: (entityId) => DEFINITIONS[entityId] ?? null,
+    getCapsuleObservations: () => ({ capsules: [], candidatesConsidered: 0 }),
   };
 
   const freshDb = () => {
@@ -1458,6 +1459,7 @@ describe('ENG-4 2(d) — engram:// resources, handles, handoff acks (executable)
     },
     resolveCanonicalAgent: (agentId) => ({ canonical: agentId, aliases: [agentId] }),
     getEntityDefinition: () => null,
+    getCapsuleObservations: () => ({ capsules: [], candidatesConsidered: 0 }),
   };
 
   const freshDb = () => {
