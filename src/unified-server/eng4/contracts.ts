@@ -456,12 +456,13 @@ export type CheckpointResult =
       revision: number;
       contentHash: string;
       /**
-       * Present ONLY when the (fingerprint-matched) request set resultVersion=2.
-       * The SAME changes the original write returned, read from the verified
-       * ledger. null ONLY for a snapshot recorded before the ledger existed
-       * whose envelope carried changes — the ids are unknowable, never invented.
+       * Present ONLY when the (fingerprint-matched) request set resultVersion=2,
+       * and then never null: v2 is bound into the fingerprint, so a matched v2
+       * replay was written by the ledger-aware writer; an absent ledger is
+       * corruption and throws CheckpointIntegrityError instead. The SAME
+       * changes the original write returned, read from the verified ledger.
        */
-      changes?: CheckpointChanges | null;
+      changes?: CheckpointChanges;
     }
   | {
       outcome: 'conflict';

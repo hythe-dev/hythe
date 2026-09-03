@@ -19,8 +19,11 @@
  *   (CheckpointIntegrityError) on any partial, duplicated, mis-ordered, or
  *   tampered ledger — never a subset. Verification runs on every replay,
  *   v1 included; the opt-in only decides whether the answer is returned.
- * - A pre-ledger snapshot (no rows, no digest) replays changes=null if its
- *   envelope carried changes, empty arrays if it did not.
+ * - "No rows AND no digest" is accepted as a pre-ledger snapshot ONLY on a
+ *   matched v1 replay. A matched resultVersion=2 replay is fingerprint-proven
+ *   to have been written by the ledger-aware writer, so that state is
+ *   erasure/corruption and throws — even for a zero-change write. v2 replay
+ *   `changes` is therefore never null.
  * - The ledger is result-side only: canonical envelope and contentHash are
  *   unchanged. conflict / idempotency-mismatch never carry `changes`.
  */
@@ -266,27 +269,52 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(CheckpointIntegrityError);
   });
 
-  it('pre-ledger snapshot (no rows AND no digest): null when the envelope carried changes, empty when it did not', () => {
+  it('REPRO (total erasure, v2): no rows AND no digest under a matched resultVersion=2 replay THROWS — envelope carried changes', () => {
     const db = freshDb();
-    const withChanges = cp2({ factChanges: [fact('alpha')] });
-    const written = performCheckpoint(db, directory, TENANT, withChanges) as any;
+    const params = cp2({ factChanges: [fact('alpha')] });
+    const written = performCheckpoint(db, directory, TENANT, params) as any;
     db.prepare(`DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
     db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
-    const replay = performCheckpoint(db, directory, TENANT, withChanges) as any;
-    expect(replay.outcome).toBe('idempotent-replay');
-    expect(replay.changes).toBeNull();
+    expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/ledger and digest absent/);
+  });
 
-    const without = cp2({ expectedRevision: 1, idempotencyKey: 'k-2' });
+  it('REPRO (total erasure, v2): THROWS even when the envelope carried NO changes (zero-change v2 write still has a digest)', () => {
+    const db = freshDb();
+    const params = cp2();
+    const written = performCheckpoint(db, directory, TENANT, params) as any;
+    expect(ledgerRows(db, written.stateId)).toEqual([]);
+    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
+    expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(CheckpointIntegrityError);
+  });
+
+  it('matched v1 replay keeps the pre-ledger fallback: no rows AND no digest replays cleanly (with or without envelope changes)', () => {
+    const db = freshDb();
+    const withChanges = cp({ factChanges: [fact('alpha')] });
+    const w1 = performCheckpoint(db, directory, TENANT, withChanges) as any;
+    db.prepare(`DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`).run(TENANT, w1.stateId);
+    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, w1.stateId);
+    const r1 = performCheckpoint(db, directory, TENANT, withChanges) as any;
+    expect(r1.outcome).toBe('idempotent-replay');
+    expect('changes' in r1).toBe(false);
+
+    const without = cp({ expectedRevision: 1, idempotencyKey: 'k-2' });
     const w2 = performCheckpoint(db, directory, TENANT, without) as any;
     db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, w2.stateId);
-    const replayEmpty = performCheckpoint(db, directory, TENANT, without) as any;
-    expect(replayEmpty.outcome).toBe('idempotent-replay');
-    expect(replayEmpty.changes).toEqual({ facts: [], loops: [] });
+    const r2 = performCheckpoint(db, directory, TENANT, without) as any;
+    expect(r2.outcome).toBe('idempotent-replay');
+    expect('changes' in r2).toBe(false);
+  });
+
+  it('a v1 request can never "upgrade" an old key to v2: the fingerprint mismatches before replay', () => {
+    const db = freshDb();
+    performCheckpoint(db, directory, TENANT, cp({ factChanges: [fact('alpha')] }));
+    const res = performCheckpoint(db, directory, TENANT, cp2({ factChanges: [fact('alpha')] })) as any;
+    expect(res.outcome).toBe('idempotency-mismatch');
   });
 });
 
 describe('ENG-4 PR A — schema and envelope invariants', () => {
-  it('output schema: v1 written/replay reject changes; v2 require it (nullable only on replay); conflict/mismatch never carry it', () => {
+  it('output schema: v1 written/replay have no changes; v2 require a non-null object; conflict/mismatch never carry it', () => {
     const base = { stateId: 's1', scopeKey: 'p:u-proj', revision: 1, contentHash: 'h' };
     const changes = { facts: [{ factId: 'f1', created: true }], loops: [{ loopId: 'l1', created: false }] };
     // v1 (frozen) shapes still validate exactly as before
@@ -296,7 +324,7 @@ describe('ENG-4 PR A — schema and envelope invariants', () => {
     expect(validCheckpointResult({ outcome: 'written', ...base, parentStateId: null, changes })).toBe(true);
     expect(validCheckpointResult({ outcome: 'written', ...base, parentStateId: null, changes: null })).toBe(false);
     expect(validCheckpointResult({ outcome: 'idempotent-replay', ...base, changes })).toBe(true);
-    expect(validCheckpointResult({ outcome: 'idempotent-replay', ...base, changes: null })).toBe(true);
+    expect(validCheckpointResult({ outcome: 'idempotent-replay', ...base, changes: null })).toBe(false);
     expect(validCheckpointResult({ outcome: 'written', ...base, parentStateId: null, changes: { facts: [{ factId: 'f1' }], loops: [] } })).toBe(false);
     expect(validCheckpointResult({ outcome: 'conflict', heads: [{ stateId: 's1', revision: 1, author: 'a', recordedAt: 't' }], changes })).toBe(false);
     expect(validCheckpointResult({ outcome: 'idempotency-mismatch', stateId: 's1', expectedRequestFingerprint: 'a', receivedRequestFingerprint: 'b', changes })).toBe(false);

@@ -496,12 +496,12 @@ export const CHECKPOINT_OUTPUT_SCHEMA = {
       properties: REPLAY_V1_PROPERTIES,
     },
     {
-      // idempotent-replay, v2: v1 + changes (null ONLY for pre-ledger
-      // snapshots whose envelope carried changes)
+      // idempotent-replay, v2: v1 + changes. Never null — a matched v2 replay
+      // is fingerprint-proven ledger-aware; a missing ledger throws instead.
       type: 'object',
       additionalProperties: false,
       required: ['outcome', 'stateId', 'scopeKey', 'revision', 'contentHash', 'changes'],
-      properties: { ...REPLAY_V1_PROPERTIES, changes: { anyOf: [CHECKPOINT_CHANGES, { type: 'null' }] } },
+      properties: { ...REPLAY_V1_PROPERTIES, changes: CHECKPOINT_CHANGES },
     },
     {
       type: 'object',

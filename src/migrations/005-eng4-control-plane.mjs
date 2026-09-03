@@ -206,7 +206,9 @@ export const DDL = [
   // Integrity binding for the ledger: sha256 of the canonical (RFC 8785)
   // changes object, stored on the snapshot row in the same transaction.
   // Replay recomputes from the ledger rows and fails CLOSED on mismatch,
-  // partial rows, or non-contiguous ordinals. NULL = pre-ledger snapshot.
+  // partial rows, or non-contiguous ordinals. NULL + zero rows is accepted as
+  // a pre-ledger snapshot ONLY on a matched v1 replay; under resultVersion=2
+  // (fingerprint-bound, hence ledger-aware) it is corruption and fails closed.
   // Additive, duplicate-column-guarded like the ai_messages ALTERs.
   `ALTER TABLE eng4_state_snapshots ADD COLUMN changes_hash TEXT`,
 

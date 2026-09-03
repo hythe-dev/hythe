@@ -247,15 +247,21 @@ export function changesHash(changes: CheckpointChanges): string {
  * the (already hash-verified) persisted envelope — fail CLOSED (review
  * 5e486718 blocker 2): a partial, duplicated, mis-ordered, or tampered
  * ledger throws CheckpointIntegrityError; it never returns a subset.
- * Pre-ledger snapshots (no rows AND no stored digest) cannot answer: null
- * when the envelope carried fact/loop changes, empty arrays when it did not.
+ * PRE-LEDGER ESCAPE IS VERSION-AWARE (re-review 882d39c7): a snapshot whose
+ * requestFingerprint matched a resultVersion=2 request was necessarily
+ * written by the ledger-aware writer (v2 is bound into the fingerprint), so
+ * "no rows AND no digest" under v2 is erasure/corruption and THROWS — even
+ * for a zero-change write. Only a matched v1 replay may treat that state as
+ * a legitimate pre-ledger snapshot: null when the envelope carried fact/loop
+ * changes, empty arrays when it did not (the v1 result omits it anyway).
  */
 export function readSnapshotChanges(
   db: DatabaseType.Database,
   tenantId: string,
   stateId: string,
   contentHash: string,
-  storedHash: string | null
+  storedHash: string | null,
+  requireLedger: boolean
 ): CheckpointChanges | null {
   const payload = db.prepare(
     `SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
@@ -276,14 +282,15 @@ export function readSnapshotChanges(
       WHERE tenant_id = ? AND state_id = ? ORDER BY kind, ordinal`
   ).all(tenantId, stateId) as Array<{ kind: string; ordinal: number; change_id: string; created: number }>;
 
-  if (rows.length === 0 && storedHash === null) {
-    // Pre-ledger snapshot: truthful answer only.
-    return expectedFacts + expectedLoops === 0 ? { facts: [], loops: [] } : null;
-  }
-
   const fail = (why: string): never => {
     throw new CheckpointIntegrityError(`eng4: snapshot change ledger failed verification for ${stateId}: ${why}`);
   };
+
+  if (rows.length === 0 && storedHash === null) {
+    if (requireLedger) fail('ledger and digest absent for a snapshot written by the ledger-aware (resultVersion=2) writer');
+    // Matched v1 replay: possibly a genuine pre-ledger snapshot — truthful answer only.
+    return expectedFacts + expectedLoops === 0 ? { facts: [], loops: [] } : null;
+  }
   const factRows = rows.filter((r) => r.kind === 'fact');
   const loopRows = rows.filter((r) => r.kind === 'loop');
   if (factRows.length !== expectedFacts) fail(`expected ${expectedFacts} fact rows, found ${factRows.length}`);
@@ -425,7 +432,8 @@ export function performCheckpoint(
       // only decides whether the verified answer is RETURNED.
       const replayChanges = readSnapshotChanges(
         db, tenantId, String(existing.state_id), String(existing.content_hash),
-        existing.changes_hash === null || existing.changes_hash === undefined ? null : String(existing.changes_hash)
+        existing.changes_hash === null || existing.changes_hash === undefined ? null : String(existing.changes_hash),
+        resultVersion === 2
       );
       return {
         outcome: 'idempotent-replay',
@@ -433,7 +441,9 @@ export function performCheckpoint(
         scopeKey: String(existing.scope_key),
         revision: Number(existing.revision),
         contentHash: String(existing.content_hash),
-        ...(resultVersion === 2 ? { changes: replayChanges } : {}),
+        // A matched v2 replay can never be pre-ledger (fingerprint-bound), so
+        // replayChanges is non-null here; the throw above guarantees it.
+        ...(resultVersion === 2 ? { changes: replayChanges as CheckpointChanges } : {}),
       };
     }
 
