@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- ENG-4 H1 (design `docs/design/ENG4-HEAD-RECONCILIATION.md` §3, internal
+  increment): checkpoint now maintains an explicit per-scope current-head
+  POINTER (`eng4_scope_current`) — set by the first write in a scope and
+  advanced only by a write whose parent is the pointed head; a write from any
+  other parent still branches (frozen CAS) but is no longer promoted to
+  "current" by having the higher revision. `resume` selects `working` through
+  this one resolver for every bundle version (legacy scopes without a pointer
+  keep the explicitly flagged max-revision selection until reconciled; a
+  pointer at a non-live snapshot fails closed with `working: null`). Snapshot
+  rows are now immutable and undeletable by trigger, except PR #8's single
+  digest write. `resume` `resultVersion: 3` (schemaVersion 3, NOT final until
+  the H-series completes and NOT published) adds `asOf.selection/pointer/
+  liveHeadCount/divergentHeadCount/retiredHeadCount` and a budgeted `heads`
+  section. v1/v2 shapes, fingerprints and the checkpoint request are unchanged.
 - Honor latency SLO time windows with timestamped samples, statistically meaningful
   percentile sample floors, current-evaluation alert metadata, and automatic stale
   alert recovery instead of retaining up to 1,000 lifetime samples.

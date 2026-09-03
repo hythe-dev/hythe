@@ -212,6 +212,54 @@ export const DDL = [
   // Additive, duplicate-column-guarded like the ai_messages ALTERs.
   `ALTER TABLE eng4_state_snapshots ADD COLUMN changes_hash TEXT`,
 
+  // 8. ENG-4 H1 — advancing current-head pointer (design note
+  // docs/design/ENG4-HEAD-RECONCILIATION.md §3, merged 3429000).
+  //
+  // 8a. Referenced target for every same-scope composite FK: a pointer (and,
+  // in later H-series steps, retirements/merge inputs/versions) can only name
+  // a snapshot that is in the SAME tenant AND scope by structure, never by
+  // convention (aad3973c finding 1).
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_eng4_snapshots_scope_state
+     ON eng4_state_snapshots (tenant_id, scope_key, state_id)`,
+  // 8b. Snapshots are immutable. Exactly ONE post-insert transition is legal:
+  // PR #8's in-transaction digest write (changes_hash NULL → NOT NULL) with
+  // every other column byte-identical. Every other UPDATE, and every DELETE,
+  // is rejected (19826044 finding 3). The column list below MUST equal
+  // PRAGMA table_info(eng4_state_snapshots); a contract test asserts it, so a
+  // future column cannot slip past the trigger.
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_snapshots_immutable
+     BEFORE UPDATE ON eng4_state_snapshots
+     WHEN NOT (
+          OLD.changes_hash IS NULL AND NEW.changes_hash IS NOT NULL
+      AND NEW.tenant_id = OLD.tenant_id AND NEW.state_id = OLD.state_id
+      AND NEW.scope_key = OLD.scope_key AND NEW.revision = OLD.revision
+      AND NEW.parent_state_id IS OLD.parent_state_id
+      AND NEW.content_hash = OLD.content_hash AND NEW.request_fingerprint = OLD.request_fingerprint
+      AND NEW.idempotency_key = OLD.idempotency_key AND NEW.author = OLD.author
+      AND NEW.asserted_agent_id IS OLD.asserted_agent_id AND NEW.recorded_at = OLD.recorded_at
+      AND NEW.state_json = OLD.state_json)
+     BEGIN SELECT RAISE(ABORT, 'eng4: snapshots are immutable'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_snapshots_no_delete
+     BEFORE DELETE ON eng4_state_snapshots
+     BEGIN SELECT RAISE(ABORT, 'eng4: snapshots are never deleted'); END`,
+  // 8c. The current-head POINTER (one row per scope). It names the current
+  // head ITSELF — not an anchor of a lineage — and it moves in exactly three
+  // ways (§3.2a/§3.4/§4): the first write in a scope sets it; a write whose
+  // parent IS the pointed head advances it; a reconcile (H3) sets it. A write
+  // from any other parent keeps its branch but never moves the pointer.
+  // The composite FK makes (scope P, state from scope Q) unrepresentable.
+  `CREATE TABLE IF NOT EXISTS eng4_scope_current (
+     tenant_id   TEXT NOT NULL,
+     scope_key   TEXT NOT NULL,
+     state_id    TEXT NOT NULL,
+     advanced_at TEXT NOT NULL,
+     advanced_by TEXT NOT NULL,
+     reason      TEXT NOT NULL CHECK (reason IN ('first-write','advance','reconcile')),
+     PRIMARY KEY (tenant_id, scope_key),
+     FOREIGN KEY (tenant_id, scope_key)           REFERENCES eng4_scopes(tenant_id, scope_key),
+     FOREIGN KEY (tenant_id, scope_key, state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+
   // 7. ai_messages scoping — additive columns + index (A6). SQLite ALTER ADD
   // COLUMN is cheap and non-rewriting; existing rows get NULLs (= unscoped).
   `ALTER TABLE ai_messages ADD COLUMN project_id TEXT`,
