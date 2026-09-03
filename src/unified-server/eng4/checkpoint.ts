@@ -61,6 +61,7 @@ import type { CheckpointChanges, CheckpointParams, CheckpointResult, FactChange,
 import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 import { advancePointerAfterInsert, liveHeads } from './heads.js';
+import { writeVersionRows } from './versions.js';
 
 /** Re-exported for existing importers; the definition lives in heads.ts (H1). */
 export { liveHeads } from './heads.js';
@@ -190,8 +191,12 @@ function applyLoopChanges(
   author: string,
   recordedAt: string,
   changes: readonly LoopChange[]
-): CheckpointChanges['loops'] {
+): { loops: CheckpointChanges['loops']; owners: string[] } {
   const out: CheckpointChanges['loops'] = [];
+  // H2: the owner in effect for each change — exact at write time, and the
+  // one loop field the payload alone does not pin down (an omitted `owner`
+  // inherits the in-place value). Fed to the version dual write.
+  const owners: string[] = [];
   for (const change of changes) {
     if (change.status === 'closed' && !change.closeOutcome) {
       throw new CheckpointChangeError('eng4: closing a loop requires closeOutcome');
@@ -216,6 +221,7 @@ function applyLoopChanges(
         tenantId, change.loopId
       );
       out.push({ loopId: change.loopId, created: false });
+      owners.push(change.owner ?? existing.owner);
     } else {
       const loopId = randomUUID();
       db.prepare(
@@ -229,9 +235,10 @@ function applyLoopChanges(
         change.nextAction, closeJson
       );
       out.push({ loopId, created: true });
+      owners.push(change.owner ?? author);
     }
   }
-  return out;
+  return { loops: out, owners };
 }
 
 /** Persist the per-snapshot change ledger (same transaction as the snapshot). */
@@ -511,11 +518,17 @@ export function performCheckpoint(
 
     // 2(c) materialization — same transaction, after the snapshot; a bad
     // change throws and rolls back the ENTIRE checkpoint.
+    const appliedLoops = applyLoopChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.loopChanges ?? []);
     const changes: CheckpointChanges = {
       facts: applyFactChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.factChanges ?? []),
-      loops: applyLoopChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.loopChanges ?? []),
+      loops: appliedLoops.loops,
     };
     recordSnapshotChanges(db, tenantId, stateId, changes);
+    // H2 dual write (§6.2): exact `materialized` coverage + version rows for
+    // every change, after the ledger they FK. The in-place rows above remain
+    // the frozen v1/v2 view; these are the v3 view (read in H4).
+    writeVersionRows(db, tenantId, scopeKey, stateId, canonicalAgentId, recordedAt,
+      { factChanges: params.factChanges ?? [], loopChanges: params.loopChanges ?? [] }, changes, appliedLoops.owners);
 
     return {
       outcome: 'written',

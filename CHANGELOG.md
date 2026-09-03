@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- ENG-4 H2 (design §6.2, internal increment, data-only): append-only
+  `eng4_fact_versions` / `eng4_loop_versions` keyed by (writing snapshot, change
+  ordinal) with same-scope composite FKs, plus the `eng4_version_coverage`
+  manifest giving every digest-bound ledger tuple exactly one explicit
+  disposition (`materialized` | `unversioned`, with `source` write|backfill).
+  Every checkpoint now dual-writes exact versions in its transaction; the
+  schema apply performs a verified, all-or-nothing, idempotent backfill of every
+  ledger-bound snapshot from immutable data only (a historical loop update that
+  omitted `owner` whose inherited value cannot be proven becomes `unversioned`
+  with reason `pre-h2-inherited-owner`, never a guess), and refuses a store
+  whose null-digest snapshots carry ledger/coverage/version rows. A
+  bidirectional parity verifier (`verifyVersionParity`) fails closed on any
+  missing, extra or mismatched row. No public read model changes (H4 reads
+  these rows); v1/v2/v3 bundles are unchanged.
 - ENG-4 H1 (design `docs/design/ENG4-HEAD-RECONCILIATION.md` §3, internal
   increment): checkpoint now maintains an explicit per-scope current-head
   POINTER (`eng4_scope_current`) — set by the first write in a scope and

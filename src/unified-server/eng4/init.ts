@@ -23,12 +23,23 @@ import type DatabaseType from 'better-sqlite3';
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore -- untyped .mjs module; DDL is a readonly string array
 import { DDL } from '../../migrations/005-eng4-control-plane.mjs';
+import { backfillVersionFoundation, type BackfillSummary } from './versions.js';
 
 const DUPLICATE_COLUMN = /duplicate column name/i;
 
 export interface ApplyEng4SchemaResult {
   statementsApplied: number;
   alterSkippedAsExisting: number;
+  /**
+   * ENG-4 H2 (design 3429000 §6.2): the verified version backfill that runs
+   * in the SAME transaction as the DDL on every apply — reconstructing
+   * coverage + versions for ledger-bound snapshots that have none, checking
+   * that null-digest snapshots are bare and covered snapshots are complete.
+   * Any integrity failure rolls the whole apply back (fail closed: the
+   * server does not start on a store whose version foundation is corrupt).
+   * Absent only when `statementsOverride` is used (rollback tests).
+   */
+  versionBackfill?: BackfillSummary;
 }
 
 /**
@@ -49,6 +60,7 @@ export function applyEng4Schema(
 
   let applied = 0;
   let skipped = 0;
+  let versionBackfill: BackfillSummary | undefined;
   const runAll = db.transaction(() => {
     for (const statement of statements) {
       try {
@@ -64,8 +76,14 @@ export function applyEng4Schema(
         throw err;
       }
     }
+    // H2 verified backfill — same transaction, all-or-nothing with the DDL.
+    if (!statementsOverride) versionBackfill = backfillVersionFoundation(db);
   });
   runAll();
 
-  return { statementsApplied: applied, alterSkippedAsExisting: skipped };
+  return {
+    statementsApplied: applied,
+    alterSkippedAsExisting: skipped,
+    ...(versionBackfill ? { versionBackfill } : {}),
+  };
 }
