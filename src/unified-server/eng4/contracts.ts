@@ -290,11 +290,13 @@ export type ResumeSectionName =
   | 'decisions'
   | 'evidence'
   | 'pointers'
-  /** schemaVersion=2 ONLY: the budgeted capsule section (item 0 = current, rest = conflicts). */
-  | 'capsule';
+  /** schemaVersion>=2 ONLY: the budgeted capsule section (item 0 = current, rest = conflicts). */
+  | 'capsule'
+  /** schemaVersion=3 ONLY (H1): every live head, budgeted, ordered right after capsule. */
+  | 'heads';
 
 /** The seven frozen v1 sections. */
-export type ResumeSectionNameV1 = Exclude<ResumeSectionName, 'capsule'>;
+export type ResumeSectionNameV1 = Exclude<ResumeSectionName, 'capsule' | 'heads'>;
 
 // ---------------------------------------------------------------------------
 // resume (primitive 1 of exactly 2)
@@ -318,8 +320,11 @@ export interface ResumeParams {
    * `capsule`, the scope entity's rehydration capsule selected BY KIND
    * (newest unsuperseded observation with metadata.kind='capsule'), never by
    * recency alone, with any other unsuperseded capsules reported as conflicts.
+   * 3 (ENG-4 H-series, INTERNAL until H5 finalizes it — design 3429000
+   * §2.10) → schemaVersion=3: the v2 bundle plus the fixed-size head-selection
+   * fields on asOf and the budgeted `heads` section (H1).
    */
-  resultVersion?: 1 | 2;
+  resultVersion?: 1 | 2 | 3;
   /** Hard total token budget for the assembled bundle. */
   budget: number;
   /** Optional subset of sections; default = all, in canonical order. */
@@ -351,6 +356,43 @@ export interface AsOfHeader {
   stale: boolean;
   /** Concurrent heads, if the state has forked. Never auto-resolved. */
   conflicts: Array<{ stateId: string; revision: number; author: string; recordedAt: string }>;
+  // --- schemaVersion=3 ONLY (ENG-4 H1, design 3429000 §3.5): fixed-size
+  // head-selection fields. Absent on the frozen v1/v2 bundles.
+  /** How `working` was chosen — the ONE resolver's mode (heads.ts). */
+  selection?: HeadSelection;
+  /** The scope's current-head pointer row, or null (empty/legacy scope). */
+  pointer?: ScopePointerView | null;
+  liveHeadCount?: number;
+  /** Live heads other than the effective current head. */
+  divergentHeadCount?: number;
+  /** Always 0 until H3 introduces retirements. */
+  retiredHeadCount?: number;
+}
+
+export type HeadSelection = 'empty-scope' | 'max-revision' | 'pointer' | 'invalid-designation';
+
+export interface ScopePointerView {
+  stateId: string;
+  revision: number;
+  advancedAt: string;
+  advancedBy: string;
+  reason: 'first-write' | 'advance' | 'reconcile';
+}
+
+/**
+ * One live head in the schemaVersion=3 `heads` section (H1). `isCurrent` is
+ * true for exactly the effective current head (never more than one; zero
+ * under 'empty-scope' / 'invalid-designation'). `parentRetired` is required
+ * and constantly false until H3 starts setting it — the item shape does not
+ * change then (19826044 precision item).
+ */
+export interface HeadItem {
+  stateId: string;
+  revision: number;
+  author: string;
+  recordedAt: string;
+  isCurrent: boolean;
+  parentRetired: boolean;
 }
 
 /**
@@ -393,14 +435,20 @@ export interface ResumeCapsule {
 }
 
 export interface ResumeBundle {
-  /** 1 = frozen bundle (default); 2 = v1 + capsule (request resultVersion=2). */
-  schemaVersion: 1 | 2;
+  /**
+   * 1 = frozen bundle (default); 2 = v1 + capsule (request resultVersion=2);
+   * 3 = v2 + head-selection asOf fields + `heads` (request resultVersion=3;
+   * INTERNAL increment until H5 — design 3429000 §2.10).
+   */
+  schemaVersion: 1 | 2 | 3;
   resolvedScope: ResolvedScope;
   asOf: AsOfHeader;
   /** Charter/definition line — creation-time prose, NEVER current state (A4). */
   definition: string | null;
-  /** Present ONLY on schemaVersion=2. */
+  /** Present ONLY on schemaVersion>=2. */
   capsule?: ResumeCapsule;
+  /** Present ONLY on schemaVersion=3: every live head, budgeted (H1). */
+  heads?: HeadItem[];
   working: WorkingState | null;
   openLoops: OpenLoop[];
   messages: InboxItem[];
@@ -408,9 +456,10 @@ export interface ResumeBundle {
   decisions: Array<{ id: string; summary: string; recordedAt: string; evidenceRefs: string[] }>;
   evidence: ContentHandle[];
   pointers: Array<{ label: string; entity: string; relation: string }>;
-  /** All seven v1 sections present ALWAYS (closedness — review e0d81d4d #2); `capsule` coverage ONLY on schemaVersion=2. */
+  /** All seven v1 sections present ALWAYS (closedness — review e0d81d4d #2); `capsule` coverage ONLY on schemaVersion>=2; `heads` ONLY on 3. */
   coverage: Record<ResumeSectionNameV1, SectionCoverage> & {
     capsule?: SectionCoverage;
+    heads?: SectionCoverage;
     totalTokenEstimate: number;
     budget: number;
   };

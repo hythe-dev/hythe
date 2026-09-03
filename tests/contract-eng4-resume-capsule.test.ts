@@ -107,11 +107,12 @@ describe('resume capsule — frozen v1 default', () => {
     expect('capsule' in bundle).toBe(false);
   });
 
-  it('input schema: resultVersion accepts only 1 or 2 and is optional', () => {
+  it('input schema: resultVersion accepts 1, 2 or 3 (3 = ENG-4 H-series internal bundle) and is optional', () => {
     const base = { agentId: 'a', scope: { project: 'Proj' }, budget: 1024 };
     expect(validInput(base)).toBe(true);
     expect(validInput({ ...base, resultVersion: 2 })).toBe(true);
-    expect(validInput({ ...base, resultVersion: 3 })).toBe(false);
+    expect(validInput({ ...base, resultVersion: 3 })).toBe(true);
+    expect(validInput({ ...base, resultVersion: 4 })).toBe(false);
     expect(validInput({ ...base, resultVersion: '2' })).toBe(false);
   });
 });

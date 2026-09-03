@@ -154,10 +154,10 @@ export const RESUME_INPUT_SCHEMA = {
     agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'Exact opaque caller identity (platform max 100). With per-agent proof the server injects and authorizes the authenticated principal; observe-mode legacy calls may assert it explicitly. Case and transport-looking suffixes are identity-significant; this principal owns authorship, acks, and views.' },
     scope: SCOPE_SCHEMA,
     budget: { type: 'integer', minimum: 256, description: 'Hard total token budget for the bundle.' },
-    resultVersion: { type: 'integer', enum: [1, 2], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts.' },
+    resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts. 3 (INTERNAL, not final until the ENG-4 H-series completes): schemaVersion=3 — v2 plus fixed-size head-selection fields on asOf (selection, pointer, liveHeadCount, divergentHeadCount, retiredHeadCount) and the budgeted `heads` section listing every live head.' },
     sections: {
       type: 'array',
-      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule'], description: 'Section filter. `capsule` is meaningful only with resultVersion=2.' },
+      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule', 'heads'], description: 'Section filter. `capsule` is meaningful only with resultVersion>=2; `heads` only with resultVersion=3.' },
     },
     cursor: { type: 'string' },
   },
@@ -409,9 +409,76 @@ export const RESUME_OUTPUT_SCHEMA_V2 = {
   },
 } as const;
 
-/** resume() outputSchema — exactly one of the v1 (frozen, default) or v2 bundle shapes. */
+/**
+ * ENG-4 H1 (design 3429000 §3.5) — one live head in the schemaVersion=3
+ * `heads` section. `parentRetired` is required and constantly false until H3.
+ */
+const HEAD_ITEM = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['stateId', 'revision', 'author', 'recordedAt', 'isCurrent', 'parentRetired'],
+  properties: {
+    ...STATE_HEAD.properties,
+    isCurrent: { type: 'boolean' },
+    parentRetired: { type: 'boolean' },
+  },
+} as const;
+
+/** The pointer row as resume reports it (fixed-size). */
+const SCOPE_POINTER = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['stateId', 'revision', 'advancedAt', 'advancedBy', 'reason'],
+  properties: {
+    stateId: { type: 'string', minLength: 1 },
+    revision: { type: 'integer', minimum: 0 },
+    advancedAt: { type: 'string' },
+    advancedBy: { type: 'string' },
+    reason: { enum: ['first-write', 'advance', 'reconcile'] },
+  },
+} as const;
+
+/**
+ * schemaVersion=3 bundle (request resultVersion=3) — ENG-4 H-series,
+ * INTERNAL increment (design 3429000 §2.10: the exact v3 schema is not final
+ * until H5; H1–H4 merge as internal increments, v3 is published once).
+ * H1: v2 + fixed-size head-selection fields on asOf + the budgeted `heads`
+ * section (every live head; ordered right after capsule). `asOf.conflicts`
+ * keeps its frozen v1 meaning.
+ */
+export const RESUME_OUTPUT_SCHEMA_V3 = {
+  ...RESUME_OUTPUT_SCHEMA_V2,
+  required: [...RESUME_OUTPUT_SCHEMA_V2.required, 'heads'],
+  properties: {
+    ...RESUME_OUTPUT_SCHEMA_V2.properties,
+    schemaVersion: { const: 3 },
+    asOf: {
+      ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf,
+      required: [
+        ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.required,
+        'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount',
+      ],
+      properties: {
+        ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.properties,
+        selection: { enum: ['empty-scope', 'max-revision', 'pointer', 'invalid-designation'] },
+        pointer: { anyOf: [SCOPE_POINTER, { type: 'null' }] },
+        liveHeadCount: { type: 'integer', minimum: 0 },
+        divergentHeadCount: { type: 'integer', minimum: 0 },
+        retiredHeadCount: { type: 'integer', minimum: 0 },
+      },
+    },
+    heads: { type: 'array', items: HEAD_ITEM },
+    coverage: {
+      ...RESUME_OUTPUT_SCHEMA_V2.properties.coverage,
+      required: [...RESUME_OUTPUT_SCHEMA_V2.properties.coverage.required, 'heads'],
+      properties: { ...RESUME_OUTPUT_SCHEMA_V2.properties.coverage.properties, heads: SECTION_COVERAGE },
+    },
+  },
+} as const;
+
+/** resume() outputSchema — exactly one of the v1 (frozen, default), v2 (frozen) or v3 (internal) bundle shapes. */
 export const RESUME_OUTPUT_SCHEMA = {
-  oneOf: [RESUME_OUTPUT_SCHEMA_V1, RESUME_OUTPUT_SCHEMA_V2],
+  oneOf: [RESUME_OUTPUT_SCHEMA_V1, RESUME_OUTPUT_SCHEMA_V2, RESUME_OUTPUT_SCHEMA_V3],
 } as const;
 
 /** checkpoint() input schema — CAS + idempotency required; changes fully typed; agentId = author. */

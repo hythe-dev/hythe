@@ -611,7 +611,7 @@ describe('ENG-4 2(a) — schema init boundary (executable)', () => {
     expect(result.statementsApplied).toBeGreaterThan(10);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'eng4_%' ORDER BY name`).all().map((r: any) => r.name);
-    expect(tables).toEqual(['eng4_fact_refs', 'eng4_facts', 'eng4_handoff_acks', 'eng4_open_loops', 'eng4_payloads', 'eng4_scopes', 'eng4_snapshot_changes', 'eng4_state_snapshots']);
+    expect(tables).toEqual(['eng4_fact_refs', 'eng4_facts', 'eng4_handoff_acks', 'eng4_open_loops', 'eng4_payloads', 'eng4_scope_current', 'eng4_scopes', 'eng4_snapshot_changes', 'eng4_state_snapshots']);
   });
 
   it('is idempotent across restarts: a second apply is a no-op (ALTERs guarded)', () => {
@@ -1222,15 +1222,21 @@ describe('ENG-4 2(c) — resume runtime (frozen bundle schema, executable)', () 
     expect(bundle.coverage.working).toMatchObject({ includedCount: 0, totalCount: 0, contentComplete: true, omittedReason: 'none' });
   });
 
-  it('asOf.conflicts lists ALL live heads when branches exist; current view follows the max revision', () => {
+  it('asOf.conflicts lists ALL live heads when branches exist; current view follows the POINTER, not the max revision (ENG-4 H1, design 3429000 §3.2a)', () => {
     const db = freshDb();
     performCheckpoint(db, directory, TENANT, cp());
+    // The first write set the pointer to revision 1. `a` extends the pointed
+    // head and ADVANCES the pointer; `b` extends the now-stale revision 1 and
+    // writes a live branch with the higher revision that is NOT current.
+    // (Before H1 this test pinned `b` — the exact A→B/A→C displacement the
+    // design closes.)
     const a = performCheckpoint(db, directory, TENANT, cp({ expectedRevision: 1, idempotencyKey: 'k-a', state: state('branch-a') })) as any;
     const b = performCheckpoint(db, directory, TENANT, cp({ expectedRevision: 1, idempotencyKey: 'k-b', state: state('branch-b') })) as any;
     const bundle = performResume(db, directory, TENANT, rz());
     expect(bundle.asOf.conflicts.map((h) => h.stateId).sort()).toEqual([a.stateId, b.stateId].sort());
-    expect(bundle.asOf.stateId).toBe(b.stateId);
-    expect(bundle.working?.status).toBe('branch-b');
+    expect(b.revision).toBeGreaterThan(a.revision);
+    expect(bundle.asOf.stateId).toBe(a.stateId);
+    expect(bundle.working?.status).toBe('branch-a');
   });
 
   it('unresolved scope: explicit resolvedScope nulls with fully-accounted empty sections — never silently empty', () => {

@@ -17,8 +17,15 @@
  *   absent snapshot is null + asOf.stale=true + asOf.stateId=null, never
  *   founding observations (legacy repro #2).
  * - asOf.conflicts lists ALL live heads when the state has forked (A5);
- *   the current view follows the max-revision head, divergence stays
- *   visible, never auto-resolved.
+ *   divergence stays visible, never auto-resolved.
+ * - CURRENT = the ONE resolver (heads.ts effectiveCurrentHead — ENG-4 H1,
+ *   design 3429000 §3.3), for EVERY bundle version: the pointed head when a
+ *   pointer exists; max-revision ONLY for legacy scopes that predate H1 and
+ *   never reconciled; null (working=null, stale=true) on an invalid
+ *   designation — fail closed, never a guess. Revision never decides once a
+ *   pointer exists. The v1/v2 bundle SHAPES are unchanged; schemaVersion=3
+ *   additionally exposes the selection mode, the pointer, head counts, and
+ *   the budgeted `heads` section.
  * - Unresolved/ambiguous scope returns EXPLICIT resolvedScope nulls (with
  *   candidates when ambiguous) and empty accounted sections — never a
  *   silently-empty bundle (legacy repro #1) and never a synthesized key.
@@ -34,6 +41,7 @@ import type {
   CapsuleObservation,
   ContentHandle,
   CurrentFact,
+  HeadItem,
   InboxItem,
   OpenLoop,
   ResumeBundle,
@@ -44,7 +52,7 @@ import type {
   SectionCoverage,
   WorkingState,
 } from './contracts.js';
-import { liveHeads } from './checkpoint.js';
+import { effectiveCurrentHead } from './heads.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 
@@ -70,6 +78,10 @@ const SECTION_ORDER: readonly ResumeSectionNameV1[] = [
 /** schemaVersion=2 order: the capsule (entry pointer) is budgeted right after working state. */
 const SECTION_ORDER_V2: readonly ResumeSectionName[] = [
   'working', 'capsule', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers',
+];
+/** schemaVersion=3 order (H1): the live-head list is budgeted right after the capsule (§3.5). */
+const SECTION_ORDER_V3: readonly ResumeSectionName[] = [
+  'working', 'capsule', 'heads', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers',
 ];
 
 /** Deliberately coarse, deterministic estimator (chars/4). */
@@ -121,18 +133,24 @@ export function performResume(
   const coverageOf = (entries: Array<[ResumeSectionName, SectionCoverage]>) =>
     Object.fromEntries(entries) as Record<ResumeSectionNameV1, SectionCoverage> & { capsule?: SectionCoverage };
 
-  const resultVersion: 1 | 2 = params.resultVersion === 2 ? 2 : 1;
-  const order: readonly ResumeSectionName[] = resultVersion === 2 ? SECTION_ORDER_V2 : SECTION_ORDER;
+  const resultVersion: 1 | 2 | 3 = params.resultVersion === 3 ? 3 : params.resultVersion === 2 ? 2 : 1;
+  const order: readonly ResumeSectionName[] =
+    resultVersion === 3 ? SECTION_ORDER_V3 : resultVersion === 2 ? SECTION_ORDER_V2 : SECTION_ORDER;
   const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0, complete: true };
+  // v3 fixed-size asOf fields for a scope with no storage at all.
+  const emptyHeadFields = resultVersion === 3
+    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0 }
+    : {};
 
   if (!resolved.scopeKey) {
     // Fail-closed resolution: explicit nulls (+ candidates when ambiguous),
     // all sections empty but ACCOUNTED — never a silently-empty bundle.
     return {
       schemaVersion: resultVersion,
-      ...(resultVersion === 2 ? { capsule: emptyCapsule } : {}),
+      ...(resultVersion >= 2 ? { capsule: emptyCapsule } : {}),
+      ...(resultVersion === 3 ? { heads: [] } : {}),
       resolvedScope: resolved,
-      asOf: { assembledAt, stateId: null, revision: null, stateAgeSec: null, stale: true, conflicts: [] },
+      asOf: { assembledAt, stateId: null, revision: null, stateAgeSec: null, stale: true, conflicts: [], ...emptyHeadFields },
       definition: null,
       working: null,
       openLoops: [],
@@ -150,9 +168,12 @@ export function performResume(
   }
   const scopeKey = resolved.scopeKey;
 
-  // --- Current state: max-revision live head; forks surface as conflicts.
-  const heads = liveHeads(db, tenantId, scopeKey);
-  const current = heads.length > 0 ? heads[heads.length - 1] : null; // heads are revision-ASC
+  // --- Current state: the ONE resolver (H1 §3.3). Pointer when designated;
+  // max-revision only for legacy undesignated scopes; null (fail closed) on
+  // an invalid designation. Forks surface as conflicts / the heads section.
+  const effective = effectiveCurrentHead(db, tenantId, scopeKey);
+  const heads = effective.live; // revision-ASC
+  const current = effective.head;
   const currentRow = current
     ? db.prepare(
         `SELECT state_id, revision, recorded_at, state_json, content_hash
@@ -171,9 +192,15 @@ export function performResume(
   // capsule is omitted with omittedReason=budget + a cursor, never trimmed
   // silently. Distinct from `definition` (immutable founding prose) and from
   // get_current_observation (newest of ANY kind).
-  const capsuleSelection = resultVersion === 2 && scopeEntityId
+  const capsuleSelection = resultVersion >= 2 && scopeEntityId
     ? directory.getCapsuleObservations(scopeEntityId, tenantId)
     : { capsules: [] as CapsuleObservation[], candidatesConsidered: 0 };
+
+  // --- heads (v3 only): every live head, revision ASC; exactly the effective
+  // current head is flagged. parentRetired is constantly false until H3.
+  const headItems: HeadItem[] = resultVersion === 3
+    ? heads.map((h) => ({ ...h, isCurrent: current !== null && h.stateId === current.stateId, parentRetired: false }))
+    : [];
 
   // --- Section item sources (all SELECT-only).
   const scopeRow = db.prepare(
@@ -323,6 +350,7 @@ export function performResume(
   const sectionItems: Record<ResumeSectionName, unknown[]> = {
     working: working ? [working] : [],
     capsule: capsuleSelection.capsules,
+    heads: headItems,
     openLoops, messages, currentFacts, decisions, evidence, pointers,
   };
 
@@ -394,7 +422,7 @@ export function performResume(
   // null with coverage.capsule saying why (budget / cursor / not-requested).
   const capsuleCoverage = coverageEntries.find(([name]) => name === 'capsule')?.[1];
   const admittedCapsules = (included.capsule ?? []) as CapsuleObservation[];
-  const capsule: ResumeCapsule | null = resultVersion === 2
+  const capsule: ResumeCapsule | null = resultVersion >= 2
     ? {
         current: capsuleStartOffset === 0 && admittedCapsules.length > 0 ? admittedCapsules[0] : null,
         conflicts: capsuleStartOffset === 0 ? admittedCapsules.slice(1) : admittedCapsules,
@@ -403,9 +431,22 @@ export function performResume(
       }
     : null;
 
+  // v3 asOf (H1 §3.5): fixed-size fields only. divergent = live heads other
+  // than the effective current head (all of them when there is none).
+  const headFields = resultVersion === 3
+    ? {
+        selection: effective.selection,
+        pointer: effective.pointer,
+        liveHeadCount: heads.length,
+        divergentHeadCount: heads.length - (current ? 1 : 0),
+        retiredHeadCount: 0,
+      }
+    : {};
+
   return {
     schemaVersion: resultVersion,
     ...(capsule ? { capsule } : {}),
+    ...(resultVersion === 3 ? { heads: (included.heads ?? []) as HeadItem[] } : {}),
     resolvedScope: resolved,
     asOf: {
       assembledAt,
@@ -416,6 +457,7 @@ export function performResume(
         : null,
       stale: !currentRow,
       conflicts: heads.length > 1 ? heads : [],
+      ...headFields,
     },
     definition,
     working: (included.working?.[0] as WorkingState | undefined) ?? null,

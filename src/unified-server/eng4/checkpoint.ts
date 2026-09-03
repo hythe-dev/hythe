@@ -44,12 +44,26 @@
  * Replay verifies the ledger against the verified envelope and fails CLOSED
  * on any partial/tampered ledger; it never recomputes or returns a subset.
  * The canonical envelope and contentHash are unchanged.
+ *
+ * CURRENT-HEAD POINTER (ENG-4 H1, design 3429000 §3.2a/§3.4): inside the
+ * same transaction, immediately after the snapshot insert, the scope's
+ * pointer (eng4_scope_current) is set on the FIRST write in a scope and
+ * ADVANCED when the new snapshot's parent IS the pointed head; a write from
+ * any other parent keeps its branch but never moves the pointer. This is
+ * unconditional on result version — a legacy v1 write on the pointed head
+ * advances it too. The frozen CAS, fingerprints, envelope and every result
+ * shape are unchanged; the pointer is what resume's ONE resolver (heads.ts)
+ * reads to define "current" instead of max revision.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, CheckpointParams, CheckpointResult, FactChange, LoopChange } from './contracts.js';
 import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
+import { advancePointerAfterInsert, liveHeads } from './heads.js';
+
+/** Re-exported for existing importers; the definition lives in heads.ts (H1). */
+export { liveHeads } from './heads.js';
 
 /** Unresolved/ambiguous scope fails CLOSED as a typed error — the four
  * CheckpointResult outcomes are reserved for resolved-scope semantics. */
@@ -311,25 +325,6 @@ export function readSnapshotChanges(
   return changes;
 }
 
-/** Heads = snapshots no other snapshot in the scope claims as parent. Shared with resume. */
-export function liveHeads(db: DatabaseType.Database, tenantId: string, scopeKey: string) {
-  return db.prepare(
-    `SELECT s.state_id, s.revision, s.author, s.recorded_at
-       FROM eng4_state_snapshots s
-      WHERE s.tenant_id = ? AND s.scope_key = ?
-        AND NOT EXISTS (
-          SELECT 1 FROM eng4_state_snapshots c
-           WHERE c.tenant_id = s.tenant_id AND c.scope_key = s.scope_key
-             AND c.parent_state_id = s.state_id)
-      ORDER BY s.revision ASC`
-  ).all(tenantId, scopeKey).map((r: any) => ({
-    stateId: String(r.state_id),
-    revision: Number(r.revision),
-    author: String(r.author),
-    recordedAt: String(r.recorded_at),
-  }));
-}
-
 /** Fail-closed hash+size check of persisted payload bytes. Shared with the
  * engram:// resource layer — every resource fetch re-verifies (2(d)). */
 export function verifyPayloadIntegrity(
@@ -503,6 +498,16 @@ export function performCheckpoint(
       fingerprint, params.idempotencyKey, canonicalAgentId, params.agentId,
       recordedAt, JSON.stringify(params.state)
     );
+
+    // H1 advance rule (§3.2a/§3.4) — same transaction, right after the
+    // insert: first write sets the pointer; parent == pointer advances it;
+    // anything else is a branch and leaves it alone. Result shapes unchanged.
+    advancePointerAfterInsert(db, tenantId, scopeKey, {
+      stateId,
+      parentStateId: resolvedParentStateId,
+      advancedBy: canonicalAgentId,
+      advancedAt: recordedAt,
+    });
 
     // 2(c) materialization — same transaction, after the snapshot; a bad
     // change throws and rolls back the ENTIRE checkpoint.

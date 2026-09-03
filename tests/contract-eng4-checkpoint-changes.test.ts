@@ -81,6 +81,18 @@ const fact = (subject: string, over: Partial<FactChange> = {}): FactChange => ({
 const ledgerRows = (db: any, stateId: string) =>
   db.prepare(`SELECT kind, ordinal, change_id, created FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=? ORDER BY kind, ordinal`)
     .all(TENANT, stateId);
+/**
+ * Out-of-band corruption fixture (ENG-4 H1): trg_eng4_snapshots_immutable
+ * forbids every snapshot UPDATE except the single digest write, so
+ * simulating erasure/tampering must bypass it explicitly — as a hostile actor
+ * with raw database access would. Re-applying the (idempotent) schema
+ * restores the trigger before the assertion runs.
+ */
+const tamperSnapshot = (db: any, sql: string, ...args: unknown[]) => {
+  db.exec(`DROP TRIGGER trg_eng4_snapshots_immutable`);
+  db.prepare(sql).run(...args);
+  applyEng4Schema(db);
+};
 const snapRow = (db: any, stateId: string) =>
   db.prepare(`SELECT content_hash, request_fingerprint, changes_hash FROM eng4_state_snapshots WHERE tenant_id=? AND state_id=?`).get(TENANT, stateId) as any;
 
@@ -257,7 +269,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const params = twoFacts();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
+    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/no stored digest/);
   });
 
@@ -274,7 +286,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const params = cp2({ factChanges: [fact('alpha')] });
     const written = performCheckpoint(db, directory, TENANT, params) as any;
     db.prepare(`DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
-    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
+    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/ledger and digest absent/);
   });
 
@@ -283,7 +295,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const params = cp2();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
     expect(ledgerRows(db, written.stateId)).toEqual([]);
-    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, written.stateId);
+    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(CheckpointIntegrityError);
   });
 
@@ -292,14 +304,14 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const withChanges = cp({ factChanges: [fact('alpha')] });
     const w1 = performCheckpoint(db, directory, TENANT, withChanges) as any;
     db.prepare(`DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`).run(TENANT, w1.stateId);
-    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, w1.stateId);
+    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, w1.stateId);
     const r1 = performCheckpoint(db, directory, TENANT, withChanges) as any;
     expect(r1.outcome).toBe('idempotent-replay');
     expect('changes' in r1).toBe(false);
 
     const without = cp({ expectedRevision: 1, idempotencyKey: 'k-2' });
     const w2 = performCheckpoint(db, directory, TENANT, without) as any;
-    db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, w2.stateId);
+    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, w2.stateId);
     const r2 = performCheckpoint(db, directory, TENANT, without) as any;
     expect(r2.outcome).toBe('idempotent-replay');
     expect('changes' in r2).toBe(false);
