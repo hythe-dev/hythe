@@ -352,6 +352,52 @@ export const DDL = [
   `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_coverage_no_delete
      BEFORE DELETE ON eng4_version_coverage
      BEGIN SELECT RAISE(ABORT, 'eng4: version coverage is append-only'); END`,
+  // 9d. Immutable H2 cutover evidence (independent review of PR #12,
+  // findings 2 and 3). The backfill runs at every schema apply, so it needs
+  // to know, from rows it cannot infer from mutable state, (a) which
+  // snapshots' coverage came from a backfill and (b) up to which revision a
+  // scope is already covered.
+  //  - eng4_version_backfills: one append-only row per BACKFILLED snapshot.
+  //    The verifier derives the expected coverage `source` from it (row
+  //    present → 'backfill', absent → 'write'), so relabelling a backfilled
+  //    unversioned tuple as a writer's materialized value is detected.
+  //  - eng4_version_cutover: append-only per-scope "covered through this
+  //    revision" marks (effective = MAX). An uncovered ledger-bound snapshot
+  //    at or below the mark is erased coverage → the apply refuses; only
+  //    snapshots above it (written by a pre-H2 binary after a rollback) are
+  //    legitimately backfilled.
+  `CREATE TABLE IF NOT EXISTS eng4_version_backfills (
+     tenant_id  TEXT NOT NULL,
+     scope_key  TEXT NOT NULL,
+     state_id   TEXT NOT NULL,
+     applied_at TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, scope_key, state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_backfills_immutable
+     BEFORE UPDATE ON eng4_version_backfills
+     BEGIN SELECT RAISE(ABORT, 'eng4: backfill marks are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_backfills_no_delete
+     BEFORE DELETE ON eng4_version_backfills
+     BEGIN SELECT RAISE(ABORT, 'eng4: backfill marks are append-only'); END`,
+  `CREATE TABLE IF NOT EXISTS eng4_version_cutover (
+     tenant_id        TEXT NOT NULL,
+     scope_key        TEXT NOT NULL,
+     through_revision INTEGER NOT NULL CHECK (through_revision >= 1),
+     applied_at       TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, through_revision),
+     FOREIGN KEY (tenant_id, scope_key) REFERENCES eng4_scopes(tenant_id, scope_key)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_cutover_immutable
+     BEFORE UPDATE ON eng4_version_cutover
+     BEGIN SELECT RAISE(ABORT, 'eng4: cutover marks are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_cutover_no_delete
+     BEFORE DELETE ON eng4_version_cutover
+     BEGIN SELECT RAISE(ABORT, 'eng4: cutover marks are append-only'); END`,
+  // 9e. Predecessor lookups (inherited-owner provenance) scan the ledger by
+  // change id.
+  `CREATE INDEX IF NOT EXISTS idx_eng4_changes_by_id
+     ON eng4_snapshot_changes (tenant_id, kind, change_id)`,
 
   // 7. ai_messages scoping — additive columns + index (A6). SQLite ALTER ADD
   // COLUMN is cheap and non-rewriting; existing rows get NULLs (= unscoped).

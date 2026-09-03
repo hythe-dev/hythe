@@ -32,10 +32,24 @@
  *   version set for every snapshot in a scope from those immutable sources
  *   and compares BIDIRECTIONALLY by cardinality, keys, disposition,
  *   deterministic reason and values. Missing, extra or mismatched rows are
- *   CheckpointIntegrityError. For a source='write' materialized version whose
- *   owner was omitted and whose predecessor chain is unprovable, the recorded
- *   owner is accepted as the writer's exact knowledge (the payload cannot
- *   contradict it); every other value must match the recomputation.
+ *   CheckpointIntegrityError. The ledger and the payload must agree on every
+ *   tuple's id and created flag (a version can never attach to a fact/loop
+ *   the payload did not name). For a writer-recorded (source 'write')
+ *   materialized version whose owner was omitted and whose predecessor chain
+ *   is unprovable, the recorded owner is accepted as the writer's exact
+ *   knowledge; every other value must match the recomputation.
+ * - Cutover evidence is immutable, not inferred: eng4_version_backfills marks
+ *   every backfilled snapshot (the verifier derives the expected coverage
+ *   `source` from it, so a relabelled row is detected) and
+ *   eng4_version_cutover records per scope the revision through which
+ *   coverage is known complete (an uncovered ledger-bound snapshot at or
+ *   below it is erased coverage and refuses the apply; above it, a snapshot
+ *   written by a pre-H2 binary after a rollback is legitimately backfilled).
+ *
+ * RESIDUAL (stated, not hidden): for a genuine post-cutover write whose
+ * omitted owner has an unprovable chain, the payload cannot contradict a
+ * later out-of-band change to that ONE field; every other field, and every
+ * backfilled tuple, is fully recomputable.
  */
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, FactChange, LoopChange } from './contracts.js';
@@ -105,6 +119,29 @@ export function loopVersionValue(change: LoopChange, owner: string, author: stri
       ? JSON.stringify({ closedAt: recordedAt, closedBy: author, outcome: change.closeOutcome })
       : null,
   };
+}
+
+/**
+ * The two immutable sources must agree on WHICH row each tuple is about: an
+ * update names its id in the payload and must match the ledger's change_id
+ * with created=false; a creation has no id in the payload and must be
+ * created=true (independent review of PR #12, finding 1).
+ */
+export function assertLedgerAgreesWithEnvelope(stateId: string, changes: CheckpointChanges, env: Envelope): void {
+  const fail = (why: string): never => {
+    throw new CheckpointIntegrityError(`eng4: ledger/payload disagreement for ${stateId}: ${why}`);
+  };
+  if (env.factChanges.length !== changes.facts.length || env.loopChanges.length !== changes.loops.length) {
+    fail('cardinality mismatch');
+  }
+  changes.facts.forEach((f, i) => {
+    const named = env.factChanges[i].factId;
+    if (named !== undefined ? (named !== f.factId || f.created) : !f.created) fail(`fact[${i}] id/created mismatch`);
+  });
+  changes.loops.forEach((l, i) => {
+    const named = env.loopChanges[i].loopId;
+    if (named !== undefined ? (named !== l.loopId || l.created) : !l.created) fail(`loop[${i}] id/created mismatch`);
+  });
 }
 
 function readEnvelope(db: DatabaseType.Database, tenantId: string, contentHash: string, stateId: string): Envelope {
@@ -313,42 +350,76 @@ function assertNullDigestIsBare(db: DatabaseType.Database, tenantId: string, sna
   }
 }
 
+/** Effective per-scope cutover mark: the revision through which coverage is known complete, or null. */
+export function coverageCutover(db: DatabaseType.Database, tenantId: string, scopeKey: string): number | null {
+  const row = db.prepare(
+    `SELECT MAX(through_revision) AS r FROM eng4_version_cutover WHERE tenant_id = ? AND scope_key = ?`
+  ).get(tenantId, scopeKey) as { r: number | null };
+  return row.r === null ? null : Number(row.r);
+}
+
+/** Whether a snapshot's coverage was produced by a backfill (immutable mark). */
+export function wasBackfilled(db: DatabaseType.Database, tenantId: string, scopeKey: string, stateId: string): boolean {
+  return !!db.prepare(
+    `SELECT 1 FROM eng4_version_backfills WHERE tenant_id = ? AND scope_key = ? AND state_id = ?`
+  ).get(tenantId, scopeKey, stateId);
+}
+
 /**
  * Verified backfill of every ledger-bound snapshot that has no coverage yet,
  * plus structural checks on everything else. Throws CheckpointIntegrityError
  * on any failure so the caller's transaction rolls the whole apply back.
- * Idempotent: an already-covered snapshot only gets its cardinality checked
- * here (full value parity is verifyVersionParity's job).
+ *
+ * Idempotent and cheap on a healthy store: a covered snapshot only gets a
+ * COUNT parity check (ledger rows vs coverage rows) — no payload read, no
+ * hashing; full value parity is verifyVersionParity's job (tests now, resume
+ * in H4). An uncovered ledger-bound snapshot is backfilled only if it lies
+ * ABOVE the scope's immutable cutover mark (a pre-H2 binary wrote it after a
+ * rollback); at or below the mark its coverage was erased → refuse. Each
+ * backfilled snapshot gets an append-only backfill mark, and the scope's
+ * cutover mark advances to its max revision.
  */
 export function backfillVersionFoundation(db: DatabaseType.Database): BackfillSummary {
   const summary: BackfillSummary = { scopesScanned: 0, snapshotsScanned: 0, snapshotsBackfilled: 0, materialized: 0, unversioned: 0 };
   const scopes = db.prepare(`SELECT DISTINCT tenant_id, scope_key FROM eng4_state_snapshots ORDER BY tenant_id, scope_key`)
     .all() as Array<{ tenant_id: string; scope_key: string }>;
+  const appliedAt = new Date().toISOString();
   for (const { tenant_id: tenantId, scope_key: scopeKey } of scopes) {
     summary.scopesScanned++;
+    const cutover = coverageCutover(db, tenantId, scopeKey);
+    let maxRevision = 0;
     for (const snap of snapshotsOfScope(db, tenantId, scopeKey)) {
       summary.snapshotsScanned++;
+      maxRevision = Math.max(maxRevision, snap.revision);
       if (snap.changes_hash === null) {
         assertNullDigestIsBare(db, tenantId, snap);
         continue;
       }
-      verifyPayloadIntegrity(db, tenantId, snap.content_hash);
-      const changes = readSnapshotChanges(db, tenantId, snap.state_id, snap.content_hash, snap.changes_hash, true) as CheckpointChanges;
-      const expectedTuples = changes.facts.length + changes.loops.length;
+      const ledgerRows = countRows(db, 'eng4_snapshot_changes', tenantId, snap.state_id);
       const coverage = countRows(db, 'eng4_version_coverage', tenantId, snap.state_id);
-      if (coverage > 0) {
-        if (coverage !== expectedTuples) {
+      if (coverage > 0 || ledgerRows === 0) {
+        // Covered (or nothing to cover): structural parity only.
+        if (coverage !== ledgerRows) {
           throw new CheckpointIntegrityError(
-            `eng4: snapshot ${snap.state_id} has ${coverage} coverage rows for ${expectedTuples} ledger tuples`
+            `eng4: snapshot ${snap.state_id} has ${coverage} coverage rows for ${ledgerRows} ledger tuples`
           );
         }
         continue;
       }
-      // Uncovered ledger-bound snapshot: reconstruct from immutable data only.
-      const env = readEnvelope(db, tenantId, snap.content_hash, snap.state_id);
-      if (env.factChanges.length !== changes.facts.length || env.loopChanges.length !== changes.loops.length) {
-        throw new CheckpointIntegrityError(`eng4: envelope/ledger cardinality mismatch for ${snap.state_id}`);
+      if (cutover !== null && snap.revision <= cutover) {
+        throw new CheckpointIntegrityError(
+          `eng4: snapshot ${snap.state_id} (revision ${snap.revision}) is below the scope's coverage cutover ${cutover} yet has no coverage — erased, not legacy`
+        );
       }
+      // Uncovered ledger-bound snapshot above the cutover: reconstruct from
+      // immutable data only, after full verification of that data.
+      verifyPayloadIntegrity(db, tenantId, snap.content_hash);
+      const changes = readSnapshotChanges(db, tenantId, snap.state_id, snap.content_hash, snap.changes_hash, true) as CheckpointChanges;
+      const env = readEnvelope(db, tenantId, snap.content_hash, snap.state_id);
+      assertLedgerAgreesWithEnvelope(snap.state_id, changes, env);
+      db.prepare(
+        `INSERT INTO eng4_version_backfills (tenant_id, scope_key, state_id, applied_at) VALUES (?, ?, ?, ?)`
+      ).run(tenantId, scopeKey, snap.state_id, appliedAt);
       changes.facts.forEach((f, i) => {
         insertCoverage(db, tenantId, scopeKey, snap.state_id, 'fact', i, f.factId, 'materialized', null, 'backfill');
         insertFactVersion(db, tenantId, scopeKey, f.factId, snap.state_id, i, factVersionValue(env.factChanges[i]), snap.author, snap.recorded_at);
@@ -368,6 +439,13 @@ export function backfillVersionFoundation(db: DatabaseType.Database): BackfillSu
         summary.materialized++;
       });
       summary.snapshotsBackfilled++;
+    }
+    // Advance the immutable cutover: everything at or below maxRevision is now
+    // known covered (or bare). Only when it actually moves (idempotent).
+    if (maxRevision > 0 && (cutover === null || maxRevision > cutover)) {
+      db.prepare(
+        `INSERT INTO eng4_version_cutover (tenant_id, scope_key, through_revision, applied_at) VALUES (?, ?, ?, ?)`
+      ).run(tenantId, scopeKey, maxRevision, appliedAt);
     }
   }
   return summary;
@@ -414,9 +492,10 @@ export function verifyVersionParity(db: DatabaseType.Database, tenantId: string,
     verifyPayloadIntegrity(db, tenantId, snap.content_hash);
     const changes = readSnapshotChanges(db, tenantId, snap.state_id, snap.content_hash, snap.changes_hash, true) as CheckpointChanges;
     const env = readEnvelope(db, tenantId, snap.content_hash, snap.state_id);
-    if (env.factChanges.length !== changes.facts.length || env.loopChanges.length !== changes.loops.length) {
-      fail(snap.state_id, 'envelope/ledger cardinality mismatch');
-    }
+    assertLedgerAgreesWithEnvelope(snap.state_id, changes, env);
+    // The expected coverage source comes from the immutable backfill mark,
+    // never from the coverage row itself (review finding 2).
+    const expectedSource: 'write' | 'backfill' = wasBackfilled(db, tenantId, scopeKey, snap.state_id) ? 'backfill' : 'write';
     const coverage = db.prepare(
       `SELECT kind, ordinal, change_id, disposition, reason, source FROM eng4_version_coverage
         WHERE tenant_id = ? AND state_id = ? ORDER BY kind, ordinal`
@@ -427,6 +506,7 @@ export function verifyVersionParity(db: DatabaseType.Database, tenantId: string,
       const row = coverage.find((c) => c.kind === kind && c.ordinal === ordinal);
       if (!row) return fail(snap.state_id, `missing coverage for ${kind}[${ordinal}]`);
       if (row.change_id !== changeId) return fail(snap.state_id, `coverage change_id mismatch for ${kind}[${ordinal}]`);
+      if (row.source !== expectedSource) return fail(snap.state_id, `coverage source for ${kind}[${ordinal}] is '${row.source}' but the backfill mark says '${expectedSource}'`);
       return row;
     };
 
@@ -455,7 +535,7 @@ export function verifyVersionParity(db: DatabaseType.Database, tenantId: string,
     let expectedLoopVersions = 0;
     changes.loops.forEach((l, i) => {
       const cov = covOf('loop', i, l.loopId);
-      const exp = expectLoop(db, tenantId, scopeKey, snap, i, env.loopChanges[i], l.created, l.loopId, cov.source);
+      const exp = expectLoop(db, tenantId, scopeKey, snap, i, env.loopChanges[i], l.created, l.loopId, expectedSource);
       const row = db.prepare(
         `SELECT owner, status, next_action, due_at, blocked_on, close_json, author, recorded_at
            FROM eng4_loop_versions WHERE tenant_id = ? AND scope_key = ? AND loop_id = ? AND state_id = ? AND ordinal = ?`

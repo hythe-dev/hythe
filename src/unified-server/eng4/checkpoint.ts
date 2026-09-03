@@ -518,11 +518,9 @@ export function performCheckpoint(
 
     // 2(c) materialization — same transaction, after the snapshot; a bad
     // change throws and rolls back the ENTIRE checkpoint.
+    const appliedFacts = applyFactChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.factChanges ?? []);
     const appliedLoops = applyLoopChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.loopChanges ?? []);
-    const changes: CheckpointChanges = {
-      facts: applyFactChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.factChanges ?? []),
-      loops: appliedLoops.loops,
-    };
+    const changes: CheckpointChanges = { facts: appliedFacts, loops: appliedLoops.loops };
     recordSnapshotChanges(db, tenantId, stateId, changes);
     // H2 dual write (§6.2): exact `materialized` coverage + version rows for
     // every change, after the ledger they FK. The in-place rows above remain

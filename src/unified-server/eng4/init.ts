@@ -33,10 +33,13 @@ export interface ApplyEng4SchemaResult {
   /**
    * ENG-4 H2 (design 3429000 §6.2): the verified version backfill that runs
    * in the SAME transaction as the DDL on every apply — reconstructing
-   * coverage + versions for ledger-bound snapshots that have none, checking
-   * that null-digest snapshots are bare and covered snapshots are complete.
-   * Any integrity failure rolls the whole apply back (fail closed: the
-   * server does not start on a store whose version foundation is corrupt).
+   * coverage + versions for ledger-bound snapshots above the scope's cutover
+   * mark that have none, and checking STRUCTURE everywhere: null-digest
+   * snapshots are bare, covered snapshots have one coverage row per ledger
+   * row, and no snapshot at or below the cutover is uncovered. Any such
+   * failure rolls the whole apply back (the server does not start). Full
+   * VALUE parity of already-covered snapshots is verifyVersionParity's job
+   * (contract tests now; resume in H4), not a startup check.
    * Absent only when `statementsOverride` is used (rollback tests).
    */
   versionBackfill?: BackfillSummary;

@@ -32,7 +32,7 @@ import Database from 'better-sqlite3';
 import type { CheckpointParams, FactChange, WorkingState } from '../src/unified-server/eng4/contracts.js';
 import { RESUME_OUTPUT_SCHEMA_V3 } from '../src/unified-server/eng4/schemas.js';
 import { applyEng4Schema } from '../src/unified-server/eng4/init.js';
-import { performCheckpoint, CheckpointChangeError, CheckpointIntegrityError } from '../src/unified-server/eng4/checkpoint.js';
+import { performCheckpoint, changesHash, CheckpointChangeError, CheckpointIntegrityError } from '../src/unified-server/eng4/checkpoint.js';
 import { performResume, type ResumeDirectory } from '../src/unified-server/eng4/resume.js';
 import { canonicalize } from '../src/unified-server/eng4/canonical.js';
 import { verifyVersionParity, UNVERSIONED_REASON_INHERITED_OWNER } from '../src/unified-server/eng4/versions.js';
@@ -109,6 +109,8 @@ const TRIGGERS = [
   'trg_eng4_fact_versions_immutable', 'trg_eng4_fact_versions_no_delete',
   'trg_eng4_loop_versions_immutable', 'trg_eng4_loop_versions_no_delete',
   'trg_eng4_version_coverage_immutable', 'trg_eng4_version_coverage_no_delete',
+  'trg_eng4_version_backfills_immutable', 'trg_eng4_version_backfills_no_delete',
+  'trg_eng4_version_cutover_immutable', 'trg_eng4_version_cutover_no_delete',
 ];
 const ddlFor = (name: string) => (DDL_STANDALONE as readonly string[]).find((s) => s.includes(name))!;
 /** Out-of-band corruption fixture: drop the triggers, modify, restore the exact trigger DDL. */
@@ -116,18 +118,28 @@ const bypass = (db: any, fn: () => void) => {
   for (const t of TRIGGERS) db.exec(`DROP TRIGGER ${t}`);
   try { fn(); } finally { for (const t of TRIGGERS) db.exec(ddlFor(t)); }
 };
-/** Simulate a pre-H2 store: ledger and digests intact, no coverage or versions anywhere. */
+/** Simulate a store that never ran H2: ledger and digests intact; no coverage, versions or cutover/backfill marks anywhere. */
 const stripVersionFoundation = (db: any) => bypass(db, () => {
-  db.exec(`DELETE FROM eng4_version_coverage; DELETE FROM eng4_fact_versions; DELETE FROM eng4_loop_versions;`);
+  db.exec(`DELETE FROM eng4_version_coverage; DELETE FROM eng4_fact_versions; DELETE FROM eng4_loop_versions;
+           DELETE FROM eng4_version_backfills; DELETE FROM eng4_version_cutover;`);
+});
+/** Erase ONE snapshot's coverage + versions while leaving the immutable marks in place (the erasure the cutover mark must catch). */
+const eraseCoverage = (db: any, stateId: string) => bypass(db, () => {
+  db.prepare(`DELETE FROM eng4_version_coverage WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
+  db.prepare(`DELETE FROM eng4_fact_versions WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
+  db.prepare(`DELETE FROM eng4_loop_versions WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
 });
 /** Simulate a pre-ledger (pre-PR #8) snapshot: no ledger rows, null digest, no coverage/versions. */
 const makePreLedger = (db: any, stateId: string) => bypass(db, () => {
   db.prepare(`DELETE FROM eng4_version_coverage WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
   db.prepare(`DELETE FROM eng4_fact_versions WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
   db.prepare(`DELETE FROM eng4_loop_versions WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
+  db.prepare(`DELETE FROM eng4_version_backfills WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
   db.prepare(`DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
   db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`).run(TENANT, stateId);
 });
+const cutoverOf = (db: any, scope = SCOPE) => (db.prepare(`SELECT MAX(through_revision) AS r FROM eng4_version_cutover WHERE tenant_id=? AND scope_key=?`).get(TENANT, scope) as any).r;
+const backfillMarks = (db: any) => db.prepare(`SELECT state_id FROM eng4_version_backfills WHERE tenant_id=? ORDER BY state_id`).all(TENANT).map((r: any) => r.state_id);
 /** Whole-store dump of the version foundation (coverage without `source`, so write/backfill dumps compare). */
 const dump = (db: any) => ({
   coverage: db.prepare(`SELECT tenant_id, scope_key, state_id, kind, ordinal, change_id, disposition, reason FROM eng4_version_coverage ORDER BY state_id, kind, ordinal`).all(),
@@ -386,7 +398,128 @@ describe('H2 backfill — verified, ledger-bound, all-or-nothing, idempotent (§
     expect(coverage(db, upd.stateId)[0]).toMatchObject({ disposition: 'unversioned', reason: UNVERSIONED_REASON_INHERITED_OWNER, source: 'backfill' });
   });
 
-  it('ALL-OR-NOTHING: a altered ledger in one snapshot aborts the whole backfill — no coverage row lands for ANY snapshot', () => {
+  it('LEDGER vs PAYLOAD ID (review finding 1): a ledger tuple re-keyed to a different fact — with a matching digest — is refused by both backfill and verifier', () => {
+    const db = freshDb();
+    const w = write(db, { factChanges: [fact('A'), fact('B')] });
+    const [A, B] = w.changes.facts.map((f: any) => f.factId);
+    const u = write(db, { expectedRevision: w.revision, factChanges: [fact('A2', { factId: A })] });
+    // Out of band: point U's ledger at B and make the digest agree, so only the payload disagrees.
+    bypass(db, () => {
+      db.prepare(`UPDATE eng4_snapshot_changes SET change_id=? WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=0`).run(B, TENANT, u.stateId);
+      db.prepare(`UPDATE eng4_state_snapshots SET changes_hash=? WHERE tenant_id=? AND state_id=?`).run(changesHash({ facts: [{ factId: B, created: false }], loops: [] }), TENANT, u.stateId);
+    });
+    expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/ledger\/payload disagreement .* fact\[0\] id\/created mismatch/);
+    stripVersionFoundation(db);
+    expect(() => applyEng4Schema(db)).toThrow(/ledger\/payload disagreement/);
+    expect(count(db, 'eng4_fact_versions')).toBe(0); // nothing landed for anyone
+    // created-flag disagreement is caught the same way.
+    const db2 = freshDb();
+    const w2 = write(db2, { factChanges: [fact('C')] });
+    bypass(db2, () => {
+      db2.prepare(`UPDATE eng4_snapshot_changes SET created=0 WHERE tenant_id=? AND state_id=?`).run(TENANT, w2.stateId);
+      db2.prepare(`UPDATE eng4_state_snapshots SET changes_hash=? WHERE tenant_id=? AND state_id=?`).run(changesHash({ facts: [{ factId: w2.changes.facts[0].factId, created: false }], loops: [] }), TENANT, w2.stateId);
+    });
+    expect(() => verifyVersionParity(db2, TENANT, SCOPE)).toThrow(/fact\[0\] id\/created mismatch/);
+  });
+
+  it('CUTOVER MARK (review finding 3): erasing a covered snapshot\'s coverage is refused at the next apply — never silently re-backfilled', () => {
+    const db = freshDb();
+    const root = write(db, { loopChanges: [{ status: 'open', nextAction: 'L0', owner: 'orig' }] });
+    const L = root.changes.loops[0].loopId;
+    makePreLedger(db, root.stateId);
+    const upd = write(db, { expectedRevision: root.revision, loopChanges: [{ loopId: L, status: 'open', nextAction: 'L1' }] }); // owner known only to the writer
+    applyEng4Schema(db); // records the cutover through revision 2
+    expect(cutoverOf(db)).toBe(2);
+    eraseCoverage(db, upd.stateId);
+    expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/expected 1 coverage rows, found 0/);
+    expect(() => applyEng4Schema(db)).toThrow(/below the scope's coverage cutover 2 yet has no coverage/);
+    expect(coverage(db, upd.stateId)).toEqual([]); // not "repaired" into an unversioned row
+    expect(cutoverOf(db)).toBe(2);
+  });
+
+  it('CUTOVER MARK: an uncovered snapshot ABOVE the mark (a pre-H2 binary wrote it after a rollback) is legitimately backfilled and the mark advances', () => {
+    const db = freshDb();
+    const { s4 } = history(db);
+    applyEng4Schema(db);
+    expect(cutoverOf(db)).toBe(4);
+    const s5 = write(db, { expectedRevision: s4.revision, factChanges: [fact('late')] });
+    eraseCoverage(db, s5.stateId); // as if the writer had been a pre-H2 binary
+    const result = applyEng4Schema(db);
+    expect(result.versionBackfill).toMatchObject({ snapshotsBackfilled: 1, materialized: 1 });
+    expect(coverage(db, s5.stateId)).toEqual([expect.objectContaining({ disposition: 'materialized', source: 'backfill' })]);
+    expect(backfillMarks(db)).toEqual([s5.stateId]);
+    expect(cutoverOf(db)).toBe(5);
+    expect(verifyVersionParity(db, TENANT, SCOPE).snapshotsVerified).toBe(5);
+    // Now it is below the mark: a second erasure is refused.
+    eraseCoverage(db, s5.stateId);
+    expect(() => applyEng4Schema(db)).toThrow(/below the scope's coverage cutover 5/);
+  });
+
+  it('BACKFILL MARK (review finding 2): relabelling a backfilled unversioned tuple as a writer\'s materialized value — or a written tuple as backfilled — is detected', () => {
+    const db = freshDb();
+    const { root, s2, L } = history(db);
+    makePreLedger(db, root.stateId);
+    stripVersionFoundation(db);
+    applyEng4Schema(db);
+    expect(coverage(db, s2.stateId)[1]).toMatchObject({ change_id: L, disposition: 'unversioned', source: 'backfill' });
+    bypass(db, () => {
+      db.prepare(`UPDATE eng4_version_coverage SET disposition='materialized', reason=NULL, source='write' WHERE tenant_id=? AND state_id=? AND kind='loop' AND ordinal=0`).run(TENANT, s2.stateId);
+      db.prepare(
+        `INSERT INTO eng4_loop_versions (tenant_id, scope_key, loop_id, state_id, ordinal, owner, status, next_action, due_at, blocked_on, close_json, author, recorded_at)
+         VALUES (?, ?, ?, ?, 0, 'invented-owner', 'blocked', 'L1', NULL, 'x', NULL, 'claude-hythe', ?)`
+      ).run(TENANT, SCOPE, L, s2.stateId, snap(db, s2.stateId).recorded_at);
+    });
+    expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/backfill mark says 'backfill'/);
+    // Reverse: a written snapshot's rows claiming to be a backfill.
+    const db2 = freshDb();
+    const w = write(db2, { factChanges: [fact('a')] });
+    bypass(db2, () => db2.prepare(`UPDATE eng4_version_coverage SET source='backfill' WHERE tenant_id=? AND state_id=?`).run(TENANT, w.stateId));
+    expect(() => verifyVersionParity(db2, TENANT, SCOPE)).toThrow(/backfill mark says 'write'/);
+  });
+
+  it('a post-H2 write whose predecessor tuple is unversioned records the exact in-place owner; the next omitted-owner write chains from it deterministically', () => {
+    const db = freshDb();
+    const { root, L } = history(db);
+    makePreLedger(db, root.stateId);
+    stripVersionFoundation(db);
+    applyEng4Schema(db); // s2's L tuple is unversioned
+    const head = (db.prepare(`SELECT MAX(revision) AS r FROM eng4_state_snapshots WHERE tenant_id=? AND scope_key=?`).get(TENANT, SCOPE) as any).r;
+    const w5 = write(db, { expectedRevision: head, loopChanges: [{ loopId: L, status: 'open', nextAction: 'L5' }] });
+    expect(coverage(db, w5.stateId)[0]).toMatchObject({ disposition: 'materialized', source: 'write' });
+    expect(loopVersions(db, w5.stateId)[0]).toMatchObject({ owner: 'y' }); // in-place owner after s3/s4
+    const w6 = write(db, { expectedRevision: w5.revision, loopChanges: [{ loopId: L, status: 'open', nextAction: 'L6' }] });
+    expect(loopVersions(db, w6.stateId)[0]).toMatchObject({ owner: 'y' });
+    expect(verifyVersionParity(db, TENANT, SCOPE)).toMatchObject({ unversioned: 1 });
+  });
+
+  it('zero-change ledger-bound snapshots are never counted as backfilled; multiple scopes are scanned and marked independently', () => {
+    const db = freshDb();
+    const { s4 } = history(db);
+    write(db, { expectedRevision: s4.revision }); // resultVersion 2, no changes: digest present, zero tuples
+    performCheckpoint(db, directory, TENANT, cp({ scope: { project: 'Other' }, factChanges: [fact('o')] }));
+    stripVersionFoundation(db);
+    const first = applyEng4Schema(db);
+    expect(first.versionBackfill).toMatchObject({ scopesScanned: 2, snapshotsScanned: 6, snapshotsBackfilled: 5 }); // 4 history + 1 Other; the zero-change one is not
+    expect(cutoverOf(db, OTHER)).toBe(1);
+    const again = applyEng4Schema(db);
+    expect(again.versionBackfill).toMatchObject({ snapshotsBackfilled: 0 });
+    expect(again.versionBackfill).toEqual(applyEng4Schema(db).versionBackfill);
+  });
+
+  it('the mark tables are append-only', () => {
+    const db = freshDb();
+    write(db, { factChanges: [fact('a')] });
+    applyEng4Schema(db);
+    expect(() => db.prepare(`UPDATE eng4_version_cutover SET through_revision=99`).run()).toThrow(/append-only/);
+    expect(() => db.prepare(`DELETE FROM eng4_version_cutover`).run()).toThrow(/append-only/);
+    stripVersionFoundation(db);
+    applyEng4Schema(db);
+    expect(backfillMarks(db)).toHaveLength(1);
+    expect(() => db.prepare(`UPDATE eng4_version_backfills SET applied_at='x'`).run()).toThrow(/append-only/);
+    expect(() => db.prepare(`DELETE FROM eng4_version_backfills`).run()).toThrow(/append-only/);
+  });
+
+  it('ALL-OR-NOTHING: an altered ledger in one snapshot aborts the whole backfill — no coverage row lands for ANY snapshot', () => {
     const db = freshDb();
     const { s2 } = history(db);
     stripVersionFoundation(db);
@@ -476,7 +609,8 @@ describe('H2 verifier — bidirectional, fails CLOSED on every corruption fixtur
   it('a flipped disposition: materialized→unversioned on a fact, or a version present for an unversioned tuple', () => {
     const { db, s2 } = healthy();
     bypass(db, () => db.prepare(`UPDATE eng4_version_coverage SET disposition='unversioned', reason=?, source='backfill' WHERE tenant_id=? AND state_id=? AND kind='fact'`).run(UNVERSIONED_REASON_INHERITED_OWNER, TENANT, s2.stateId));
-    expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/fact\[0\] must be materialized/);
+    // The CHECK forces a relabelled row to claim source=backfill; the immutable mark says otherwise.
+    expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/backfill mark says 'write'/);
 
     // Genuine unversioned tuple (unprovable owner) + an unexpected version row for it.
     const db2 = freshDb();
