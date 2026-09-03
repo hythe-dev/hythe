@@ -111,7 +111,7 @@ const TRIGGERS = [
   'trg_eng4_version_coverage_immutable', 'trg_eng4_version_coverage_no_delete',
 ];
 const ddlFor = (name: string) => (DDL_STANDALONE as readonly string[]).find((s) => s.includes(name))!;
-/** Out-of-band corruption fixture: drop the triggers, tamper, restore the exact trigger DDL. */
+/** Out-of-band corruption fixture: drop the triggers, modify, restore the exact trigger DDL. */
 const bypass = (db: any, fn: () => void) => {
   for (const t of TRIGGERS) db.exec(`DROP TRIGGER ${t}`);
   try { fn(); } finally { for (const t of TRIGGERS) db.exec(ddlFor(t)); }
@@ -386,11 +386,11 @@ describe('H2 backfill — verified, ledger-bound, all-or-nothing, idempotent (§
     expect(coverage(db, upd.stateId)[0]).toMatchObject({ disposition: 'unversioned', reason: UNVERSIONED_REASON_INHERITED_OWNER, source: 'backfill' });
   });
 
-  it('ALL-OR-NOTHING: a tampered ledger in one snapshot aborts the whole backfill — no coverage row lands for ANY snapshot', () => {
+  it('ALL-OR-NOTHING: a altered ledger in one snapshot aborts the whole backfill — no coverage row lands for ANY snapshot', () => {
     const db = freshDb();
     const { s2 } = history(db);
     stripVersionFoundation(db);
-    db.prepare(`UPDATE eng4_snapshot_changes SET change_id='forged' WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=0`).run(TENANT, s2.stateId);
+    db.prepare(`UPDATE eng4_snapshot_changes SET change_id='inconsistent' WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=0`).run(TENANT, s2.stateId);
     expect(() => applyEng4Schema(db)).toThrow(CheckpointIntegrityError);
     expect(count(db, 'eng4_version_coverage')).toBe(0);
     expect(count(db, 'eng4_fact_versions')).toBe(0);
@@ -449,12 +449,12 @@ describe('H2 verifier — bidirectional, fails CLOSED on every corruption fixtur
     expect(() => verifyVersionParity(db2, TENANT, SCOPE)).toThrow(/missing loop version/);
   });
 
-  it('a tampered version value (object, owner, close event, refs, author)', () => {
+  it('a altered version value (object, owner, close event, refs, author)', () => {
     for (const [sql, pattern] of [
-      [`UPDATE eng4_fact_versions SET object='tampered'`, /fact version value mismatch/],
+      [`UPDATE eng4_fact_versions SET object='altered'`, /fact version value mismatch/],
       [`UPDATE eng4_fact_versions SET refs_json='{}'`, /fact version value mismatch/],
       [`UPDATE eng4_fact_versions SET author='someone-else'`, /fact version value mismatch/],
-      [`UPDATE eng4_loop_versions SET owner='hijacked'`, /loop version value mismatch/],
+      [`UPDATE eng4_loop_versions SET owner='changed'`, /loop version value mismatch/],
       [`UPDATE eng4_loop_versions SET close_json=NULL WHERE close_json IS NOT NULL`, /loop version value mismatch/],
       [`UPDATE eng4_loop_versions SET recorded_at='1970-01-01T00:00:00Z'`, /loop version value mismatch/],
     ] as const) {
@@ -478,7 +478,7 @@ describe('H2 verifier — bidirectional, fails CLOSED on every corruption fixtur
     bypass(db, () => db.prepare(`UPDATE eng4_version_coverage SET disposition='unversioned', reason=?, source='backfill' WHERE tenant_id=? AND state_id=? AND kind='fact'`).run(UNVERSIONED_REASON_INHERITED_OWNER, TENANT, s2.stateId));
     expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/fact\[0\] must be materialized/);
 
-    // Genuine unversioned tuple (unprovable owner) + a forged version for it.
+    // Genuine unversioned tuple (unprovable owner) + an unexpected version row for it.
     const db2 = freshDb();
     const { root, s2: t2, L } = history(db2);
     makePreLedger(db2, root.stateId);
@@ -496,7 +496,7 @@ describe('H2 verifier — bidirectional, fails CLOSED on every corruption fixtur
     bypass(db, () => db.prepare(`UPDATE eng4_version_coverage SET change_id='other' WHERE tenant_id=? AND state_id=? AND kind='fact'`).run(TENANT, s2.stateId));
     expect(() => verifyVersionParity(db, TENANT, SCOPE)).toThrow(/coverage change_id mismatch/);
     const { db: db2, s3 } = healthy();
-    db2.pragma('foreign_keys = OFF'); // raw-access tamper: coverage FKs the ledger, the digest is what catches it
+    db2.pragma('foreign_keys = OFF'); // out-of-band change: coverage FKs the ledger, the digest is what catches it
     db2.prepare(`DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=? AND ordinal=1`).run(TENANT, s3.stateId);
     db2.pragma('foreign_keys = ON');
     expect(() => verifyVersionParity(db2, TENANT, SCOPE)).toThrow(CheckpointIntegrityError);

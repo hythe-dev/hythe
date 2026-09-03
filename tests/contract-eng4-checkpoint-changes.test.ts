@@ -17,7 +17,7 @@
  *   is ALWAYS written in the checkpoint transaction. Replay verifies it
  *   against the hash-verified persisted envelope and FAILS CLOSED
  *   (CheckpointIntegrityError) on any partial, duplicated, mis-ordered, or
- *   tampered ledger — never a subset. Verification runs on every replay,
+ *   altered ledger — never a subset. Verification runs on every replay,
  *   v1 included; the opt-in only decides whether the answer is returned.
  * - "No rows AND no digest" is accepted as a pre-ledger snapshot ONLY on a
  *   matched v1 replay. A matched resultVersion=2 replay is fingerprint-proven
@@ -85,24 +85,24 @@ const ledgerRows = (db: any, stateId: string) =>
 /**
  * Out-of-band corruption fixture (ENG-4 H1): trg_eng4_snapshots_immutable
  * forbids every snapshot UPDATE except the single digest write, so
- * simulating erasure/tampering must bypass it explicitly — as a hostile actor
- * with raw database access would. The exact trigger DDL is re-executed
+ * simulating erasure or alteration must bypass it explicitly — as an out-of-band process
+ * with direct database access would. The exact trigger DDL is re-executed
  * afterwards (not the whole schema apply: since H2 that also runs the
  * verified version backfill, which correctly refuses a store whose digest
  * was erased under existing coverage rows — the very corruption we model).
  */
 /**
- * Ledger tampering fixture (ENG-4 H2): coverage rows FK the ledger, so a
- * "hostile raw write" that deletes or re-keys ledger rows must switch FK
- * enforcement off for the tamper, as a raw-access attacker would — the
+ * Ledger out-of-band modification fixture (ENG-4 H2): coverage rows FK the ledger, so a
+ * direct out-of-band write that deletes or re-keys ledger rows must switch FK
+ * enforcement off for the modification, as any direct database write would — the
  * digest (not the FK) is what replay verification catches it with.
  */
-const tamperLedger = (db: any, sql: string, ...args: unknown[]) => {
+const modifyLedgerOutOfBand = (db: any, sql: string, ...args: unknown[]) => {
   db.pragma('foreign_keys = OFF');
   try { db.prepare(sql).run(...args); } finally { db.pragma('foreign_keys = ON'); }
 };
 const IMMUTABLE_TRIGGER_DDL = (DDL_STANDALONE as readonly string[]).find((s) => s.includes('trg_eng4_snapshots_immutable'))!;
-const tamperSnapshot = (db: any, sql: string, ...args: unknown[]) => {
+const modifySnapshotOutOfBand = (db: any, sql: string, ...args: unknown[]) => {
   db.exec(`DROP TRIGGER trg_eng4_snapshots_immutable`);
   db.prepare(sql).run(...args);
   db.exec(IMMUTABLE_TRIGGER_DDL);
@@ -251,23 +251,23 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const params = twoFacts();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperLedger(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=1`, TENANT, written.stateId);
+    modifyLedgerOutOfBand(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=1`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(CheckpointIntegrityError);
   });
 
-  it('tampered change_id (counts and ordinals intact) fails the digest', () => {
+  it('altered change_id (counts and ordinals intact) fails the digest', () => {
     const db = freshDb();
     const params = twoFacts();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperLedger(db, `UPDATE eng4_snapshot_changes SET change_id='forged' WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=0`, TENANT, written.stateId);
+    modifyLedgerOutOfBand(db, `UPDATE eng4_snapshot_changes SET change_id='inconsistent' WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=0`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/digest mismatch/);
   });
 
-  it('tampered created flag fails the digest', () => {
+  it('altered created flag fails the digest', () => {
     const db = freshDb();
     const params = twoFacts();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperLedger(db, `UPDATE eng4_snapshot_changes SET created=0 WHERE tenant_id=? AND state_id=? AND kind='loop' AND ordinal=0`, TENANT, written.stateId);
+    modifyLedgerOutOfBand(db, `UPDATE eng4_snapshot_changes SET created=0 WHERE tenant_id=? AND state_id=? AND kind='loop' AND ordinal=0`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/digest mismatch/);
   });
 
@@ -275,7 +275,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const params = twoFacts();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperLedger(db, `UPDATE eng4_snapshot_changes SET ordinal=7 WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=1`, TENANT, written.stateId);
+    modifyLedgerOutOfBand(db, `UPDATE eng4_snapshot_changes SET ordinal=7 WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=1`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/not contiguous/);
   });
 
@@ -283,7 +283,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const params = twoFacts();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
+    modifySnapshotOutOfBand(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/no stored digest/);
   });
 
@@ -291,7 +291,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const params = cp({ factChanges: [fact('alpha'), fact('beta')] });
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperLedger(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=1`, TENANT, written.stateId);
+    modifyLedgerOutOfBand(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=? AND kind='fact' AND ordinal=1`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(CheckpointIntegrityError);
   });
 
@@ -299,8 +299,8 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const params = cp2({ factChanges: [fact('alpha')] });
     const written = performCheckpoint(db, directory, TENANT, params) as any;
-    tamperLedger(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
-    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
+    modifyLedgerOutOfBand(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
+    modifySnapshotOutOfBand(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(/ledger and digest absent/);
   });
 
@@ -309,7 +309,7 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const params = cp2();
     const written = performCheckpoint(db, directory, TENANT, params) as any;
     expect(ledgerRows(db, written.stateId)).toEqual([]);
-    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
+    modifySnapshotOutOfBand(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, written.stateId);
     expect(() => performCheckpoint(db, directory, TENANT, params)).toThrow(CheckpointIntegrityError);
   });
 
@@ -317,15 +317,15 @@ describe('ENG-4 PR A — ledger integrity fails CLOSED (review 5e486718 blocker 
     const db = freshDb();
     const withChanges = cp({ factChanges: [fact('alpha')] });
     const w1 = performCheckpoint(db, directory, TENANT, withChanges) as any;
-    tamperLedger(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`, TENANT, w1.stateId);
-    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, w1.stateId);
+    modifyLedgerOutOfBand(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`, TENANT, w1.stateId);
+    modifySnapshotOutOfBand(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, w1.stateId);
     const r1 = performCheckpoint(db, directory, TENANT, withChanges) as any;
     expect(r1.outcome).toBe('idempotent-replay');
     expect('changes' in r1).toBe(false);
 
     const without = cp({ expectedRevision: 1, idempotencyKey: 'k-2' });
     const w2 = performCheckpoint(db, directory, TENANT, without) as any;
-    tamperSnapshot(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, w2.stateId);
+    modifySnapshotOutOfBand(db, `UPDATE eng4_state_snapshots SET changes_hash=NULL WHERE tenant_id=? AND state_id=?`, TENANT, w2.stateId);
     const r2 = performCheckpoint(db, directory, TENANT, without) as any;
     expect(r2.outcome).toBe('idempotent-replay');
     expect('changes' in r2).toBe(false);
@@ -378,7 +378,7 @@ describe('ENG-4 PR A — schema and envelope invariants', () => {
     const res = performCheckpoint(db, directory, TENANT, cp2({ factChanges: [fact('alpha')] })) as any;
     const before = snapRow(db, res.stateId);
     expect(before.content_hash).toBe(res.contentHash);
-    tamperLedger(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`, TENANT, res.stateId);
+    modifyLedgerOutOfBand(db, `DELETE FROM eng4_snapshot_changes WHERE tenant_id=? AND state_id=?`, TENANT, res.stateId);
     const after = snapRow(db, res.stateId);
     expect(after.content_hash).toBe(before.content_hash);
     expect(after.request_fingerprint).toBe(before.request_fingerprint);
