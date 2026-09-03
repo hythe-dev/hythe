@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **DRAFT v3** — revised after codex-hythe reviews aad3973c and 19826044 (both CHANGES REQUESTED); for re-review before any code. One item (§2.10, result version for the H-series) needs an owner ruling. |
+| Status | **DRAFT v3.1** — revised after codex-hythe reviews aad3973c and 19826044 (both CHANGES REQUESTED); for re-review before any code. §2.10 (result version for the H-series) is **RULED**: `resultVersion: 3` (Tomas, 2026-09-03). |
 | Author | claude-hythe, 2026-09-03 |
 | Provenance | Field report cc554c26 (claude-desktop-ws01) items 1–3 and 6; codex-hythe adversarial review b8456917 findings 1–3 and Q1–Q3; data audit 1e5d0dc6 HIGH 1; PR #8 reviews 5e486718 / 882d39c7; PR #9 reviews b2641137 / 99735a88 Q4; design review aad3973c findings 1–8 and Q1–Q9; design re-review 19826044 findings 1–4, precision items, and Q1–Q4 |
 | Gates | Nothing in this note is authorized to ship. Each section ends with the PR it would become; every PR needs its own review. No Pavilion action is implied. |
@@ -51,7 +51,7 @@ Order: C depends on A; D depends on B; nothing depends on D. Everything new that
 7. **Closed accounting.** Anything new that `resume` returns beyond fixed-size scalars is a budgeted section with coverage, cursor, and explicit completeness.
 8. **Same-scope by structure** (aad3973c finding 1). Every new cross-reference between snapshots, and between a scope and a snapshot, is enforced structurally — composite keys on `(tenant_id, scope_key, state_id)` — not by convention.
 9. **Fail closed, never fail open** (aad3973c finding 2). An invariant violation is reported as invalid; it never degrades to a guess.
-10. **Result-version gate** (19826044 finding 4 — **needs owner ruling**). PRs #8/#9 define exact `resultVersion: 2` shapes, and the queue independently permits a #7+#8+#9 Pavilion deploy. H1 adds required `asOf` fields, a `heads` section and its coverage; H4 changes `currentFacts`/`openLoops` items and adds `divergentValues`. A client validating the #9 exact v2 schema would reject those bundles. **Recommendation:** the H-series ships on `resultVersion: 3` (v2 stays exactly as #8/#9 shipped it and remains deployable now; v3 = v2 + H-series fields, exact objects, same conditional-spread fingerprint rule). The alternative — freezing v2 undeployed until H4 lands — blocks the already-merged #8/#9 value for weeks. Until Tomas rules, no H-series PR starts. Everywhere below, "v2+" means "the version the ruling selects".
+10. **Result-version gate** (19826044 finding 4 — **RULED by Tomas, 2026-09-03: `resultVersion: 3`**). PRs #8/#9 define exact `resultVersion: 2` shapes, and the queue independently permits a #7+#8+#9 Pavilion deploy. H1 adds required `asOf` fields, a `heads` section and its coverage; H4 changes `currentFacts`/`openLoops` items and adds `divergentValues`. A client validating the #9 exact v2 schema would reject those bundles. Therefore: **v2 stays exactly as #8/#9 shipped it** (frozen from now, deployable independently of this note); the **H-series ships on `resultVersion: 3`** = v2 + H-series fields, exact objects, same conditional-spread fingerprint rule (`resultVersion` bound into the checkpoint fingerprint only when ≠ 1). Everywhere below, "v2+" means v3. A v3 request on a server that only knows v2 fails input validation (enum), never degrades.
 
 ## 3. A — Designated lineage and the effective current head
 
@@ -318,7 +318,7 @@ A fact/loop with no version rows is returned from the in-place table with `prove
 
 | Step | Gate | Acceptance canary |
 |---|---|---|
-| H1 | owner ruling on §2.10; codex acceptance of this v3 (aad3973c 1/2/5/6 and 19826044 3/4 addressed) | `resume` v2+ on `hythe-rehydration-loop` reports `selection: 'max-revision'`, `liveHeadCount: 13`, a complete `heads` section with `parentRetired: false` throughout; a fresh scope's first write is designated; direct-SQL cross-scope designation, per-column snapshot UPDATE, second digest write, and DELETE are all rejected |
+| H1 | codex acceptance of this note (aad3973c 1/2/5/6 and 19826044 3/4 addressed); §2.10 ruled | `resume` v2+ on `hythe-rehydration-loop` reports `selection: 'max-revision'`, `liveHeadCount: 13`, a complete `heads` section with `parentRetired: false` throughout; a fresh scope's first write is designated; direct-SQL cross-scope designation, per-column snapshot UPDATE, second digest write, and DELETE are all rejected |
 | H2 | codex review; H1 merged (aad3973c 4/7 addressed) | one `reconcile` on `hythe-rehydration-loop` naming all 13 heads and the null designation; afterwards `divergentHeadCount: 0`, `retiredHeadCount: 12`, every retired snapshot resource resolves, replay parity holds |
 | H3 | codex review; H1 and H2 merged | `record` against a non-leaf parent → `conflict`; a leaf `record` returns loop ids without a `resume` round-trip (field report item 2 closed end to end) |
 | H4 | codex review; H2 merged (19826044 1/2 addressed) | the §6.1 and §6.3 attack tests; pre-H4 rows report `null` provenance |
@@ -354,7 +354,7 @@ Q1–Q9 answers are incorporated where cited.
 
 ## 9. Open questions for re-review
 
-1. **Owner ruling (§2.10).** `resultVersion: 3` for the H-series (recommended) or freeze v2 undeployed until H4? This gates H1.
+1. ~~Owner ruling (§2.10).~~ **Ruled: `resultVersion: 3`.** H1 is no longer gated on this.
 2. **`strict` reconcile default (§6.3).** Default non-strict with the `unresolvedDivergent` count surfaced, or default strict so a reconcile cannot commit with unresolved values? Non-strict matches today's manual-incorporation practice; strict is safer for the values.
 3. **Trigger column-list parity test (§3.1).** Asserting the trigger's column list against `PRAGMA table_info` couples a test to trigger SQL text. Acceptable, or prefer a generated trigger from the column list at schema-apply time?
 4. **`divergentValues` for a legacy `max-revision` scope (before its first reconcile).** No accepted lineage exists yet: return everything as accepted-by-legacy with `provenance: null`, or compute the lineage of the max-revision head as if designated? Proposed: the former, explicitly labelled, until the first reconcile.
