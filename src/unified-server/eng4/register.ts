@@ -67,7 +67,7 @@ export const ENG4_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'checkpoint',
-    description: 'Write an immutable, branch-preserving state snapshot for a scope (CAS on expectedRevision; stale parents branch, never conflict) with fingerprint-verified idempotency, plus transactional fact/loop changes. The counterpart of resume.',
+    description: 'Write an immutable, branch-preserving state snapshot for a scope (CAS on expectedRevision; stale parents branch, never conflict) with fingerprint-verified idempotency, plus transactional fact/loop changes. Returns the ids each factChange/loopChange materialized to (result.changes, positional, with a created flag) so callers never need a follow-up resume to learn a new loopId/factId. The counterpart of resume.',
     inputSchema: CHECKPOINT_INPUT_SCHEMA as any,
   },
 ];

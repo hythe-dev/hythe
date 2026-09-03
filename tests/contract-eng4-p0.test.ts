@@ -611,14 +611,14 @@ describe('ENG-4 2(a) — schema init boundary (executable)', () => {
     expect(result.statementsApplied).toBeGreaterThan(10);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'eng4_%' ORDER BY name`).all().map((r: any) => r.name);
-    expect(tables).toEqual(['eng4_fact_refs', 'eng4_facts', 'eng4_handoff_acks', 'eng4_open_loops', 'eng4_payloads', 'eng4_scopes', 'eng4_state_snapshots']);
+    expect(tables).toEqual(['eng4_fact_refs', 'eng4_facts', 'eng4_handoff_acks', 'eng4_open_loops', 'eng4_payloads', 'eng4_scopes', 'eng4_snapshot_changes', 'eng4_state_snapshots']);
   });
 
   it('is idempotent across restarts: a second apply is a no-op (ALTERs guarded)', () => {
     const db = freshDb();
     applyEng4Schema(db);
     const second = applyEng4Schema(db);
-    expect(second.alterSkippedAsExisting).toBe(3); // the three ai_messages columns already exist
+    expect(second.alterSkippedAsExisting).toBe(4); // 3 ai_messages ALTERs + eng4_state_snapshots.changes_hash (PR A); // the three ai_messages columns already exist
     // Columns exist exactly once.
     const cols = db.prepare(`PRAGMA table_info(ai_messages)`).all().map((r: any) => r.name);
     expect(cols.filter((c: string) => c === 'project_id')).toHaveLength(1);

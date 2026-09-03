@@ -408,11 +408,34 @@ export interface CheckpointParams {
    * deliberately distinct.
    */
   idempotencyKey: string;
+  /**
+   * Result-shape opt-in (PR A, 2026-09-03). Absent or 1 → the exact frozen
+   * v1 result. 2 → written/idempotent-replay additionally carry `changes`
+   * (CheckpointChanges). Bound into requestFingerprint only when 2, so a
+   * same-key retry with a different resultVersion is an idempotency-mismatch
+   * and legacy fingerprints are unchanged.
+   */
+  resultVersion?: 1 | 2;
   state: WorkingState;
   events?: Array<{ kind: string; summary: string; at?: string }>;
   factChanges?: FactChange[];
   loopChanges?: LoopChange[];
   evidenceRefs?: string[];
+}
+
+/**
+ * What a checkpoint materialized (PR A, 2026-09-03). POSITIONAL: facts[i]
+ * is the row factChanges[i] resolved to, loops[i] the row loopChanges[i]
+ * resolved to. `created` is false when the caller supplied an existing id
+ * that was updated in place. Recorded in eng4_snapshot_changes inside the
+ * checkpoint transaction and integrity-bound by a stored digest
+ * (eng4_state_snapshots.changes_hash) that replay verifies fail-closed; NOT
+ * part of the canonical envelope (contentHash unaffected). Returned only when
+ * the request opts in with resultVersion=2.
+ */
+export interface CheckpointChanges {
+  facts: Array<{ factId: string; created: boolean }>;
+  loops: Array<{ loopId: string; created: boolean }>;
 }
 
 export type CheckpointResult =
@@ -423,6 +446,8 @@ export type CheckpointResult =
       revision: number;
       parentStateId: string | null;
       contentHash: string;
+      /** Present ONLY when the request set resultVersion=2; empty arrays when nothing changed. */
+      changes?: CheckpointChanges;
     }
   | {
       outcome: 'idempotent-replay';
@@ -430,6 +455,14 @@ export type CheckpointResult =
       scopeKey: ScopeKey;
       revision: number;
       contentHash: string;
+      /**
+       * Present ONLY when the (fingerprint-matched) request set resultVersion=2,
+       * and then never null: v2 is bound into the fingerprint, so a matched v2
+       * replay was written by the ledger-aware writer; an absent ledger is
+       * corruption and throws CheckpointIntegrityError instead. The SAME
+       * changes the original write returned, read from the verified ledger.
+       */
+      changes?: CheckpointChanges;
     }
   | {
       outcome: 'conflict';

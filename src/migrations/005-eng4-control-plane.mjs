@@ -184,6 +184,34 @@ export const DDL = [
      FOREIGN KEY (tenant_id, fact_id) REFERENCES eng4_facts(tenant_id, fact_id)
    )`,
 
+  // 6b. Per-snapshot change ledger (2026-09-03, field-report response PR A):
+  // which fact/loop row each factChanges[i] / loopChanges[i] materialized
+  // to, and whether the row was CREATED by that checkpoint. Written in the
+  // checkpoint transaction so idempotent-replay can return the SAME ids the
+  // original write did without recomputation. Result-side only: it is NOT
+  // part of the canonical envelope, so content hashes and request
+  // fingerprints are untouched. Snapshots recorded before this table
+  // existed have no rows; replay reports changes=null for them when the
+  // envelope carried changes (never guesses).
+  `CREATE TABLE IF NOT EXISTS eng4_snapshot_changes (
+     tenant_id TEXT NOT NULL,
+     state_id  TEXT NOT NULL,
+     kind      TEXT NOT NULL CHECK (kind IN ('fact','loop')),
+     ordinal   INTEGER NOT NULL CHECK (ordinal >= 0),
+     change_id TEXT NOT NULL,
+     created   INTEGER NOT NULL CHECK (created IN (0,1)),
+     PRIMARY KEY (tenant_id, state_id, kind, ordinal),
+     FOREIGN KEY (tenant_id, state_id) REFERENCES eng4_state_snapshots(tenant_id, state_id)
+   )`,
+  // Integrity binding for the ledger: sha256 of the canonical (RFC 8785)
+  // changes object, stored on the snapshot row in the same transaction.
+  // Replay recomputes from the ledger rows and fails CLOSED on mismatch,
+  // partial rows, or non-contiguous ordinals. NULL + zero rows is accepted as
+  // a pre-ledger snapshot ONLY on a matched v1 replay; under resultVersion=2
+  // (fingerprint-bound, hence ledger-aware) it is corruption and fails closed.
+  // Additive, duplicate-column-guarded like the ai_messages ALTERs.
+  `ALTER TABLE eng4_state_snapshots ADD COLUMN changes_hash TEXT`,
+
   // 7. ai_messages scoping — additive columns + index (A6). SQLite ALTER ADD
   // COLUMN is cheap and non-rewriting; existing rows get NULLs (= unscoped).
   `ALTER TABLE ai_messages ADD COLUMN project_id TEXT`,

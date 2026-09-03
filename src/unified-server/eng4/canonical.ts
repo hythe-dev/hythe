@@ -138,12 +138,20 @@ export function requestFingerprint(input: {
   expectedRevision: number | null;
   resolvedParentStateId: string | null;
   envelope: CheckpointContentEnvelope;
+  /**
+   * Result-shape discriminant (PR A, 2026-09-03). Bound into the fingerprint
+   * ONLY when it is 2: a legacy request (absent or 1) produces the exact v1
+   * fingerprint, byte-for-byte, so retries that began before an upgrade
+   * still replay after it. It is NOT part of the content envelope/contentHash.
+   */
+  resultVersion?: 1 | 2;
 }): string {
   const canonical = canonicalize({
     canonicalAgentId: input.canonicalAgentId,
     scopeKey: input.scopeKey,
     expectedRevision: input.expectedRevision,
     resolvedParentStateId: input.resolvedParentStateId,
+    ...(input.resultVersion === 2 ? { resultVersion: 2 } : {}),
     content: canonicalize({
       scopeKey: input.envelope.scopeKey,
       state: input.envelope.state,
