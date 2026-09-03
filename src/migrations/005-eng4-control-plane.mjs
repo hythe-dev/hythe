@@ -447,6 +447,10 @@ export const DDL = [
   // one reconcile snapshot on the accepted lineage. `accept` MUST name the
   // reconcile's own re-asserting change (FK into the ledger); `reject` has
   // no change. Both are bound into the reconcile payload as well.
+  // The resolving snapshot is PART OF THE KEY (codex-hythe review of PR #13,
+  // finding 3): a resolution only counts while its resolver is on the
+  // accepted lineage, so after a survivor switch moves that resolver off the
+  // lineage the same terminal must be resolvable again by a later reconcile.
   `CREATE TABLE IF NOT EXISTS eng4_divergence_resolutions (
      tenant_id            TEXT NOT NULL,
      scope_key            TEXT NOT NULL,
@@ -458,7 +462,7 @@ export const DDL = [
      accepted_ordinal     INTEGER,
      CHECK ((decision = 'accept' AND accepted_ordinal IS NOT NULL) OR
             (decision = 'reject' AND accepted_ordinal IS NULL)),
-     PRIMARY KEY (tenant_id, scope_key, kind, change_id, divergent_state_id),
+     PRIMARY KEY (tenant_id, scope_key, kind, change_id, divergent_state_id, resolved_by_state_id),
      FOREIGN KEY (tenant_id, scope_key, divergent_state_id)   REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
      FOREIGN KEY (tenant_id, scope_key, resolved_by_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
      FOREIGN KEY (tenant_id, resolved_by_state_id, kind, accepted_ordinal)

@@ -709,3 +709,39 @@ describe('H3 independent review round 1 — fail-closed evidence, sequential own
     expect(verifyRetirementAttribution(db, TENANT, SCOPE)).toEqual({ retirementsVerified: 2 });
   });
 });
+
+describe('H3 codex-hythe review 0952b074 — re-resolution after a survivor switch; retirement row fields', () => {
+  it('FINDING 3: the same divergent terminal can be resolved again once its earlier resolver is off the accepted lineage (resolver is part of the key)', () => {
+    const db = freshDb();
+    const { root, a, c, F } = forkWithFact(db);
+    const r1 = reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId, rejectLineages: [c.stateId] }); // R1 rejects F@C
+    // A new head E from A that does NOT descend from R1; choosing it as survivor moves R1 off the accepted lineage.
+    const e = write(db, { expectedRevision: a.revision, state: state('e') });
+    expect(liveIds(db).sort()).toEqual([e.stateId, r1.stateId].sort());
+    // F@C is divergent again (R1's rejection no longer governs) → owed.
+    expect(() => reconcile(db, { expectedHeads: [e.stateId, r1.stateId], survivor: e.stateId })).toThrow(/unresolved divergent terminal/);
+    const r2 = reconcile(db, { expectedHeads: [e.stateId, r1.stateId], survivor: e.stateId, resolutions: [{ kind: 'fact', id: F, divergentStateId: c.stateId, decision: 'reject' }] });
+    expect(r2.outcome).toBe('written');
+    // Two rows for the same terminal, keyed by their resolvers; both verify.
+    expect(resolutionRows(db).map((r) => r.resolved_by_state_id).sort()).toEqual([r1.stateId, r2.stateId].sort());
+    expect(verifyResolutionRowsOnLineage(db, TENANT, SCOPE, r2.stateId)).toEqual({ reconcilesVerified: 1 });
+    expect(resume(db, { resultVersion: 3 }).asOf).toMatchObject({ stateId: r2.stateId, retiredHeadCount: 2 });
+    void root;
+  });
+
+  it('FINDING 4: an altered retirement actor, time or reason fails replay and v3 resume parity', () => {
+    for (const [sql, pattern] of [
+      [`UPDATE eng4_head_retirements SET retired_by='someone-else'`, /names actor/],
+      [`UPDATE eng4_head_retirements SET retired_at='1970-01-01T00:00:00Z'`, /is timed/],
+      [`UPDATE eng4_head_retirements SET reason='rewritten'`, /reason that differs/],
+    ] as const) {
+      const db = freshDb();
+      const { a, c } = attack(db);
+      const params = reconcileParams(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId, idempotencyKey: 'k-ret-fields' });
+      performCheckpoint(db, directory, TENANT, params);
+      bypass(db, () => db.exec(sql));
+      expect(() => performCheckpoint(db, directory, TENANT, params), sql).toThrow(pattern);
+      expect(() => resume(db, { resultVersion: 3 }), sql).toThrow(pattern);
+    }
+  });
+});

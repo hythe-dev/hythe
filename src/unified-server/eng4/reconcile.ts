@@ -542,8 +542,8 @@ export function writeReconcileRows(
 function rowsFor(db: DatabaseType.Database, tenantId: string, scopeKey: string, stateId: string) {
   const inputs = (db.prepare(`SELECT input_state_id FROM eng4_snapshot_merge_inputs WHERE tenant_id = ? AND scope_key = ? AND state_id = ? ORDER BY input_state_id`)
     .all(tenantId, scopeKey, stateId) as any[]).map((r) => String(r.input_state_id));
-  const retirements = db.prepare(`SELECT state_id, retired_by_state_id FROM eng4_head_retirements WHERE tenant_id = ? AND scope_key = ? AND retired_by_state_id = ? ORDER BY state_id`)
-    .all(tenantId, scopeKey, stateId) as Array<{ state_id: string; retired_by_state_id: string }>;
+  const retirements = db.prepare(`SELECT state_id, retired_by_state_id, retired_at, retired_by, reason FROM eng4_head_retirements WHERE tenant_id = ? AND scope_key = ? AND retired_by_state_id = ? ORDER BY state_id`)
+    .all(tenantId, scopeKey, stateId) as Array<{ state_id: string; retired_by_state_id: string; retired_at: string; retired_by: string; reason: string }>;
   const resolutions = (db.prepare(
     `SELECT kind, change_id, divergent_state_id, decision, accepted_ordinal FROM eng4_divergence_resolutions
       WHERE tenant_id = ? AND scope_key = ? AND resolved_by_state_id = ?`
@@ -583,7 +583,16 @@ export function verifyReconcileParity(
   const expectedRetired = [...record.retired].sort();
   if (canonicalize(inputs) !== canonicalize(expectedRetired)) fail('merge-input set differs from the recorded retired set');
   if (canonicalize(retirements.map((r) => r.state_id)) !== canonicalize(expectedRetired)) fail('retirement set differs from the recorded retired set');
-  for (const r of retirements) if (r.retired_by_state_id !== stateId) fail(`retirement of ${r.state_id} is attributed to another snapshot`);
+  // Every retirement row's attribution, time, actor and reason must equal the
+  // reconcile snapshot's own author/recorded_at and the recorded reason
+  // (codex-hythe review of PR #13, finding 4).
+  const who = db.prepare(`SELECT author, recorded_at FROM eng4_state_snapshots WHERE tenant_id = ? AND state_id = ?`).get(tenantId, stateId) as { author: string; recorded_at: string };
+  for (const r of retirements) {
+    if (r.retired_by_state_id !== stateId) fail(`retirement of ${r.state_id} is attributed to another snapshot`);
+    if (r.retired_by !== who.author) fail(`retirement of ${r.state_id} names actor '${r.retired_by}', not the reconcile author`);
+    if (r.retired_at !== who.recorded_at) fail(`retirement of ${r.state_id} is timed '${r.retired_at}', not at the reconcile`);
+    if (r.reason !== record.reason) fail(`retirement of ${r.state_id} carries a reason that differs from the recorded one`);
+  }
   const expectedResolutions = [...record.resolutions].sort(byResolutionKey);
   if (canonicalize(resolutions) !== canonicalize(expectedResolutions)) fail('resolution rows differ from the recorded resolution set');
   // Each accept must point at THIS snapshot's ledger row for the same id, and
