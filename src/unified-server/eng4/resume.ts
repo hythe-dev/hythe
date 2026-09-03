@@ -31,13 +31,16 @@
  */
 import type DatabaseType from 'better-sqlite3';
 import type {
+  CapsuleObservation,
   ContentHandle,
   CurrentFact,
   InboxItem,
   OpenLoop,
   ResumeBundle,
+  ResumeCapsule,
   ResumeParams,
   ResumeSectionName,
+  ResumeSectionNameV1,
   SectionCoverage,
   WorkingState,
 } from './contracts.js';
@@ -52,10 +55,21 @@ export const MAX_INLINE_MESSAGE_BODY_CHARS = 2000;
 export interface ResumeDirectory extends EntityDirectory {
   /** Charter/creation prose for an entity — NEVER current state. */
   getEntityDefinition(entityId: string, tenantId: string): string | null;
+  /**
+   * Every observation on the entity with metadata.kind === 'capsule' that is
+   * NOT superseded by any observation on that entity, newest first, plus the
+   * number of observations examined. Selection is BY KIND: an unrelated newer
+   * append must not hide a capsule (data-audit HIGH 1, 2026-09-03).
+   */
+  getCapsuleObservations(entityId: string, tenantId: string): { capsules: CapsuleObservation[]; candidatesConsidered: number };
 }
 
-const SECTION_ORDER: readonly ResumeSectionName[] = [
+const SECTION_ORDER: readonly ResumeSectionNameV1[] = [
   'working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers',
+];
+/** schemaVersion=2 order: the capsule (entry pointer) is budgeted right after working state. */
+const SECTION_ORDER_V2: readonly ResumeSectionName[] = [
+  'working', 'capsule', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers',
 ];
 
 /** Deliberately coarse, deterministic estimator (chars/4). */
@@ -72,11 +86,11 @@ function encodeCursor(cursor: Cursor): string {
   return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
 }
 
-function decodeCursor(raw: string | undefined): Cursor | null {
+function decodeCursor(raw: string | undefined, order: readonly ResumeSectionName[]): Cursor | null {
   if (!raw) return null;
   try {
     const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
-    if (SECTION_ORDER.includes(parsed?.s) && Number.isInteger(parsed?.o) && parsed.o >= 0) {
+    if (order.includes(parsed?.s) && Number.isInteger(parsed?.o) && parsed.o >= 0) {
       return { s: parsed.s, o: parsed.o };
     }
   } catch { /* fall through — malformed cursors fail closed below */ }
@@ -105,13 +119,18 @@ export function performResume(
   const assembledAt = new Date().toISOString();
 
   const coverageOf = (entries: Array<[ResumeSectionName, SectionCoverage]>) =>
-    Object.fromEntries(entries) as Record<ResumeSectionName, SectionCoverage>;
+    Object.fromEntries(entries) as Record<ResumeSectionNameV1, SectionCoverage> & { capsule?: SectionCoverage };
+
+  const resultVersion: 1 | 2 = params.resultVersion === 2 ? 2 : 1;
+  const order: readonly ResumeSectionName[] = resultVersion === 2 ? SECTION_ORDER_V2 : SECTION_ORDER;
+  const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0, complete: true };
 
   if (!resolved.scopeKey) {
     // Fail-closed resolution: explicit nulls (+ candidates when ambiguous),
     // all sections empty but ACCOUNTED — never a silently-empty bundle.
     return {
-      schemaVersion: 1,
+      schemaVersion: resultVersion,
+      ...(resultVersion === 2 ? { capsule: emptyCapsule } : {}),
       resolvedScope: resolved,
       asOf: { assembledAt, stateId: null, revision: null, stateAgeSec: null, stale: true, conflicts: [] },
       definition: null,
@@ -123,7 +142,7 @@ export function performResume(
       evidence: [],
       pointers: [],
       coverage: {
-        ...coverageOf(SECTION_ORDER.map((s) => [s, emptyCoverage('none')])),
+        ...coverageOf(order.map((s) => [s, emptyCoverage('none')])),
         totalTokenEstimate: 0,
         budget: params.budget,
       },
@@ -142,11 +161,19 @@ export function performResume(
     : null;
 
   const working: WorkingState | null = currentRow ? JSON.parse(currentRow.state_json) : null;
-  const definition = resolved.projectId
-    ? directory.getEntityDefinition(resolved.projectId, tenantId)
-    : resolved.taskId
-      ? directory.getEntityDefinition(resolved.taskId, tenantId)
-      : null;
+  const scopeEntityId = resolved.projectId ?? resolved.taskId ?? null;
+  const definition = scopeEntityId ? directory.getEntityDefinition(scopeEntityId, tenantId) : null;
+
+  // --- Capsule (v2 only): selected BY KIND over the entity's FULL indexed
+  // observation set, never by recency alone. Item 0 is current; the rest are
+  // conflicts the lane must reconcile. It is a BUDGETED SECTION like the
+  // seven (review b2641137 blocker 1): coverage.capsule is closed, a large
+  // capsule is omitted with omittedReason=budget + a cursor, never trimmed
+  // silently. Distinct from `definition` (immutable founding prose) and from
+  // get_current_observation (newest of ANY kind).
+  const capsuleSelection = resultVersion === 2 && scopeEntityId
+    ? directory.getCapsuleObservations(scopeEntityId, tenantId)
+    : { capsules: [] as CapsuleObservation[], candidatesConsidered: 0 };
 
   // --- Section item sources (all SELECT-only).
   const scopeRow = db.prepare(
@@ -291,10 +318,11 @@ export function performResume(
   if (resolved.taskId) pointers.push({ label: 'task', entity: resolved.taskId, relation: 'scoped-to' });
 
   // --- Budgeted assembly in contractual section order.
-  const requested = new Set<ResumeSectionName>(params.sections ?? SECTION_ORDER);
-  const cursor = decodeCursor(params.cursor);
+  const requested = new Set<ResumeSectionName>(params.sections ?? order);
+  const cursor = decodeCursor(params.cursor, order);
   const sectionItems: Record<ResumeSectionName, unknown[]> = {
     working: working ? [working] : [],
+    capsule: capsuleSelection.capsules,
     openLoops, messages, currentFacts, decisions, evidence, pointers,
   };
 
@@ -307,7 +335,8 @@ export function performResume(
   // so pages never repeat items admitted "around" an earlier cut.
   let truncated = false;
 
-  for (const section of SECTION_ORDER) {
+  let capsuleStartOffset = 0;
+  for (const section of order) {
     const items = sectionItems[section];
     if (beforeCursor && section === cursor!.s) beforeCursor = false;
     if (!requested.has(section)) {
@@ -331,6 +360,7 @@ export function performResume(
       continue;
     }
     const startOffset = cursor && section === cursor.s ? Math.min(cursor.o, items.length) : 0;
+    if (section === 'capsule') capsuleStartOffset = startOffset;
     const takeFrom = items.slice(startOffset);
     const taken: unknown[] = [];
     let sectionTokens = 0;
@@ -359,8 +389,23 @@ export function performResume(
     }]);
   }
 
+  // Capsule block derived from what the budget actually admitted: current is
+  // item 0 ONLY when this page starts at offset 0 and admitted it; otherwise
+  // null with coverage.capsule saying why (budget / cursor / not-requested).
+  const capsuleCoverage = coverageEntries.find(([name]) => name === 'capsule')?.[1];
+  const admittedCapsules = (included.capsule ?? []) as CapsuleObservation[];
+  const capsule: ResumeCapsule | null = resultVersion === 2
+    ? {
+        current: capsuleStartOffset === 0 && admittedCapsules.length > 0 ? admittedCapsules[0] : null,
+        conflicts: capsuleStartOffset === 0 ? admittedCapsules.slice(1) : admittedCapsules,
+        candidatesConsidered: capsuleSelection.candidatesConsidered,
+        complete: capsuleCoverage?.contentComplete ?? false,
+      }
+    : null;
+
   return {
-    schemaVersion: 1,
+    schemaVersion: resultVersion,
+    ...(capsule ? { capsule } : {}),
     resolvedScope: resolved,
     asOf: {
       assembledAt,

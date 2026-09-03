@@ -289,7 +289,12 @@ export type ResumeSectionName =
   | 'currentFacts'
   | 'decisions'
   | 'evidence'
-  | 'pointers';
+  | 'pointers'
+  /** schemaVersion=2 ONLY: the budgeted capsule section (item 0 = current, rest = conflicts). */
+  | 'capsule';
+
+/** The seven frozen v1 sections. */
+export type ResumeSectionNameV1 = Exclude<ResumeSectionName, 'capsule'>;
 
 // ---------------------------------------------------------------------------
 // resume (primitive 1 of exactly 2)
@@ -307,6 +312,14 @@ export interface ResumeParams {
    */
   agentId: string;
   scope: ScopeRef;
+  /**
+   * Bundle-shape opt-in (2026-09-03, data-audit HIGH 1). Absent or 1 → the
+   * frozen schemaVersion=1 bundle. 2 → schemaVersion=2: the v1 bundle plus
+   * `capsule`, the scope entity's rehydration capsule selected BY KIND
+   * (newest unsuperseded observation with metadata.kind='capsule'), never by
+   * recency alone, with any other unsuperseded capsules reported as conflicts.
+   */
+  resultVersion?: 1 | 2;
   /** Hard total token budget for the assembled bundle. */
   budget: number;
   /** Optional subset of sections; default = all, in canonical order. */
@@ -345,12 +358,49 @@ export interface AsOfHeader {
  * identity/guardrails → current state → blockers/loops → next actions →
  * scoped unread messages → facts/decisions → evidence/pointers → coverage.
  */
+/**
+ * One rehydration-capsule observation on the scope entity (resultVersion=2).
+ * Selected BY KIND: metadata.kind === 'capsule' and not superseded by ANY
+ * observation on that entity. Recency alone never decides — an unrelated
+ * newer append cannot displace it (data-audit HIGH 1, 2026-09-03).
+ */
+export interface CapsuleObservation {
+  observationId: string;
+  entityId: string;
+  recordedAt: string;
+  author: string;
+  canonicalFact: string | null;
+  contents: string[];
+}
+
+export interface ResumeCapsule {
+  /**
+   * Newest unsuperseded kind=capsule observation. null when none exists OR
+   * when the budget/cursor omitted it — coverage.capsule and `complete`
+   * distinguish the two; `current: null` is never silently "absent".
+   */
+  current: CapsuleObservation | null;
+  /** Every OTHER unsuperseded kind=capsule observation delivered on this page, newest first — a fork to reconcile. */
+  conflicts: CapsuleObservation[];
+  /** Every visible observation on the scope entity examined (FULL indexed scan, not a window). */
+  candidatesConsidered: number;
+  /**
+   * true iff current AND all conflicts are delivered on this page
+   * (== coverage.capsule.contentComplete). false → continue with
+   * coverage.capsule.nextCursor or a larger budget; nothing was trimmed silently.
+   */
+  complete: boolean;
+}
+
 export interface ResumeBundle {
-  schemaVersion: 1;
+  /** 1 = frozen bundle (default); 2 = v1 + capsule (request resultVersion=2). */
+  schemaVersion: 1 | 2;
   resolvedScope: ResolvedScope;
   asOf: AsOfHeader;
   /** Charter/definition line — creation-time prose, NEVER current state (A4). */
   definition: string | null;
+  /** Present ONLY on schemaVersion=2. */
+  capsule?: ResumeCapsule;
   working: WorkingState | null;
   openLoops: OpenLoop[];
   messages: InboxItem[];
@@ -358,8 +408,9 @@ export interface ResumeBundle {
   decisions: Array<{ id: string; summary: string; recordedAt: string; evidenceRefs: string[] }>;
   evidence: ContentHandle[];
   pointers: Array<{ label: string; entity: string; relation: string }>;
-  /** All seven sections present ALWAYS (closedness — review e0d81d4d #2). */
-  coverage: Record<ResumeSectionName, SectionCoverage> & {
+  /** All seven v1 sections present ALWAYS (closedness — review e0d81d4d #2); `capsule` coverage ONLY on schemaVersion=2. */
+  coverage: Record<ResumeSectionNameV1, SectionCoverage> & {
+    capsule?: SectionCoverage;
     totalTokenEstimate: number;
     budget: number;
   };

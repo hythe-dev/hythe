@@ -154,9 +154,10 @@ export const RESUME_INPUT_SCHEMA = {
     agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'Exact opaque caller identity (platform max 100). With per-agent proof the server injects and authorizes the authenticated principal; observe-mode legacy calls may assert it explicitly. Case and transport-looking suffixes are identity-significant; this principal owns authorship, acks, and views.' },
     scope: SCOPE_SCHEMA,
     budget: { type: 'integer', minimum: 256, description: 'Hard total token budget for the bundle.' },
+    resultVersion: { type: 'integer', enum: [1, 2], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts.' },
     sections: {
       type: 'array',
-      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers'] },
+      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule'], description: 'Section filter. `capsule` is meaningful only with resultVersion=2.' },
     },
     cursor: { type: 'string' },
   },
@@ -167,7 +168,8 @@ export const RESUME_INPUT_SCHEMA = {
  * contractual; coverage accounting is mandatory (silent trimming = failure);
  * message items are body XOR handle so omitted bytes stay reachable.
  */
-export const RESUME_OUTPUT_SCHEMA = {
+/** Frozen schemaVersion=1 bundle (the default). */
+export const RESUME_OUTPUT_SCHEMA_V1 = {
   type: 'object',
   additionalProperties: false,
   required: ['schemaVersion', 'resolvedScope', 'asOf', 'definition', 'working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'coverage'],
@@ -358,6 +360,58 @@ export const RESUME_OUTPUT_SCHEMA = {
       },
     },
   },
+} as const;
+
+/** One rehydration-capsule observation (resultVersion=2). */
+const CAPSULE_OBSERVATION = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['observationId', 'entityId', 'recordedAt', 'author', 'canonicalFact', 'contents'],
+  properties: {
+    observationId: { type: 'string', minLength: 1 },
+    entityId: { type: 'string', minLength: 1 },
+    recordedAt: { type: 'string' },
+    author: { type: 'string' },
+    canonicalFact: { type: ['string', 'null'] },
+    contents: { type: 'array', items: { type: 'string' } },
+  },
+} as const;
+
+/**
+ * schemaVersion=2 bundle (request resultVersion=2): v1 + `capsule`, the scope
+ * entity's rehydration capsule selected BY KIND — newest unsuperseded
+ * observation with metadata.kind='capsule' — with every other unsuperseded
+ * capsule reported as a conflict. Recency alone never selects it.
+ */
+export const RESUME_OUTPUT_SCHEMA_V2 = {
+  ...RESUME_OUTPUT_SCHEMA_V1,
+  required: [...RESUME_OUTPUT_SCHEMA_V1.required, 'capsule'],
+  properties: {
+    ...RESUME_OUTPUT_SCHEMA_V1.properties,
+    schemaVersion: { const: 2 },
+    capsule: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['current', 'conflicts', 'candidatesConsidered', 'complete'],
+      properties: {
+        current: { anyOf: [CAPSULE_OBSERVATION, { type: 'null' }] },
+        conflicts: { type: 'array', items: CAPSULE_OBSERVATION },
+        candidatesConsidered: { type: 'integer', minimum: 0 },
+        complete: { type: 'boolean' },
+      },
+    },
+    // The capsule is a BUDGETED section: its coverage is closed like the seven.
+    coverage: {
+      ...RESUME_OUTPUT_SCHEMA_V1.properties.coverage,
+      required: [...RESUME_OUTPUT_SCHEMA_V1.properties.coverage.required, 'capsule'],
+      properties: { ...RESUME_OUTPUT_SCHEMA_V1.properties.coverage.properties, capsule: SECTION_COVERAGE },
+    },
+  },
+} as const;
+
+/** resume() outputSchema — exactly one of the v1 (frozen, default) or v2 bundle shapes. */
+export const RESUME_OUTPUT_SCHEMA = {
+  oneOf: [RESUME_OUTPUT_SCHEMA_V1, RESUME_OUTPUT_SCHEMA_V2],
 } as const;
 
 /** checkpoint() input schema — CAS + idempotency required; changes fully typed; agentId = author. */

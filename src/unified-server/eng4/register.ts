@@ -62,7 +62,7 @@ export class Eng4InputValidationError extends Error {
 export const ENG4_TOOLS: ToolDefinition[] = [
   {
     name: 'resume',
-    description: 'Rebuild working context for a project/task scope: current state, open loops, scoped messages/handoffs, facts, decisions, evidence handles and pointers — with closed per-section coverage accounting under a hard token budget. Read-only; never consumes messages or handoffs. Replaces get_agent_context.',
+    description: 'Rebuild working context for a project/task scope: current state, open loops, scoped messages/handoffs, facts, decisions, evidence handles and pointers — with closed per-section coverage accounting under a hard token budget. Pass resultVersion:2 to also receive `capsule` — the scope entity\'s rehydration capsule selected by kind (newest unsuperseded kind=capsule observation, with other unsuperseded capsules as conflicts), separate from the immutable `definition`. Read-only; never consumes messages or handoffs. Replaces get_agent_context.',
     inputSchema: RESUME_INPUT_SCHEMA as any,
   },
   {
