@@ -1131,7 +1131,7 @@ Parameters
     },
     "acknowledgeRetired": {
       "type": "boolean",
-      "description": "resultVersion 3 only: a write extending a RETIRED parent must set true; it never moves the pointer."
+      "description": "resultVersion 3 only: a write extending a RETIRED parent must set true (it never moves the pointer); a reconcile whose survivor descends from retired snapshots must set true (the re-adopted snapshots are recorded as adoptedRetired)."
     },
     "expectedHeads": {
       "type": "array",

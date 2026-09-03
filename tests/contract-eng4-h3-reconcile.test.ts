@@ -37,7 +37,7 @@ import { performCheckpoint, CheckpointEmptyScopeError, CheckpointIntegrityError 
 import { performResume, type ResumeDirectory } from '../src/unified-server/eng4/resume.js';
 import { requestFingerprint } from '../src/unified-server/eng4/canonical.js';
 import { effectiveCurrentHead, liveHeads, readScopePointer } from '../src/unified-server/eng4/heads.js';
-import { CheckpointReconcileError, CheckpointRetiredParentError, readReconciliation } from '../src/unified-server/eng4/reconcile.js';
+import { CheckpointReconcileError, CheckpointRetiredParentError, readReconciliation, verifyResolutionRowsOnLineage, verifyRetirementAttribution } from '../src/unified-server/eng4/reconcile.js';
 import { verifyVersionParity } from '../src/unified-server/eng4/versions.js';
 import { fetchResourceByUri } from '../src/unified-server/eng4/resource.js';
 import { validateEng4Output } from '../src/unified-server/eng4/register.js';
@@ -224,7 +224,8 @@ describe('H3 schemas and fingerprint (§2.2, §4.1, §5.1 rule)', () => {
     expect(Object.keys(v3c).sort()).toEqual(['heads', 'outcome', 'pointer']);
     expect(v3c.pointer).toBe(written.stateId);
     for (const r of [v1c, v3c]) expect(validResult(r), ajv.errorsText(validResult.errors)).toBe(true);
-    expect(validResult({ ...v1c, pointer: null, extra: 1 })).toBe(false);
+    expect(validResult({ ...v1c, extra: 1 })).toBe(false);
+    expect(validResult({ ...v1c, pointer: null })).toBe(true); // = the v3 conflict shape; exact objects, one branch each
   });
 });
 
@@ -235,7 +236,7 @@ describe('H3 reconcile — CAS, survivor, retirement, pointer (§4.2 steps 1–5
     const r = reconcile(db, { expectedHeads: [c.stateId, a.stateId], survivor: a.stateId, reason: 'fold the audit branch' });
     expect(r.outcome).toBe('written');
     expect(r.parentStateId).toBe(a.stateId);
-    expect(r.reconciled).toEqual({ survivor: a.stateId, retired: [c.stateId], pointer: r.stateId, resolutions: [], unresolvedDivergent: { facts: 0, loops: 0 } });
+    expect(r.reconciled).toEqual({ survivor: a.stateId, retired: [c.stateId], pointer: r.stateId, resolutions: [], adoptedRetired: [], unresolvedDivergent: { facts: 0, loops: 0 } });
     expect(liveIds(db)).toEqual([r.stateId]);
     expect(retirements(db)).toEqual([{ state_id: c.stateId, retired_by_state_id: r.stateId, reason: 'fold the audit branch' }]);
     expect(db.prepare(`SELECT input_state_id FROM eng4_snapshot_merge_inputs WHERE state_id=?`).all(r.stateId)).toEqual([{ input_state_id: c.stateId }]);
@@ -444,7 +445,7 @@ describe('H3 causal divergence resolution (§6.3)', () => {
       { kind: 'fact', id: F1, divergentStateId: c2.stateId, decision: 'reject', acceptedOrdinal: null },
       { kind: 'fact', id: F2, divergentStateId: c2.stateId, decision: 'reject', acceptedOrdinal: null },
       { kind: 'loop', id: L, divergentStateId: c2.stateId, decision: 'reject', acceptedOrdinal: null },
-    ].sort((x, y) => (x.kind + x.id).localeCompare(y.kind + y.id)));
+    ].sort((x, y) => (x.kind + x.id < y.kind + y.id ? -1 : 1))); // UTF-16 code-unit order, as the implementation sorts
     const db2 = freshDb();
     const f = forkWithFact(db2);
     const H = [f.a.stateId, f.c.stateId];
@@ -543,7 +544,7 @@ describe('H3 resume v3 — resolution rows verified against payloads on the acce
     const db2 = freshDb();
     const f2 = attack(db2);
     bypass(db2, () => db2.prepare(`INSERT INTO eng4_head_retirements VALUES (?, ?, ?, ?, 't', 'x', 'r')`).run(TENANT, SCOPE, f2.c.stateId, f2.a.stateId));
-    expect(() => resume(db2, { resultVersion: 3 })).toThrow(/records no reconciliation/);
+    expect(() => resume(db2, { resultVersion: 3 })).toThrow(/does not record retiring it|records no reconciliation/); // both fail closed; attribution is checked first
   });
 
   it('after a reconcile the version foundation verifier and the resume resolution verifier both pass; a second reconcile chains on the first', () => {
@@ -558,5 +559,153 @@ describe('H3 resume v3 — resolution rows verified against payloads on the acce
     expect(v3.asOf).toMatchObject({ stateId: r2.stateId, liveHeadCount: 1, retiredHeadCount: 2 });
     expect(verifyVersionParity(db, TENANT, SCOPE).snapshotsVerified).toBe(7);
     expect(validV3(v3), ajv.errorsText(validV3.errors)).toBe(true);
+  });
+});
+
+describe('H3 independent review round 1 — fail-closed evidence, sequential owners, amendments, re-adoption, hidden heads', () => {
+  it('FINDING 1: a ledger tuple without a coverage row on a divergent chain is corruption — reconcile refuses instead of missing the terminal', () => {
+    const db = freshDb();
+    const { a, c } = forkWithFact(db);
+    expect(() => reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId })).toThrow(CheckpointReconcileError); // healthy: refused for the divergent value
+    bypass(db, () => db.prepare(`DELETE FROM eng4_version_coverage WHERE state_id=?`).run(c.stateId));
+    expect(() => reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId })).toThrow(CheckpointIntegrityError);
+    expect(() => reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId, strict: false })).toThrow(CheckpointIntegrityError);
+    expect(retirements(db)).toEqual([]);
+    expect(liveIds(db)).toHaveLength(2);
+  });
+
+  it('FINDING 2: an accept compares against the owner the dual write will record — sequential same-loop changes in one request', () => {
+    const db = freshDb();
+    const root = write(db, { loopChanges: [{ status: 'open', nextAction: 'n', owner: 'orig' }] });
+    const L = root.changes.loops[0].loopId;
+    const a = write(db, { expectedRevision: 1, state: state('a') });
+    const c = write(db, { expectedRevision: 1, state: state('c'), loopChanges: [{ loopId: L, status: 'blocked', nextAction: 'x' }] }); // terminal owner orig
+    const H = [a.stateId, c.stateId];
+    const acc = { kind: 'loop' as const, id: L, divergentStateId: c.stateId, decision: 'accept' as const, acceptedOrdinal: 1 };
+    // Ordinal 0 changes the owner; ordinal 1 (omitted owner) therefore records 'someone-else' — not equal to the terminal.
+    expect(() => reconcile(db, { expectedHeads: H, survivor: a.stateId, resolutions: [acc], loopChanges: [{ loopId: L, status: 'open', nextAction: 'n', owner: 'someone-else' }, { loopId: L, status: 'blocked', nextAction: 'x' }] })).toThrow(/does not equal/);
+    // With the owner chain preserved, the accept is valid, commits, replays and verifies.
+    const params = reconcileParams(db, { expectedHeads: H, survivor: a.stateId, resolutions: [acc], loopChanges: [{ loopId: L, status: 'open', nextAction: 'n', owner: 'orig' }, { loopId: L, status: 'blocked', nextAction: 'x' }], idempotencyKey: 'k-seq-owner' });
+    const r = performCheckpoint(db, directory, TENANT, params) as any;
+    expect(r.outcome).toBe('written');
+    expect(db.prepare(`SELECT owner FROM eng4_loop_versions WHERE state_id=? AND ordinal=1`).get(r.stateId)).toEqual({ owner: 'orig' });
+    expect((performCheckpoint(db, directory, TENANT, params) as any).outcome).toBe('idempotent-replay');
+    expect(resume(db, { resultVersion: 3 }).asOf.stateId).toBe(r.stateId);
+  });
+
+  it('FINDING 3: accept must name the FINAL change for that id in the request ("accept with amendment" is reject + a fresh change)', () => {
+    const db = freshDb();
+    const { a, c, F } = forkWithFact(db);
+    const H = [a.stateId, c.stateId];
+    expect(() => reconcile(db, { expectedHeads: H, survivor: a.stateId, resolutions: [{ kind: 'fact', id: F, divergentStateId: c.stateId, decision: 'accept', acceptedOrdinal: 0 }], factChanges: [fact('bad', { factId: F }), fact('amended', { factId: F })] })).toThrow(/must name the final change/);
+    const r = reconcile(db, { expectedHeads: H, survivor: a.stateId, resolutions: [{ kind: 'fact', id: F, divergentStateId: c.stateId, decision: 'accept', acceptedOrdinal: 1 }], factChanges: [fact('interim', { factId: F }), fact('bad', { factId: F })] });
+    expect(r.reconciled.resolutions[0]).toMatchObject({ decision: 'accept', acceptedOrdinal: 1 });
+    // The amendment path the design prescribes:
+    const db2 = freshDb();
+    const f = forkWithFact(db2);
+    const r2 = reconcile(db2, { expectedHeads: [f.a.stateId, f.c.stateId], survivor: f.a.stateId, resolutions: [{ kind: 'fact', id: f.F, divergentStateId: f.c.stateId, decision: 'reject' }], factChanges: [fact('amended', { factId: f.F })] });
+    expect(r2.outcome).toBe('written');
+  });
+
+  it('FINDING 4: a resurrected survivor re-adopts retired history — refused without acknowledgeRetired, recorded as adoptedRetired with it', () => {
+    const db = freshDb();
+    const { a, c, F } = forkWithFact(db);
+    const r1 = reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId, rejectLineages: [c.stateId] });
+    const d = write(db, { resultVersion: 3, expectedRevision: c.revision, state: state('d'), acknowledgeRetired: true }); // resurrection of C
+    expect(() => reconcile(db, { expectedHeads: [r1.stateId, d.stateId], survivor: d.stateId })).toThrow(/re-adopting them requires acknowledgeRetired/);
+    const params = reconcileParams(db, { expectedHeads: [r1.stateId, d.stateId], survivor: d.stateId, acknowledgeRetired: true, idempotencyKey: 'k-readopt' });
+    const r2 = performCheckpoint(db, directory, TENANT, params) as any;
+    expect(r2.outcome).toBe('written');
+    expect(r2.reconciled.adoptedRetired).toEqual([c.stateId]);
+    expect(readReconciliation(db, TENANT, r2.contentHash)!.adoptedRetired).toEqual([c.stateId]);
+    // R1 is now off-lineage; its rejection of F@C no longer governs, and the record shows why.
+    expect((performCheckpoint(db, directory, TENANT, params) as any).reconciled).toEqual(r2.reconciled);
+    expect(resume(db, { resultVersion: 3 }).asOf).toMatchObject({ stateId: r2.stateId, retiredHeadCount: 2 });
+    // acknowledgeRetired changes intent → a different fingerprint under the same key.
+    expect((performCheckpoint(db, directory, TENANT, { ...params, acknowledgeRetired: false }) as any).outcome).toBe('idempotency-mismatch');
+    void F;
+  });
+
+  it('FINDING 6: a retirement row not recorded by its attributed snapshot\'s payload cannot hide a live head — v3 resume and reconcile refuse; v1 is unchanged', () => {
+    const db = freshDb();
+    const { a, c } = attack(db);
+    bypass(db, () => db.prepare(`INSERT INTO eng4_head_retirements VALUES (?, ?, ?, ?, 't', 'x', 'r')`).run(TENANT, SCOPE, c.stateId, c.stateId));
+    expect(liveIds(db)).toEqual([a.stateId]); // the raw query alone would hide C…
+    expect(() => resume(db, { resultVersion: 3 })).toThrow(/does not record retiring it/); // …but v3 refuses
+    expect(() => verifyRetirementAttribution(db, TENANT, SCOPE)).toThrow(CheckpointIntegrityError);
+    expect(() => reconcile(db, { expectedHeads: [a.stateId], survivor: a.stateId })).toThrow(CheckpointIntegrityError);
+    expect(resume(db).working.status).toBe('a');
+    // Attributed to a REAL reconcile that did not retire it: still refused.
+    const db2 = freshDb();
+    const f = attack(db2);
+    const r = reconcile(db2, { expectedHeads: [f.a.stateId, f.c.stateId], survivor: f.a.stateId });
+    const e = write(db2, { expectedRevision: f.c.revision, state: state('e') }); // resurrection, live
+    bypass(db2, () => db2.prepare(`INSERT INTO eng4_head_retirements VALUES (?, ?, ?, ?, 't', 'x', 'r')`).run(TENANT, SCOPE, e.stateId, r.stateId));
+    expect(() => resume(db2, { resultVersion: 3 })).toThrow(/does not record retiring it/);
+  });
+
+  it('shared prefix: two divergent heads on one branch — each chain has its own terminals; rejecting one lineage leaves the other\'s owed', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('f0'), fact('g0')] });
+    const [F, G] = root.changes.facts.map((f: any) => f.factId);
+    const a = write(db, { expectedRevision: 1, state: state('a') });
+    const x = write(db, { expectedRevision: 1, state: state('x'), factChanges: [fact('fx', { factId: F })] });
+    const c1 = write(db, { expectedRevision: x.revision, state: state('c1'), factChanges: [fact('fc1', { factId: F })] });
+    const c2 = write(db, { expectedRevision: x.revision, state: state('c2'), factChanges: [fact('gc2', { factId: G })] });
+    const H = [a.stateId, c1.stateId, c2.stateId];
+    let err: any;
+    try { reconcile(db, { expectedHeads: H, survivor: a.stateId, rejectLineages: [c1.stateId] }); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(CheckpointReconcileError);
+    // A lineage is the head's chain from its fork point: chain(C1) = {C1, X}, so rejecting C1 also
+    // rejects the shared F@X (chain C2's terminal for F). Only G@C2 remains owed.
+    expect(err.unresolved.map((u: any) => [u.id, u.divergentStateId])).toEqual([[G, c2.stateId]]);
+    const r = reconcile(db, { expectedHeads: H, survivor: a.stateId, rejectLineages: [c1.stateId, c2.stateId] });
+    expect(r.reconciled.resolutions.map((x: any) => [x.id, x.divergentStateId]).sort()).toEqual([[F, c1.stateId], [F, x.stateId], [G, c2.stateId]].sort());
+    expect(r.reconciled.retired.sort()).toEqual([c1.stateId, c2.stateId].sort());
+  });
+
+  it('one request may accept one terminal and reject a whole other lineage; a reconcile may also create NEW facts; loop count under strict:false', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('f0')], loopChanges: [{ status: 'open', nextAction: 'n', owner: 'orig' }] });
+    const F = root.changes.facts[0].factId;
+    const L = root.changes.loops[0].loopId;
+    const a = write(db, { expectedRevision: 1, state: state('a') });
+    const c = write(db, { expectedRevision: 1, state: state('c'), factChanges: [fact('fc', { factId: F })] });
+    const d = write(db, { expectedRevision: 1, state: state('d'), loopChanges: [{ loopId: L, status: 'blocked', nextAction: 'x' }] }); // owner omitted → materialized owner orig
+    const H = [a.stateId, c.stateId, d.stateId];
+    const soft = reconcile(db, { expectedHeads: H, survivor: a.stateId, strict: false, rejectLineages: [c.stateId] });
+    expect(soft.reconciled.unresolvedDivergent).toEqual({ facts: 0, loops: 1 });
+    // Fresh store, same shape: accept the loop terminal (owner omitted, in-place chain) and reject C's lineage, while creating a new fact.
+    const db2 = freshDb();
+    const root2 = write(db2, { factChanges: [fact('f0')], loopChanges: [{ status: 'open', nextAction: 'n', owner: 'orig' }] });
+    const F2 = root2.changes.facts[0].factId; const L2 = root2.changes.loops[0].loopId;
+    const a2 = write(db2, { expectedRevision: 1, state: state('a') });
+    const c2 = write(db2, { expectedRevision: 1, state: state('c'), factChanges: [fact('fc', { factId: F2 })] });
+    const d2 = write(db2, { expectedRevision: 1, state: state('d'), loopChanges: [{ loopId: L2, status: 'blocked', nextAction: 'x' }] });
+    const r = reconcile(db2, {
+      expectedHeads: [a2.stateId, c2.stateId, d2.stateId], survivor: a2.stateId, rejectLineages: [c2.stateId],
+      resolutions: [{ kind: 'loop', id: L2, divergentStateId: d2.stateId, decision: 'accept', acceptedOrdinal: 0 }],
+      loopChanges: [{ loopId: L2, status: 'blocked', nextAction: 'x' }],
+      factChanges: [fact('brand-new')],
+    });
+    expect(r.outcome).toBe('written');
+    expect(r.changes.facts[0].created).toBe(true);
+    expect(r.reconciled.resolutions).toEqual([
+      { kind: 'fact', id: F2, divergentStateId: c2.stateId, decision: 'reject', acceptedOrdinal: null },
+      { kind: 'loop', id: L2, divergentStateId: d2.stateId, decision: 'accept', acceptedOrdinal: 0 },
+    ]);
+    expect(verifyVersionParity(db2, TENANT, SCOPE).unversioned).toBe(0);
+    expect(resume(db2, { resultVersion: 3 }).asOf.stateId).toBe(r.stateId);
+  });
+
+  it('resume verification covers every reconcile on the accepted lineage (two chained reconciles → 2 verified)', () => {
+    const db = freshDb();
+    const { a, c } = forkWithFact(db);
+    const r1 = reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId, rejectLineages: [c.stateId] });
+    const d = write(db, { expectedRevision: r1.revision, state: state('d') });
+    const e = write(db, { expectedRevision: r1.revision, state: state('e') });
+    const r2 = reconcile(db, { expectedHeads: [d.stateId, e.stateId], survivor: d.stateId });
+    expect(verifyResolutionRowsOnLineage(db, TENANT, SCOPE, r2.stateId)).toEqual({ reconcilesVerified: 2 });
+    expect(verifyRetirementAttribution(db, TENANT, SCOPE)).toEqual({ retirementsVerified: 2 });
   });
 });

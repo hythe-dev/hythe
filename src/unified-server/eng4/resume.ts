@@ -53,7 +53,7 @@ import type {
   WorkingState,
 } from './contracts.js';
 import { effectiveCurrentHead, liveHeadDetails, retiredHeadCount } from './heads.js';
-import { verifyResolutionRowsOnLineage } from './reconcile.js';
+import { verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 
@@ -172,6 +172,11 @@ export function performResume(
   // --- Current state: the ONE resolver (H1 §3.3). Pointer when designated;
   // max-revision only for legacy undesignated scopes; null (fail closed) on
   // an invalid designation. Forks surface as conflicts / the heads section.
+  // H3: under v3, retirement rows are trusted only when the reconcile they
+  // are attributed to records them in its hash-verified payload — otherwise
+  // one out-of-band row could hide a live head. Scope-wide, before any head
+  // computation.
+  if (resultVersion === 3) verifyRetirementAttribution(db, tenantId, scopeKey);
   const effective = effectiveCurrentHead(db, tenantId, scopeKey);
   const heads = effective.live; // revision-ASC, retired heads excluded (H3 §4.4)
   const current = effective.head;

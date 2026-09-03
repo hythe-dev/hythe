@@ -502,7 +502,7 @@ export const CHECKPOINT_INPUT_SCHEMA = {
     idempotencyKey: { type: 'string', minLength: 8 },
     resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (INTERNAL, not final until the ENG-4 H-series completes): v2 plus the `operation` discriminant (`reconcile` since H3) and its fields; required for any of them.' },
     operation: { enum: ['write', 'reconcile'], description: 'resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally.' },
-    acknowledgeRetired: { type: 'boolean', description: 'resultVersion 3 only: a write extending a RETIRED parent must set true; it never moves the pointer.' },
+    acknowledgeRetired: { type: 'boolean', description: 'resultVersion 3 only: a write extending a RETIRED parent must set true (it never moves the pointer); a reconcile whose survivor descends from retired snapshots must set true (the re-adopted snapshots are recorded as adoptedRetired).' },
     expectedHeads: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'reconcile: the exact set of live head stateIds (order irrelevant).' },
     expectedPointer: { type: ['string', 'null'], description: 'reconcile: the current pointer stateId, or null for a scope without one.' },
     survivor: { type: 'string', minLength: 1, description: 'reconcile: the head that becomes the parent; must be in expectedHeads and match expectedRevision.' },
@@ -621,12 +621,13 @@ const RESOLUTION_RECORD = {
 export const CHECKPOINT_RECONCILED = {
   type: 'object',
   additionalProperties: false,
-  required: ['survivor', 'retired', 'pointer', 'resolutions', 'unresolvedDivergent'],
+  required: ['survivor', 'retired', 'pointer', 'resolutions', 'adoptedRetired', 'unresolvedDivergent'],
   properties: {
     survivor: { type: 'string', minLength: 1 },
     retired: { type: 'array', items: { type: 'string', minLength: 1 } },
     pointer: { type: 'string', minLength: 1 },
     resolutions: { type: 'array', items: RESOLUTION_RECORD },
+    adoptedRetired: { type: 'array', items: { type: 'string', minLength: 1 } },
     unresolvedDivergent: {
       type: 'object',
       additionalProperties: false,

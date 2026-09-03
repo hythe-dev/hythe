@@ -578,6 +578,8 @@ export interface ReconciliationRecord {
   reason: string;
   strict: boolean;
   resolutions: ResolutionRecord[];
+  /** Retired snapshots on the survivor's own chain re-adopted by this reconcile (requires acknowledgeRetired). */
+  adoptedRetired: string[];
   unresolvedDivergent: { facts: number; loops: number };
 }
 
@@ -587,6 +589,7 @@ export interface ReconciledBlock {
   retired: string[];
   pointer: string;
   resolutions: ResolutionRecord[];
+  adoptedRetired: string[];
   /** Zero under strict (the default) by construction. */
   unresolvedDivergent: { facts: number; loops: number };
 }

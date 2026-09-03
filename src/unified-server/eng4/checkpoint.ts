@@ -471,7 +471,7 @@ export function performCheckpoint(
         verifyReconcileParity(db, tenantId, scopeKey, String(existing.state_id), record);
         reconciled = {
           survivor: record.survivor, retired: record.retired, pointer: String(existing.state_id),
-          resolutions: record.resolutions, unresolvedDivergent: record.unresolvedDivergent,
+          resolutions: record.resolutions, adoptedRetired: record.adoptedRetired, unresolvedDivergent: record.unresolvedDivergent,
         };
       }
       return {
@@ -534,6 +534,7 @@ export function performCheckpoint(
         reason: normalized.reason,
         strict: normalized.strict,
         resolutions: outcome.resolutions,
+        adoptedRetired: outcome.adoptedRetired,
         unresolvedDivergent: outcome.unresolvedDivergent,
       };
     } else if (
@@ -619,9 +620,15 @@ export function performCheckpoint(
     if (reconciliation) {
       // §4.2 steps 5–6 rows, after the ledger (accepts FK their own ledger row).
       writeReconcileRows(db, tenantId, scopeKey, stateId, reconciliation, canonicalAgentId, recordedAt);
+      // A reconcile must pass its OWN replay parity before it commits: if the
+      // rows just written could not be verified against the record just
+      // hashed, throwing here rolls everything back instead of leaving a
+      // snapshot that poisons every later replay and v3 resume.
+      verifyReconcileParity(db, tenantId, scopeKey, stateId, reconciliation);
       reconciled = {
         survivor: reconciliation.survivor, retired: reconciliation.retired, pointer: stateId,
-        resolutions: reconciliation.resolutions, unresolvedDivergent: reconciliation.unresolvedDivergent,
+        resolutions: reconciliation.resolutions, adoptedRetired: reconciliation.adoptedRetired,
+        unresolvedDivergent: reconciliation.unresolvedDivergent,
       };
     }
 
