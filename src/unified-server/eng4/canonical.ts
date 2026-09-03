@@ -100,6 +100,13 @@ export interface CheckpointContentEnvelope {
   factChanges: unknown[];
   loopChanges: unknown[];
   evidenceRefs: string[];
+  /**
+   * ENG-4 H3 (design §4.2 step 4): a RECONCILE snapshot's envelope carries
+   * the normalized reconciliation record so contentHash binds it and the
+   * snapshot resource is self-contained. Present ONLY on reconcile
+   * snapshots — a `write` envelope is byte-identical to before.
+   */
+  reconciliation?: unknown;
 }
 
 /** Canonical UTF-8 bytes of the envelope — the ONLY hashable representation. */
@@ -112,6 +119,7 @@ export function canonicalEnvelopeBytes(envelope: CheckpointContentEnvelope): Buf
       factChanges: envelope.factChanges ?? [],
       loopChanges: envelope.loopChanges ?? [],
       evidenceRefs: envelope.evidenceRefs ?? [],
+      ...(envelope.reconciliation !== undefined ? { reconciliation: envelope.reconciliation } : {}),
     }),
     'utf8'
   );
@@ -144,7 +152,21 @@ export function requestFingerprint(input: {
    * fingerprint, byte-for-byte, so retries that began before an upgrade
    * still replay after it. It is NOT part of the content envelope/contentHash.
    */
-  resultVersion?: 1 | 2;
+  resultVersion?: 1 | 2 | 3;
+  /**
+   * ENG-4 H3 (design §5.1 rule, applied to reconcile now): the operation
+   * discriminant is bound ONLY when present and ≠ 'write' — legacy bytes
+   * unchanged.
+   */
+  operation?: 'write' | 'reconcile';
+  /**
+   * ENG-4 H3 (§4.1, §6.3 Q4): the NORMALIZED reconcile request — sorted
+   * expectedHeads, expectedPointer, survivor, reason, strict, explicit
+   * resolutions sorted, and the RAW sorted rejectLineages shorthand (never
+   * its expansion, which depends on database state) — so a retry can locate
+   * the prior snapshot before any recomputation. Present only for reconcile.
+   */
+  reconcile?: unknown;
 }): string {
   const canonical = canonicalize({
     canonicalAgentId: input.canonicalAgentId,
@@ -152,6 +174,11 @@ export function requestFingerprint(input: {
     expectedRevision: input.expectedRevision,
     resolvedParentStateId: input.resolvedParentStateId,
     ...(input.resultVersion === 2 ? { resultVersion: 2 } : {}),
+    ...(input.resultVersion === 3 ? { resultVersion: 3 } : {}),
+    ...(input.operation !== undefined && input.operation !== 'write' ? { operation: input.operation } : {}),
+    ...(input.reconcile !== undefined ? { reconcile: input.reconcile } : {}),
+    // Content is the BASE envelope — the reconciliation record is derived
+    // inside the transaction and bound by contentHash, not by the fingerprint.
     content: canonicalize({
       scopeKey: input.envelope.scopeKey,
       state: input.envelope.state,

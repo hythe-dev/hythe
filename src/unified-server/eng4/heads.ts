@@ -40,26 +40,80 @@ export interface LiveHead {
   recordedAt: string;
 }
 
+/** A live head with the lineage facts resume's `heads` section needs. */
+export interface LiveHeadDetail extends LiveHead {
+  parentStateId: string | null;
+  /** The head's parent has a retirement row — a resurrection (§4.5). */
+  parentRetired: boolean;
+}
+
 /**
- * Heads = snapshots no other snapshot in the scope claims as parent, revision
- * ASC. (H3 additionally excludes retired snapshots — §4.4; not yet.)
+ * Live heads = snapshots that no other snapshot in the scope claims as
+ * parent AND that have no retirement row (§4.4, since H3). Revision ASC.
  */
-export function liveHeads(db: DatabaseType.Database, tenantId: string, scopeKey: string): LiveHead[] {
+export function liveHeadDetails(db: DatabaseType.Database, tenantId: string, scopeKey: string): LiveHeadDetail[] {
   return db.prepare(
-    `SELECT s.state_id, s.revision, s.author, s.recorded_at
+    `SELECT s.state_id, s.revision, s.author, s.recorded_at, s.parent_state_id,
+            EXISTS (SELECT 1 FROM eng4_head_retirements pr
+                     WHERE pr.tenant_id = s.tenant_id AND pr.scope_key = s.scope_key
+                       AND pr.state_id = s.parent_state_id) AS parent_retired
        FROM eng4_state_snapshots s
       WHERE s.tenant_id = ? AND s.scope_key = ?
         AND NOT EXISTS (
           SELECT 1 FROM eng4_state_snapshots c
            WHERE c.tenant_id = s.tenant_id AND c.scope_key = s.scope_key
              AND c.parent_state_id = s.state_id)
+        AND NOT EXISTS (
+          SELECT 1 FROM eng4_head_retirements r
+           WHERE r.tenant_id = s.tenant_id AND r.scope_key = s.scope_key
+             AND r.state_id = s.state_id)
       ORDER BY s.revision ASC`
   ).all(tenantId, scopeKey).map((r: any) => ({
     stateId: String(r.state_id),
     revision: Number(r.revision),
     author: String(r.author),
     recordedAt: String(r.recorded_at),
+    parentStateId: r.parent_state_id === null ? null : String(r.parent_state_id),
+    parentRetired: Boolean(r.parent_retired),
   }));
+}
+
+/** The frozen four-field projection (conflict lists, resolver). */
+export function liveHeads(db: DatabaseType.Database, tenantId: string, scopeKey: string): LiveHead[] {
+  return liveHeadDetails(db, tenantId, scopeKey).map(({ stateId, revision, author, recordedAt }) => ({ stateId, revision, author, recordedAt }));
+}
+
+export function isRetired(db: DatabaseType.Database, tenantId: string, scopeKey: string, stateId: string): boolean {
+  return !!db.prepare(
+    `SELECT 1 FROM eng4_head_retirements WHERE tenant_id = ? AND scope_key = ? AND state_id = ?`
+  ).get(tenantId, scopeKey, stateId);
+}
+
+export function retiredHeadCount(db: DatabaseType.Database, tenantId: string, scopeKey: string): number {
+  return (db.prepare(
+    `SELECT COUNT(*) AS n FROM eng4_head_retirements WHERE tenant_id = ? AND scope_key = ?`
+  ).get(tenantId, scopeKey) as { n: number }).n;
+}
+
+/**
+ * §4.2 step 7 — a reconcile sets the pointer to itself explicitly, whatever
+ * its prior state (this is also how an invalid designation is repaired).
+ */
+export function setPointerOnReconcile(
+  db: DatabaseType.Database,
+  tenantId: string,
+  scopeKey: string,
+  stateId: string,
+  advancedBy: string,
+  advancedAt: string
+): void {
+  db.prepare(
+    `INSERT INTO eng4_scope_current (tenant_id, scope_key, state_id, advanced_at, advanced_by, reason)
+     VALUES (?, ?, ?, ?, ?, 'reconcile')
+     ON CONFLICT(tenant_id, scope_key) DO UPDATE SET
+       state_id = excluded.state_id, advanced_at = excluded.advanced_at,
+       advanced_by = excluded.advanced_by, reason = 'reconcile'`
+  ).run(tenantId, scopeKey, stateId, advancedAt, advancedBy);
 }
 
 export type PointerReason = 'first-write' | 'advance' | 'reconcile';
@@ -173,13 +227,15 @@ export function advancePointerAfterInsert(
     return 'first-write';
   }
   if (String(pointer.state_id) !== inserted.parentStateId) return null; // branch: live, not current
-  // Was the pointed head live immediately before this insert? Any OTHER child
-  // means the designation was already invalid — fail closed, do not repair.
+  // Was the pointed head live immediately before this insert? Any OTHER child,
+  // or a retirement row (H3), means the designation was already invalid —
+  // fail closed, do not repair (a resurrection never moves the pointer, §4.5).
   const priorChildren = db.prepare(
     `SELECT COUNT(*) AS n FROM eng4_state_snapshots
       WHERE tenant_id = ? AND scope_key = ? AND parent_state_id = ? AND state_id != ?`
   ).get(tenantId, scopeKey, inserted.parentStateId, inserted.stateId) as { n: number };
   if (priorChildren.n > 0) return null; // invalid designation stays invalid until reconcile
+  if (isRetired(db, tenantId, scopeKey, inserted.parentStateId)) return null;
   db.prepare(
     `UPDATE eng4_scope_current SET state_id = ?, advanced_at = ?, advanced_by = ?, reason = 'advance'
       WHERE tenant_id = ? AND scope_key = ?`

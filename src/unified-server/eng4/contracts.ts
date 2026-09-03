@@ -515,12 +515,80 @@ export interface CheckpointParams {
    * same-key retry with a different resultVersion is an idempotency-mismatch
    * and legacy fingerprints are unchanged.
    */
-  resultVersion?: 1 | 2;
+  resultVersion?: 1 | 2 | 3;
   state: WorkingState;
   events?: Array<{ kind: string; summary: string; at?: string }>;
   factChanges?: FactChange[];
   loopChanges?: LoopChange[];
   evidenceRefs?: string[];
+  // --- ENG-4 H3, resultVersion 3 ONLY (design §4, §4.5, §5.1). A v1/v2
+  // request carrying any of these fails input validation.
+  /** Absent → legacy `write`. `record`/`patch` arrive with H5. */
+  operation?: CheckpointOperation;
+  /** v3 `write` extending a RETIRED parent must say so (§4.5); never moves the pointer. */
+  acknowledgeRetired?: boolean;
+  /** reconcile: the EXACT live-head set (CAS); sorted server-side. */
+  expectedHeads?: string[];
+  /** reconcile: CAS on the pointer row's stateId (null = no row / legacy scope). */
+  expectedPointer?: string | null;
+  /** reconcile: the head that becomes this snapshot's parent; ∈ expectedHeads. */
+  survivor?: string;
+  /** reconcile: required free text. */
+  reason?: string;
+  /** reconcile: default true — any unresolved materialized divergent terminal refuses the call. */
+  strict?: boolean;
+  /** reconcile: explicit per-terminal resolutions. */
+  resolutions?: DivergenceResolutionRequest[];
+  /** reconcile: divergent head ids whose unresolved terminals are all rejected (expanded server-side). */
+  rejectLineages?: string[];
+}
+
+export type CheckpointOperation = 'write' | 'reconcile';
+
+/** One requested resolution of a divergent terminal change (§6.3). */
+export interface DivergenceResolutionRequest {
+  kind: 'fact' | 'loop';
+  id: string;
+  /** The terminal change's snapshot on the divergent lineage. */
+  divergentStateId: string;
+  decision: 'accept' | 'reject';
+  /** accept ONLY: ordinal of this request's own factChanges/loopChanges entry re-asserting the value. */
+  acceptedOrdinal?: number;
+}
+
+/** A resolution as recorded (payload-bound and in eng4_divergence_resolutions). */
+export interface ResolutionRecord {
+  kind: 'fact' | 'loop';
+  id: string;
+  divergentStateId: string;
+  decision: 'accept' | 'reject';
+  acceptedOrdinal: number | null;
+}
+
+/**
+ * The normalized reconciliation record — bound into the reconcile
+ * snapshot's envelope (contentHash) and mirrored by the merge-input,
+ * retirement and resolution rows, which replay and resume verify against it.
+ */
+export interface ReconciliationRecord {
+  expectedHeads: string[];
+  survivor: string;
+  retired: string[];
+  expectedPointer: string | null;
+  reason: string;
+  strict: boolean;
+  resolutions: ResolutionRecord[];
+  unresolvedDivergent: { facts: number; loops: number };
+}
+
+/** v3 `written`/`idempotent-replay` block for operation reconcile (§4.6). */
+export interface ReconciledBlock {
+  survivor: string;
+  retired: string[];
+  pointer: string;
+  resolutions: ResolutionRecord[];
+  /** Zero under strict (the default) by construction. */
+  unresolvedDivergent: { facts: number; loops: number };
 }
 
 /**
@@ -546,8 +614,10 @@ export type CheckpointResult =
       revision: number;
       parentStateId: string | null;
       contentHash: string;
-      /** Present ONLY when the request set resultVersion=2; empty arrays when nothing changed. */
+      /** Present ONLY when the request set resultVersion>=2; empty arrays when nothing changed. */
       changes?: CheckpointChanges;
+      /** Present ONLY on a resultVersion 3 `reconcile` (H3). */
+      reconciled?: ReconciledBlock;
     }
   | {
       outcome: 'idempotent-replay';
@@ -563,15 +633,20 @@ export type CheckpointResult =
        * changes the original write returned, read from the verified ledger.
        */
       changes?: CheckpointChanges;
+      /** Present ONLY on a resultVersion 3 `reconcile` replay, after §4.3 parity. */
+      reconciled?: ReconciledBlock;
     }
   | {
       outcome: 'conflict';
       /**
        * Returned ONLY for a missing/wrong-scope parent or null-on-existing-
-       * scope (frozen semantics — stale parents WRITE branches instead).
+       * scope (frozen semantics — stale parents WRITE branches instead), and
+       * (H3, v3 reconcile) for a head-set or pointer CAS mismatch.
        * Lists all live heads (>= 1) so the caller can pick a real parent.
        */
       heads: Array<{ stateId: string; revision: number; author: string; recordedAt: string }>;
+      /** Present ONLY on resultVersion 3: the pointer's stateId now (null = none). */
+      pointer?: string | null;
     }
   | {
       /**

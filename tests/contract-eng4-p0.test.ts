@@ -611,7 +611,7 @@ describe('ENG-4 2(a) — schema init boundary (executable)', () => {
     expect(result.statementsApplied).toBeGreaterThan(10);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'eng4_%' ORDER BY name`).all().map((r: any) => r.name);
-    expect(tables).toEqual(['eng4_fact_refs', 'eng4_fact_versions', 'eng4_facts', 'eng4_handoff_acks', 'eng4_loop_versions', 'eng4_open_loops', 'eng4_payloads', 'eng4_scope_current', 'eng4_scopes', 'eng4_snapshot_changes', 'eng4_state_snapshots', 'eng4_version_backfills', 'eng4_version_coverage', 'eng4_version_cutover']);
+    expect(tables).toEqual(['eng4_divergence_resolutions', 'eng4_fact_refs', 'eng4_fact_versions', 'eng4_facts', 'eng4_handoff_acks', 'eng4_head_retirements', 'eng4_loop_versions', 'eng4_open_loops', 'eng4_payloads', 'eng4_scope_current', 'eng4_scopes', 'eng4_snapshot_changes', 'eng4_snapshot_merge_inputs', 'eng4_state_snapshots', 'eng4_version_backfills', 'eng4_version_coverage', 'eng4_version_cutover']);
   });
 
   it('is idempotent across restarts: a second apply is a no-op (ALTERs guarded)', () => {

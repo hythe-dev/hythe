@@ -500,7 +500,34 @@ export const CHECKPOINT_INPUT_SCHEMA = {
     scope: SCOPE_SCHEMA,
     expectedRevision: { type: ['integer', 'null'], description: 'CAS guard; null asserts first write in scope.' },
     idempotencyKey: { type: 'string', minLength: 8 },
-    resultVersion: { type: 'integer', enum: [1, 2], description: 'Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2.' },
+    resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (INTERNAL, not final until the ENG-4 H-series completes): v2 plus the `operation` discriminant (`reconcile` since H3) and its fields; required for any of them.' },
+    operation: { enum: ['write', 'reconcile'], description: 'resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally.' },
+    acknowledgeRetired: { type: 'boolean', description: 'resultVersion 3 only: a write extending a RETIRED parent must set true; it never moves the pointer.' },
+    expectedHeads: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'reconcile: the exact set of live head stateIds (order irrelevant).' },
+    expectedPointer: { type: ['string', 'null'], description: 'reconcile: the current pointer stateId, or null for a scope without one.' },
+    survivor: { type: 'string', minLength: 1, description: 'reconcile: the head that becomes the parent; must be in expectedHeads and match expectedRevision.' },
+    reason: { type: 'string', minLength: 1, description: 'reconcile: required free text.' },
+    strict: { type: 'boolean', description: 'reconcile: default true — any unresolved materialized divergent terminal refuses the call. Opaque (unversioned) terminals must be rejected regardless.' },
+    resolutions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'id', 'divergentStateId', 'decision'],
+        properties: {
+          kind: { enum: ['fact', 'loop'] },
+          id: { type: 'string', minLength: 1 },
+          divergentStateId: { type: 'string', minLength: 1 },
+          decision: { enum: ['accept', 'reject'] },
+          acceptedOrdinal: { type: 'integer', minimum: 0 },
+        },
+        allOf: [
+          { if: { properties: { decision: { const: 'accept' } } }, then: { required: ['acceptedOrdinal'] } },
+          { if: { properties: { decision: { const: 'reject' } } }, then: { not: { required: ['acceptedOrdinal'] } } },
+        ],
+      },
+    },
+    rejectLineages: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'reconcile: divergent head ids whose every unresolved terminal is rejected (expanded server-side to per-value rejects).' },
     state: WORKING_STATE,
     events: {
       type: 'array',
@@ -546,6 +573,66 @@ export const CHECKPOINT_INPUT_SCHEMA = {
       },
     },
     evidenceRefs: { type: 'array', items: { type: 'string' } },
+  },
+  // Frozen v1/v2 request surface (design §2.2): every H-series field requires
+  // an explicit resultVersion:3; reconcile-only fields require
+  // operation:'reconcile', which requires its CAS/survivor/reason fields.
+  allOf: [
+    {
+      if: { not: { required: ['resultVersion'], properties: { resultVersion: { const: 3 } } } },
+      then: {
+        not: {
+          anyOf: ['operation', 'acknowledgeRetired', 'expectedHeads', 'expectedPointer', 'survivor', 'reason', 'strict', 'resolutions', 'rejectLineages']
+            .map((f) => ({ required: [f] })),
+        },
+      },
+    },
+    {
+      if: { required: ['operation'], properties: { operation: { const: 'reconcile' } } },
+      then: { required: ['expectedHeads', 'expectedPointer', 'survivor', 'reason'] },
+    },
+    {
+      if: { not: { required: ['operation'], properties: { operation: { const: 'reconcile' } } } },
+      then: {
+        not: {
+          anyOf: ['expectedHeads', 'expectedPointer', 'survivor', 'reason', 'strict', 'resolutions', 'rejectLineages']
+            .map((f) => ({ required: [f] })),
+        },
+      },
+    },
+  ],
+} as const;
+
+/** One recorded resolution (H3): accept carries the re-asserting ordinal, reject carries null. */
+const RESOLUTION_RECORD = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'id', 'divergentStateId', 'decision', 'acceptedOrdinal'],
+  properties: {
+    kind: { enum: ['fact', 'loop'] },
+    id: { type: 'string', minLength: 1 },
+    divergentStateId: { type: 'string', minLength: 1 },
+    decision: { enum: ['accept', 'reject'] },
+    acceptedOrdinal: { type: ['integer', 'null'], minimum: 0 },
+  },
+} as const;
+
+/** v3 reconcile result block (design §4.6). */
+export const CHECKPOINT_RECONCILED = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['survivor', 'retired', 'pointer', 'resolutions', 'unresolvedDivergent'],
+  properties: {
+    survivor: { type: 'string', minLength: 1 },
+    retired: { type: 'array', items: { type: 'string', minLength: 1 } },
+    pointer: { type: 'string', minLength: 1 },
+    resolutions: { type: 'array', items: RESOLUTION_RECORD },
+    unresolvedDivergent: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['facts', 'loops'],
+      properties: { facts: { type: 'integer', minimum: 0 }, loops: { type: 'integer', minimum: 0 } },
+    },
   },
 } as const;
 
@@ -634,12 +721,39 @@ export const CHECKPOINT_OUTPUT_SCHEMA = {
       properties: { ...REPLAY_V1_PROPERTIES, changes: CHECKPOINT_CHANGES },
     },
     {
+      // written, v3 reconcile (H3): v2 written + reconciled. A v3 `write`
+      // uses the v2 written shape (no reconciled key) — exact objects.
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'parentStateId', 'contentHash', 'changes', 'reconciled'],
+      properties: { ...WRITTEN_V1_PROPERTIES, changes: CHECKPOINT_CHANGES, reconciled: CHECKPOINT_RECONCILED },
+    },
+    {
+      // idempotent-replay, v3 reconcile: after §4.3 parity, the same block.
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'contentHash', 'changes', 'reconciled'],
+      properties: { ...REPLAY_V1_PROPERTIES, changes: CHECKPOINT_CHANGES, reconciled: CHECKPOINT_RECONCILED },
+    },
+    {
       type: 'object',
       additionalProperties: false,
       required: ['outcome', 'heads'],
       properties: {
         outcome: { const: 'conflict' },
         heads: { type: 'array', minItems: 1, items: STATE_HEAD },
+      },
+    },
+    {
+      // conflict, v3 (H3): heads + the pointer now (null = none), so a
+      // reconcile caller can restate both CAS values.
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'heads', 'pointer'],
+      properties: {
+        outcome: { const: 'conflict' },
+        heads: { type: 'array', minItems: 1, items: STATE_HEAD },
+        pointer: { type: ['string', 'null'] },
       },
     },
     {
