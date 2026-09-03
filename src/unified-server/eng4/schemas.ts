@@ -157,10 +157,19 @@ export const RESUME_INPUT_SCHEMA = {
     resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts. 3 (INTERNAL, not final until the ENG-4 H-series completes): schemaVersion=3 — v2 plus fixed-size head-selection fields on asOf (selection, pointer, liveHeadCount, divergentHeadCount, retiredHeadCount) and the budgeted `heads` section listing every live head.' },
     sections: {
       type: 'array',
-      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule', 'heads'], description: 'Section filter. `capsule` is meaningful only with resultVersion>=2; `heads` only with resultVersion=3.' },
+      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule', 'heads'], description: 'Section filter. `capsule` is meaningful only with resultVersion>=2. `heads` is an H-series section and REQUIRES an explicit resultVersion:3 — a v1/v2 request naming it fails validation.' },
     },
     cursor: { type: 'string' },
   },
+  // Frozen v1/v2 request surface (design 3429000 §2.2; codex-hythe review
+  // 186e1f91 MEDIUM 2): the H-series section `heads` is accepted ONLY on an
+  // explicit resultVersion:3 request — never inert on v1/v2.
+  allOf: [
+    {
+      if: { required: ['sections'], properties: { sections: { contains: { const: 'heads' } } } },
+      then: { required: ['resultVersion'], properties: { resultVersion: { const: 3 } } },
+    },
+  ],
 } as const;
 
 /**

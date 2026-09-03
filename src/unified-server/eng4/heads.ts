@@ -137,8 +137,19 @@ export function effectiveCurrentHead(
  * checkpoint result shapes are unchanged by it.
  *
  *   no pointer AND first snapshot in scope → set to the new snapshot ('first-write')
- *   pointer exists AND parent == pointer   → move to the new snapshot ('advance')
- *   otherwise                              → unchanged (a branch was written)
+ *   pointer exists AND parent == pointer
+ *     AND the pointed head was LIVE immediately before this insert
+ *                                          → move to the new snapshot ('advance')
+ *   otherwise                              → unchanged (a branch was written,
+ *                                            or the designation is invalid)
+ *
+ * The liveness precondition (codex-hythe review 186e1f91 HIGH 1): a pointer
+ * that names a non-live snapshot is an INVALID designation (§3.3) and must
+ * stay that way until an explicit reconcile with pointer CAS repairs it (§3.4,
+ * §4.2). Without the check, a frozen legacy write extending the corrupt
+ * pointer's target would silently "repair" the pointer onto its own branch.
+ * "Live immediately before" = the pointed head had no child other than the
+ * snapshot just inserted (H3 adds: and is not retired).
  *
  * A legacy scope (snapshots but no pointer) stays in legacy mode on ordinary
  * writes; only a reconcile (H3) gives it a pointer (§6.5).
@@ -162,6 +173,13 @@ export function advancePointerAfterInsert(
     return 'first-write';
   }
   if (String(pointer.state_id) !== inserted.parentStateId) return null; // branch: live, not current
+  // Was the pointed head live immediately before this insert? Any OTHER child
+  // means the designation was already invalid — fail closed, do not repair.
+  const priorChildren = db.prepare(
+    `SELECT COUNT(*) AS n FROM eng4_state_snapshots
+      WHERE tenant_id = ? AND scope_key = ? AND parent_state_id = ? AND state_id != ?`
+  ).get(tenantId, scopeKey, inserted.parentStateId, inserted.stateId) as { n: number };
+  if (priorChildren.n > 0) return null; // invalid designation stays invalid until reconcile
   db.prepare(
     `UPDATE eng4_scope_current SET state_id = ?, advanced_at = ?, advanced_by = ?, reason = 'advance'
       WHERE tenant_id = ? AND scope_key = ?`

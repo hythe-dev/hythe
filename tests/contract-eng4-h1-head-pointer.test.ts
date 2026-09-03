@@ -413,6 +413,37 @@ describe('H1 resolver — every selection mode (§3.3)', () => {
     }
   });
 
+  it('REGRESSION (codex 186e1f91 HIGH 1): a write extending a CORRUPT pointer target never repairs the pointer — invalid-designation persists until reconcile', () => {
+    const db = freshDb();
+    const root = write(db);
+    const b = write(db, { expectedRevision: 1, idempotencyKey: 'k-b-000001', state: state('b') });
+    // Out-of-band corruption: point back at root, which has child b (not live).
+    db.prepare(`UPDATE eng4_scope_current SET state_id=? WHERE tenant_id=? AND scope_key=?`).run(root.stateId, TENANT, SCOPE);
+    expect(effectiveCurrentHead(db, TENANT, SCOPE).selection).toBe('invalid-designation');
+    // A frozen legacy write A→C: parent == pointer, but the pointer was NOT live.
+    const c = write(db, { expectedRevision: 1, idempotencyKey: 'k-c-000001', state: state('c') });
+    expect(c.outcome).toBe('written'); // the branch itself is legal (frozen CAS)
+    expect(pointerRow(db).state_id).toBe(root.stateId); // pointer did NOT move
+    const eff = effectiveCurrentHead(db, TENANT, SCOPE);
+    expect(eff.selection).toBe('invalid-designation');
+    expect(eff.head).toBeNull();
+    expect(eff.live.map((h) => h.stateId)).toEqual([b.stateId, c.stateId]);
+    for (const over of [{}, { resultVersion: 2 }, { resultVersion: 3 }]) {
+      const bundle = resume(db, over);
+      expect(bundle.working).toBeNull();
+      expect(bundle.asOf).toMatchObject({ stateId: null, stale: true });
+    }
+    const v3 = resume(db, { resultVersion: 3 });
+    expect(v3.asOf).toMatchObject({ selection: 'invalid-designation', liveHeadCount: 2, divergentHeadCount: 2 });
+    expect(v3.asOf.pointer.stateId).toBe(root.stateId);
+    expect(v3.heads.every((h: any) => h.isCurrent === false)).toBe(true);
+    // And a healthy pointer is unaffected by the precondition: extending the live pointed head still advances.
+    const db2 = freshDb();
+    write(db2);
+    const b2 = write(db2, { expectedRevision: 1, idempotencyKey: 'k-b-000001', state: state('b') });
+    expect(pointerRow(db2)).toMatchObject({ state_id: b2.stateId, reason: 'advance' });
+  });
+
   it('exactly one head is flagged isCurrent under pointer/max-revision; none under empty-scope/invalid-designation', () => {
     const db = freshDb();
     const root = write(db);
@@ -536,23 +567,29 @@ describe('H1 resume v3 — bundle shape, schema exclusivity, budget and cursor (
     expect(validV3(bundle), ajv.errorsText(validV3.errors)).toBe(true);
   });
 
-  it('v1 and v2 ignore heads entirely: a v3 heads cursor is malformed under v1/v2, and "heads" in sections is inert there', () => {
+  it('v1 and v2 never see heads: a v3 heads cursor is malformed under v1/v2 at runtime', () => {
     const db = freshDb();
     attack(db);
     const cursor = Buffer.from(JSON.stringify({ s: 'heads', o: 1 }), 'utf8').toString('base64url');
     expect(() => resume(db, { cursor })).toThrow(/malformed resume cursor/);
     expect(() => resume(db, { resultVersion: 2, cursor })).toThrow(/malformed resume cursor/);
-    const v2 = resume(db, { resultVersion: 2, sections: ['working', 'heads'] });
-    expect('heads' in v2).toBe(false);
-    expect(validV2(v2), ajv.errorsText(validV2.errors)).toBe(true);
   });
 
-  it('resume input schema: resultVersion accepts 1|2|3 (not 4), sections accepts "heads"', () => {
+  it('resume input schema: resultVersion accepts 1|2|3 (not 4); "heads" in sections REQUIRES an explicit resultVersion 3 (codex 186e1f91 MEDIUM 2)', () => {
     const base = { agentId: 'a', scope: { project: 'Proj' }, budget: 1024 };
     expect(validResumeInput({ ...base, resultVersion: 3 })).toBe(true);
     expect(validResumeInput({ ...base, resultVersion: 4 })).toBe(false);
-    expect(validResumeInput({ ...base, sections: ['heads'] })).toBe(true);
     expect(validResumeInput({ ...base, sections: ['anchors'] })).toBe(false);
+    // The frozen v1/v2 request surface does not grow: heads is rejected without v3.
+    expect(validResumeInput({ ...base, sections: ['heads'] })).toBe(false);
+    expect(validResumeInput({ ...base, sections: ['working', 'heads'] })).toBe(false);
+    expect(validResumeInput({ ...base, resultVersion: 1, sections: ['heads'] })).toBe(false);
+    expect(validResumeInput({ ...base, resultVersion: 2, sections: ['heads'] })).toBe(false);
+    expect(validResumeInput({ ...base, resultVersion: 3, sections: ['heads'] })).toBe(true);
+    expect(validResumeInput({ ...base, resultVersion: 3, sections: ['working', 'heads', 'capsule'] })).toBe(true);
+    // Other sections remain valid on v1/v2 exactly as before #8/#9.
+    expect(validResumeInput({ ...base, sections: ['working', 'openLoops'] })).toBe(true);
+    expect(validResumeInput({ ...base, resultVersion: 2, sections: ['capsule'] })).toBe(true);
   });
 });
 
