@@ -370,6 +370,7 @@ export const CHECKPOINT_INPUT_SCHEMA = {
     scope: SCOPE_SCHEMA,
     expectedRevision: { type: ['integer', 'null'], description: 'CAS guard; null asserts first write in scope.' },
     idempotencyKey: { type: 'string', minLength: 8 },
+    resultVersion: { type: 'integer', enum: [1, 2], description: 'Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2.' },
     state: WORKING_STATE,
     events: {
       type: 'array',
@@ -448,36 +449,59 @@ export const CHECKPOINT_CHANGES = {
   },
 } as const;
 
-/** checkpoint() outputSchema — written | idempotent-replay | conflict (>=1 head). */
+/**
+ * checkpoint() outputSchema — written | idempotent-replay | conflict (>=1
+ * head) | idempotency-mismatch. The v1 written/replay shapes are FROZEN and
+ * remain the default; the v2 shapes (request resultVersion=2) are the same
+ * objects plus `changes`. Exact objects throughout: a v1 result never carries
+ * `changes`, a v2 result always does.
+ */
+const WRITTEN_V1_PROPERTIES = {
+  outcome: { const: 'written' },
+  stateId: { type: 'string' },
+  scopeKey: { type: 'string', minLength: 1 },
+  revision: { type: 'integer', minimum: 0 },
+  parentStateId: { type: ['string', 'null'] },
+  contentHash: { type: 'string' },
+} as const;
+const REPLAY_V1_PROPERTIES = {
+  outcome: { const: 'idempotent-replay' },
+  stateId: { type: 'string' },
+  scopeKey: { type: 'string', minLength: 1 },
+  revision: { type: 'integer', minimum: 0 },
+  contentHash: { type: 'string' },
+} as const;
+
 export const CHECKPOINT_OUTPUT_SCHEMA = {
   oneOf: [
     {
+      // written, v1 (frozen)
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'parentStateId', 'contentHash'],
+      properties: WRITTEN_V1_PROPERTIES,
+    },
+    {
+      // written, v2 (resultVersion=2): v1 + changes
       type: 'object',
       additionalProperties: false,
       required: ['outcome', 'stateId', 'scopeKey', 'revision', 'parentStateId', 'contentHash', 'changes'],
-      properties: {
-        outcome: { const: 'written' },
-        stateId: { type: 'string' },
-        scopeKey: { type: 'string', minLength: 1 },
-        revision: { type: 'integer', minimum: 0 },
-        parentStateId: { type: ['string', 'null'] },
-        contentHash: { type: 'string' },
-        changes: CHECKPOINT_CHANGES,
-      },
+      properties: { ...WRITTEN_V1_PROPERTIES, changes: CHECKPOINT_CHANGES },
     },
     {
+      // idempotent-replay, v1 (frozen)
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'contentHash'],
+      properties: REPLAY_V1_PROPERTIES,
+    },
+    {
+      // idempotent-replay, v2: v1 + changes (null ONLY for pre-ledger
+      // snapshots whose envelope carried changes)
       type: 'object',
       additionalProperties: false,
       required: ['outcome', 'stateId', 'scopeKey', 'revision', 'contentHash', 'changes'],
-      properties: {
-        outcome: { const: 'idempotent-replay' },
-        stateId: { type: 'string' },
-        scopeKey: { type: 'string', minLength: 1 },
-        revision: { type: 'integer', minimum: 0 },
-        contentHash: { type: 'string' },
-        // null ONLY for pre-ledger snapshots whose envelope carried changes.
-        changes: { anyOf: [CHECKPOINT_CHANGES, { type: 'null' }] },
-      },
+      properties: { ...REPLAY_V1_PROPERTIES, changes: { anyOf: [CHECKPOINT_CHANGES, { type: 'null' }] } },
     },
     {
       type: 'object',
@@ -490,9 +514,9 @@ export const CHECKPOINT_OUTPUT_SCHEMA = {
     },
     {
       // Same idempotencyKey, DIFFERENT REQUEST FINGERPRINT (different
-      // semantic intent — author, CAS position, or content; content hashes
-      // may be identical). Comparison IS the RFC 8785 requestFingerprint
-      // from canonical.ts; the field names say exactly that.
+      // semantic intent — author, CAS position, resultVersion=2 opt-in, or
+      // content; content hashes may be identical). Comparison IS the RFC 8785
+      // requestFingerprint from canonical.ts; the field names say exactly that.
       type: 'object',
       additionalProperties: false,
       required: ['outcome', 'stateId', 'expectedRequestFingerprint', 'receivedRequestFingerprint'],

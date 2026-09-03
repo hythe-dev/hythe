@@ -203,6 +203,12 @@ export const DDL = [
      PRIMARY KEY (tenant_id, state_id, kind, ordinal),
      FOREIGN KEY (tenant_id, state_id) REFERENCES eng4_state_snapshots(tenant_id, state_id)
    )`,
+  // Integrity binding for the ledger: sha256 of the canonical (RFC 8785)
+  // changes object, stored on the snapshot row in the same transaction.
+  // Replay recomputes from the ledger rows and fails CLOSED on mismatch,
+  // partial rows, or non-contiguous ordinals. NULL = pre-ledger snapshot.
+  // Additive, duplicate-column-guarded like the ai_messages ALTERs.
+  `ALTER TABLE eng4_state_snapshots ADD COLUMN changes_hash TEXT`,
 
   // 7. ai_messages scoping — additive columns + index (A6). SQLite ALTER ADD
   // COLUMN is cheap and non-rewriting; existing rows get NULLs (= unscoped).

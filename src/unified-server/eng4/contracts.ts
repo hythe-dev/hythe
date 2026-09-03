@@ -408,6 +408,14 @@ export interface CheckpointParams {
    * deliberately distinct.
    */
   idempotencyKey: string;
+  /**
+   * Result-shape opt-in (PR A, 2026-09-03). Absent or 1 → the exact frozen
+   * v1 result. 2 → written/idempotent-replay additionally carry `changes`
+   * (CheckpointChanges). Bound into requestFingerprint only when 2, so a
+   * same-key retry with a different resultVersion is an idempotency-mismatch
+   * and legacy fingerprints are unchanged.
+   */
+  resultVersion?: 1 | 2;
   state: WorkingState;
   events?: Array<{ kind: string; summary: string; at?: string }>;
   factChanges?: FactChange[];
@@ -420,8 +428,10 @@ export interface CheckpointParams {
  * is the row factChanges[i] resolved to, loops[i] the row loopChanges[i]
  * resolved to. `created` is false when the caller supplied an existing id
  * that was updated in place. Recorded in eng4_snapshot_changes inside the
- * checkpoint transaction; NOT part of the canonical envelope (hashes and
- * fingerprints are unaffected).
+ * checkpoint transaction and integrity-bound by a stored digest
+ * (eng4_state_snapshots.changes_hash) that replay verifies fail-closed; NOT
+ * part of the canonical envelope (contentHash unaffected). Returned only when
+ * the request opts in with resultVersion=2.
  */
 export interface CheckpointChanges {
   facts: Array<{ factId: string; created: boolean }>;
@@ -436,8 +446,8 @@ export type CheckpointResult =
       revision: number;
       parentStateId: string | null;
       contentHash: string;
-      /** Always present on a fresh write; empty arrays when nothing changed. */
-      changes: CheckpointChanges;
+      /** Present ONLY when the request set resultVersion=2; empty arrays when nothing changed. */
+      changes?: CheckpointChanges;
     }
   | {
       outcome: 'idempotent-replay';
@@ -446,11 +456,12 @@ export type CheckpointResult =
       revision: number;
       contentHash: string;
       /**
-       * The SAME changes the original write returned, read from the ledger.
-       * null ONLY for a snapshot recorded before the ledger existed whose
-       * envelope carried changes — the ids are unknowable, never invented.
+       * Present ONLY when the (fingerprint-matched) request set resultVersion=2.
+       * The SAME changes the original write returned, read from the verified
+       * ledger. null ONLY for a snapshot recorded before the ledger existed
+       * whose envelope carried changes — the ids are unknowable, never invented.
        */
-      changes: CheckpointChanges | null;
+      changes?: CheckpointChanges | null;
     }
   | {
       outcome: 'conflict';

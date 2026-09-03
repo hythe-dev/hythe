@@ -34,16 +34,21 @@
  * Tenant identity comes from the server-side request context parameter,
  * NEVER from caller params. No tool is registered here (2(c)/(d) gates).
  *
- * CHANGE LEDGER (PR A, 2026-09-03): the ids each factChange/loopChange
- * materialized to are recorded in eng4_snapshot_changes inside the same
- * transaction and returned as result.changes (positional). Replay reads the
- * ledger; it never recomputes. The ledger is result-side only — the
- * canonical envelope, contentHash and requestFingerprint are unchanged.
+ * CHANGE LEDGER (PR A, 2026-09-03; review 5e486718): the ids each
+ * factChange/loopChange materialized to are ALWAYS recorded in
+ * eng4_snapshot_changes inside the same transaction, digest-bound via
+ * eng4_state_snapshots.changes_hash. They are RETURNED as result.changes
+ * (positional) only when the request opts in with resultVersion=2 — the v1
+ * result shape is frozen and stays the default. resultVersion=2 is bound
+ * into requestFingerprint; absent/1 leaves legacy fingerprints byte-identical.
+ * Replay verifies the ledger against the verified envelope and fails CLOSED
+ * on any partial/tampered ledger; it never recomputes or returns a subset.
+ * The canonical envelope and contentHash are unchanged.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, CheckpointParams, CheckpointResult, FactChange, LoopChange } from './contracts.js';
-import { canonicalEnvelopeBytes, envelopeContentHash, requestFingerprint } from './canonical.js';
+import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 
 /** Unresolved/ambiguous scope fails CLOSED as a typed error — the four
@@ -102,6 +107,7 @@ interface SnapshotRow {
   request_fingerprint: string;
   author: string;
   recorded_at: string;
+  changes_hash: string | null;
 }
 
 /**
@@ -227,38 +233,75 @@ function recordSnapshotChanges(
   );
   changes.facts.forEach((f, i) => insert.run(tenantId, stateId, 'fact', i, f.factId, f.created ? 1 : 0));
   changes.loops.forEach((l, i) => insert.run(tenantId, stateId, 'loop', i, l.loopId, l.created ? 1 : 0));
+  db.prepare(`UPDATE eng4_state_snapshots SET changes_hash = ? WHERE tenant_id = ? AND state_id = ?`)
+    .run(changesHash(changes), tenantId, stateId);
+}
+
+/** sha256 over the RFC 8785 canonical form of the changes object. */
+export function changesHash(changes: CheckpointChanges): string {
+  return createHash('sha256').update(Buffer.from(canonicalize(changes), 'utf8')).digest('hex');
 }
 
 /**
- * Read back a snapshot's ledger for idempotent-replay. A snapshot recorded
- * before the ledger existed has no rows: if its persisted envelope carried
- * fact/loop changes the ids are unknowable → null (never invented); if it
- * carried none, empty arrays are the truthful answer.
+ * Read back a snapshot's ledger for idempotent-replay and VERIFY it against
+ * the (already hash-verified) persisted envelope — fail CLOSED (review
+ * 5e486718 blocker 2): a partial, duplicated, mis-ordered, or tampered
+ * ledger throws CheckpointIntegrityError; it never returns a subset.
+ * Pre-ledger snapshots (no rows AND no stored digest) cannot answer: null
+ * when the envelope carried fact/loop changes, empty arrays when it did not.
  */
-function readSnapshotChanges(
+export function readSnapshotChanges(
   db: DatabaseType.Database,
   tenantId: string,
   stateId: string,
-  contentHash: string
+  contentHash: string,
+  storedHash: string | null
 ): CheckpointChanges | null {
+  const payload = db.prepare(
+    `SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
+  ).get(tenantId, contentHash) as { body: Buffer } | undefined;
+  if (!payload) throw new CheckpointIntegrityError(`eng4: payload missing for content hash ${contentHash}`);
+  let expectedFacts = 0;
+  let expectedLoops = 0;
+  try {
+    const envelope = JSON.parse(payload.body.toString('utf-8')) as { factChanges?: unknown[]; loopChanges?: unknown[] };
+    expectedFacts = envelope.factChanges?.length ?? 0;
+    expectedLoops = envelope.loopChanges?.length ?? 0;
+  } catch {
+    throw new CheckpointIntegrityError(`eng4: persisted envelope for ${stateId} is not parseable`);
+  }
+
   const rows = db.prepare(
     `SELECT kind, ordinal, change_id, created FROM eng4_snapshot_changes
       WHERE tenant_id = ? AND state_id = ? ORDER BY kind, ordinal`
   ).all(tenantId, stateId) as Array<{ kind: string; ordinal: number; change_id: string; created: number }>;
-  const facts = rows.filter((r) => r.kind === 'fact').map((r) => ({ factId: String(r.change_id), created: r.created === 1 }));
-  const loops = rows.filter((r) => r.kind === 'loop').map((r) => ({ loopId: String(r.change_id), created: r.created === 1 }));
-  if (rows.length > 0) return { facts, loops };
-  const payload = db.prepare(
-    `SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-  ).get(tenantId, contentHash) as { body: Buffer } | undefined;
-  if (!payload) return null;
-  try {
-    const envelope = JSON.parse(payload.body.toString('utf-8')) as { factChanges?: unknown[]; loopChanges?: unknown[] };
-    const carried = (envelope.factChanges?.length ?? 0) + (envelope.loopChanges?.length ?? 0);
-    return carried === 0 ? { facts: [], loops: [] } : null;
-  } catch {
-    return null;
+
+  if (rows.length === 0 && storedHash === null) {
+    // Pre-ledger snapshot: truthful answer only.
+    return expectedFacts + expectedLoops === 0 ? { facts: [], loops: [] } : null;
   }
+
+  const fail = (why: string): never => {
+    throw new CheckpointIntegrityError(`eng4: snapshot change ledger failed verification for ${stateId}: ${why}`);
+  };
+  const factRows = rows.filter((r) => r.kind === 'fact');
+  const loopRows = rows.filter((r) => r.kind === 'loop');
+  if (factRows.length !== expectedFacts) fail(`expected ${expectedFacts} fact rows, found ${factRows.length}`);
+  if (loopRows.length !== expectedLoops) fail(`expected ${expectedLoops} loop rows, found ${loopRows.length}`);
+  const contiguous = (list: Array<{ ordinal: number }>) => list.every((r, i) => r.ordinal === i);
+  if (!contiguous(factRows)) fail('fact ordinals are not contiguous from 0');
+  if (!contiguous(loopRows)) fail('loop ordinals are not contiguous from 0');
+  for (const r of rows) {
+    if (typeof r.change_id !== 'string' || r.change_id.length === 0) fail('empty change_id');
+    if (r.created !== 0 && r.created !== 1) fail('created flag out of range');
+  }
+  const changes: CheckpointChanges = {
+    facts: factRows.map((r) => ({ factId: String(r.change_id), created: r.created === 1 })),
+    loops: loopRows.map((r) => ({ loopId: String(r.change_id), created: r.created === 1 })),
+  };
+  if (storedHash === null) fail('ledger rows present but no stored digest');
+  if (changesHash(changes) !== storedHash) fail('ledger digest mismatch');
+  return changes;
 }
 
 /** Heads = snapshots no other snapshot in the scope claims as parent. Shared with resume. */
@@ -349,19 +392,21 @@ export function performCheckpoint(
         ).get(tenantId, scopeKey, params.expectedRevision) as { state_id: string } | undefined;
     const resolvedParentStateId = parentRow ? String(parentRow.state_id) : null;
 
+    const resultVersion: 1 | 2 = params.resultVersion === 2 ? 2 : 1;
     const fingerprint = requestFingerprint({
       canonicalAgentId,
       scopeKey,
       expectedRevision: params.expectedRevision,
       resolvedParentStateId,
       envelope,
+      resultVersion,
     });
 
     // Idempotency FIRST (before CAS validation): a retry of the initial
     // write must replay even though the scope now has snapshots.
     const existing = db.prepare(
       `SELECT state_id, scope_key, revision, parent_state_id, content_hash,
-              request_fingerprint, author, recorded_at
+              request_fingerprint, author, recorded_at, changes_hash
          FROM eng4_state_snapshots
         WHERE tenant_id = ? AND scope_key = ? AND idempotency_key = ?`
     ).get(tenantId, scopeKey, params.idempotencyKey) as SnapshotRow | undefined;
@@ -376,13 +421,19 @@ export function performCheckpoint(
         };
       }
       verifyPayloadIntegrity(db, tenantId, String(existing.content_hash));
+      // Ledger verification is unconditional (fail closed) — the shape opt-in
+      // only decides whether the verified answer is RETURNED.
+      const replayChanges = readSnapshotChanges(
+        db, tenantId, String(existing.state_id), String(existing.content_hash),
+        existing.changes_hash === null || existing.changes_hash === undefined ? null : String(existing.changes_hash)
+      );
       return {
         outcome: 'idempotent-replay',
         stateId: String(existing.state_id),
         scopeKey: String(existing.scope_key),
         revision: Number(existing.revision),
         contentHash: String(existing.content_hash),
-        changes: readSnapshotChanges(db, tenantId, String(existing.state_id), String(existing.content_hash)),
+        ...(resultVersion === 2 ? { changes: replayChanges } : {}),
       };
     }
 
@@ -458,7 +509,7 @@ export function performCheckpoint(
       revision,
       parentStateId: resolvedParentStateId,
       contentHash,
-      changes,
+      ...(resultVersion === 2 ? { changes } : {}),
     };
   });
 

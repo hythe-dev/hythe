@@ -1113,6 +1113,14 @@ Parameters
       "type": "string",
       "minLength": 8
     },
+    "resultVersion": {
+      "type": "integer",
+      "enum": [
+        1,
+        2
+      ],
+      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2."
+    },
     "state": {
       "type": "object",
       "additionalProperties": false,

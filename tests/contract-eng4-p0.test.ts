@@ -618,7 +618,7 @@ describe('ENG-4 2(a) — schema init boundary (executable)', () => {
     const db = freshDb();
     applyEng4Schema(db);
     const second = applyEng4Schema(db);
-    expect(second.alterSkippedAsExisting).toBe(3); // the three ai_messages columns already exist
+    expect(second.alterSkippedAsExisting).toBe(4); // 3 ai_messages ALTERs + eng4_state_snapshots.changes_hash (PR A); // the three ai_messages columns already exist
     // Columns exist exactly once.
     const cols = db.prepare(`PRAGMA table_info(ai_messages)`).all().map((r: any) => r.name);
     expect(cols.filter((c: string) => c === 'project_id')).toHaveLength(1);
@@ -944,7 +944,6 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
       scopeKey: first.scopeKey,
       revision: first.revision,
       contentHash: first.contentHash,
-      changes: { facts: [], loops: [] }, // PR A: replay carries the ledger answer (empty here)
     });
     expect(snapCount(db)).toBe(1);
   });
