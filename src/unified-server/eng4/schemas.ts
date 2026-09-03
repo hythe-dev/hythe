@@ -418,13 +418,43 @@ export const CHECKPOINT_INPUT_SCHEMA = {
   },
 } as const;
 
+/**
+ * Materialized change ids (PR A, 2026-09-03): positional to the request's
+ * factChanges / loopChanges. Result-side only — never part of the envelope.
+ */
+export const CHECKPOINT_CHANGES = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['facts', 'loops'],
+  properties: {
+    facts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['factId', 'created'],
+        properties: { factId: { type: 'string', minLength: 1 }, created: { type: 'boolean' } },
+      },
+    },
+    loops: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['loopId', 'created'],
+        properties: { loopId: { type: 'string', minLength: 1 }, created: { type: 'boolean' } },
+      },
+    },
+  },
+} as const;
+
 /** checkpoint() outputSchema — written | idempotent-replay | conflict (>=1 head). */
 export const CHECKPOINT_OUTPUT_SCHEMA = {
   oneOf: [
     {
       type: 'object',
       additionalProperties: false,
-      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'parentStateId', 'contentHash'],
+      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'parentStateId', 'contentHash', 'changes'],
       properties: {
         outcome: { const: 'written' },
         stateId: { type: 'string' },
@@ -432,18 +462,21 @@ export const CHECKPOINT_OUTPUT_SCHEMA = {
         revision: { type: 'integer', minimum: 0 },
         parentStateId: { type: ['string', 'null'] },
         contentHash: { type: 'string' },
+        changes: CHECKPOINT_CHANGES,
       },
     },
     {
       type: 'object',
       additionalProperties: false,
-      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'contentHash'],
+      required: ['outcome', 'stateId', 'scopeKey', 'revision', 'contentHash', 'changes'],
       properties: {
         outcome: { const: 'idempotent-replay' },
         stateId: { type: 'string' },
         scopeKey: { type: 'string', minLength: 1 },
         revision: { type: 'integer', minimum: 0 },
         contentHash: { type: 'string' },
+        // null ONLY for pre-ledger snapshots whose envelope carried changes.
+        changes: { anyOf: [CHECKPOINT_CHANGES, { type: 'null' }] },
       },
     },
     {

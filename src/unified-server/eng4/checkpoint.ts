@@ -33,10 +33,16 @@
  * resume bundle in 2(c) — resume is the only reader of those tables.
  * Tenant identity comes from the server-side request context parameter,
  * NEVER from caller params. No tool is registered here (2(c)/(d) gates).
+ *
+ * CHANGE LEDGER (PR A, 2026-09-03): the ids each factChange/loopChange
+ * materialized to are recorded in eng4_snapshot_changes inside the same
+ * transaction and returned as result.changes (positional). Replay reads the
+ * ledger; it never recomputes. The ledger is result-side only — the
+ * canonical envelope, contentHash and requestFingerprint are unchanged.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import type DatabaseType from 'better-sqlite3';
-import type { CheckpointParams, CheckpointResult, FactChange, LoopChange } from './contracts.js';
+import type { CheckpointChanges, CheckpointParams, CheckpointResult, FactChange, LoopChange } from './contracts.js';
 import { canonicalEnvelopeBytes, envelopeContentHash, requestFingerprint } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 
@@ -112,12 +118,14 @@ function applyFactChanges(
   author: string,
   recordedAt: string,
   changes: readonly FactChange[]
-): void {
+): CheckpointChanges['facts'] {
   const insertRef = db.prepare(
     `INSERT OR IGNORE INTO eng4_fact_refs (tenant_id, fact_id, ref_kind, ref) VALUES (?, ?, ?, ?)`
   );
+  const out: CheckpointChanges['facts'] = [];
   for (const change of changes) {
     let factId = change.factId ?? null;
+    const created = !factId;
     if (factId) {
       const existing = db.prepare(
         `SELECT fact_id FROM eng4_facts WHERE tenant_id = ? AND scope_key = ? AND fact_id = ?`
@@ -150,7 +158,9 @@ function applyFactChanges(
     // Dangling contradicts refs are LEGAL AT WRITE (deferred-resolution
     // rule) — they surface at read time as unresolved contradictions.
     for (const ref of change.contradicts ?? []) insertRef.run(tenantId, factId, 'contradicts', ref);
+    out.push({ factId, created });
   }
+  return out;
 }
 
 function applyLoopChanges(
@@ -160,7 +170,8 @@ function applyLoopChanges(
   author: string,
   recordedAt: string,
   changes: readonly LoopChange[]
-): void {
+): CheckpointChanges['loops'] {
+  const out: CheckpointChanges['loops'] = [];
   for (const change of changes) {
     if (change.status === 'closed' && !change.closeOutcome) {
       throw new CheckpointChangeError('eng4: closing a loop requires closeOutcome');
@@ -184,18 +195,69 @@ function applyLoopChanges(
         change.dueAt ?? null, change.blockedOn ?? null, closeJson, recordedAt,
         tenantId, change.loopId
       );
+      out.push({ loopId: change.loopId, created: false });
     } else {
+      const loopId = randomUUID();
       db.prepare(
         `INSERT INTO eng4_open_loops
            (tenant_id, loop_id, scope_key, owner, status, opened_at, updated_at,
             due_at, blocked_on, next_action, close_json, revision)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
       ).run(
-        tenantId, randomUUID(), scopeKey, change.owner ?? author, change.status,
+        tenantId, loopId, scopeKey, change.owner ?? author, change.status,
         recordedAt, recordedAt, change.dueAt ?? null, change.blockedOn ?? null,
         change.nextAction, closeJson
       );
+      out.push({ loopId, created: true });
     }
+  }
+  return out;
+}
+
+/** Persist the per-snapshot change ledger (same transaction as the snapshot). */
+function recordSnapshotChanges(
+  db: DatabaseType.Database,
+  tenantId: string,
+  stateId: string,
+  changes: CheckpointChanges
+): void {
+  const insert = db.prepare(
+    `INSERT INTO eng4_snapshot_changes (tenant_id, state_id, kind, ordinal, change_id, created)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  );
+  changes.facts.forEach((f, i) => insert.run(tenantId, stateId, 'fact', i, f.factId, f.created ? 1 : 0));
+  changes.loops.forEach((l, i) => insert.run(tenantId, stateId, 'loop', i, l.loopId, l.created ? 1 : 0));
+}
+
+/**
+ * Read back a snapshot's ledger for idempotent-replay. A snapshot recorded
+ * before the ledger existed has no rows: if its persisted envelope carried
+ * fact/loop changes the ids are unknowable → null (never invented); if it
+ * carried none, empty arrays are the truthful answer.
+ */
+function readSnapshotChanges(
+  db: DatabaseType.Database,
+  tenantId: string,
+  stateId: string,
+  contentHash: string
+): CheckpointChanges | null {
+  const rows = db.prepare(
+    `SELECT kind, ordinal, change_id, created FROM eng4_snapshot_changes
+      WHERE tenant_id = ? AND state_id = ? ORDER BY kind, ordinal`
+  ).all(tenantId, stateId) as Array<{ kind: string; ordinal: number; change_id: string; created: number }>;
+  const facts = rows.filter((r) => r.kind === 'fact').map((r) => ({ factId: String(r.change_id), created: r.created === 1 }));
+  const loops = rows.filter((r) => r.kind === 'loop').map((r) => ({ loopId: String(r.change_id), created: r.created === 1 }));
+  if (rows.length > 0) return { facts, loops };
+  const payload = db.prepare(
+    `SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
+  ).get(tenantId, contentHash) as { body: Buffer } | undefined;
+  if (!payload) return null;
+  try {
+    const envelope = JSON.parse(payload.body.toString('utf-8')) as { factChanges?: unknown[]; loopChanges?: unknown[] };
+    const carried = (envelope.factChanges?.length ?? 0) + (envelope.loopChanges?.length ?? 0);
+    return carried === 0 ? { facts: [], loops: [] } : null;
+  } catch {
+    return null;
   }
 }
 
@@ -320,6 +382,7 @@ export function performCheckpoint(
         scopeKey: String(existing.scope_key),
         revision: Number(existing.revision),
         contentHash: String(existing.content_hash),
+        changes: readSnapshotChanges(db, tenantId, String(existing.state_id), String(existing.content_hash)),
       };
     }
 
@@ -382,8 +445,11 @@ export function performCheckpoint(
 
     // 2(c) materialization — same transaction, after the snapshot; a bad
     // change throws and rolls back the ENTIRE checkpoint.
-    applyFactChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.factChanges ?? []);
-    applyLoopChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.loopChanges ?? []);
+    const changes: CheckpointChanges = {
+      facts: applyFactChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.factChanges ?? []),
+      loops: applyLoopChanges(db, tenantId, scopeKey, canonicalAgentId, recordedAt, params.loopChanges ?? []),
+    };
+    recordSnapshotChanges(db, tenantId, stateId, changes);
 
     return {
       outcome: 'written',
@@ -392,6 +458,7 @@ export function performCheckpoint(
       revision,
       parentStateId: resolvedParentStateId,
       contentHash,
+      changes,
     };
   });
 

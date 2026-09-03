@@ -611,7 +611,7 @@ describe('ENG-4 2(a) — schema init boundary (executable)', () => {
     expect(result.statementsApplied).toBeGreaterThan(10);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
     const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'eng4_%' ORDER BY name`).all().map((r: any) => r.name);
-    expect(tables).toEqual(['eng4_fact_refs', 'eng4_facts', 'eng4_handoff_acks', 'eng4_open_loops', 'eng4_payloads', 'eng4_scopes', 'eng4_state_snapshots']);
+    expect(tables).toEqual(['eng4_fact_refs', 'eng4_facts', 'eng4_handoff_acks', 'eng4_open_loops', 'eng4_payloads', 'eng4_scopes', 'eng4_snapshot_changes', 'eng4_state_snapshots']);
   });
 
   it('is idempotent across restarts: a second apply is a no-op (ALTERs guarded)', () => {
@@ -944,6 +944,7 @@ describe('ENG-4 2(b) — checkpoint runtime (branch-preserving CAS, executable)'
       scopeKey: first.scopeKey,
       revision: first.revision,
       contentHash: first.contentHash,
+      changes: { facts: [], loops: [] }, // PR A: replay carries the ledger answer (empty here)
     });
     expect(snapCount(db)).toBe(1);
   });

@@ -415,6 +415,19 @@ export interface CheckpointParams {
   evidenceRefs?: string[];
 }
 
+/**
+ * What a checkpoint materialized (PR A, 2026-09-03). POSITIONAL: facts[i]
+ * is the row factChanges[i] resolved to, loops[i] the row loopChanges[i]
+ * resolved to. `created` is false when the caller supplied an existing id
+ * that was updated in place. Recorded in eng4_snapshot_changes inside the
+ * checkpoint transaction; NOT part of the canonical envelope (hashes and
+ * fingerprints are unaffected).
+ */
+export interface CheckpointChanges {
+  facts: Array<{ factId: string; created: boolean }>;
+  loops: Array<{ loopId: string; created: boolean }>;
+}
+
 export type CheckpointResult =
   | {
       outcome: 'written';
@@ -423,6 +436,8 @@ export type CheckpointResult =
       revision: number;
       parentStateId: string | null;
       contentHash: string;
+      /** Always present on a fresh write; empty arrays when nothing changed. */
+      changes: CheckpointChanges;
     }
   | {
       outcome: 'idempotent-replay';
@@ -430,6 +445,12 @@ export type CheckpointResult =
       scopeKey: ScopeKey;
       revision: number;
       contentHash: string;
+      /**
+       * The SAME changes the original write returned, read from the ledger.
+       * null ONLY for a snapshot recorded before the ledger existed whose
+       * envelope carried changes — the ids are unknowable, never invented.
+       */
+      changes: CheckpointChanges | null;
     }
   | {
       outcome: 'conflict';
