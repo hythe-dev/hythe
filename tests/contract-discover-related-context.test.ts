@@ -686,6 +686,111 @@ describe('discover_related_context generic read-only contract', () => {
     }
   });
 
+  it('conditions semantic retrieval on the caller intent rather than scope self-text', async () => {
+    let captured: string | null = null;
+    const semantic = installSemanticSearch(server, async (query) => {
+      captured = query;
+      return { results: [], degraded: false, reasons: [] };
+    });
+    try {
+      const intent = 'alpha unique intent probe for semantic conditioning';
+      await callOk(server, 'discover_related_context', {
+        scope: { project: names.scope },
+        intent,
+        candidateLimit: 10,
+        graphDepth: 1,
+        budget: 3000,
+      }, alphaContext);
+      expect(captured).toBe(intent);
+    } finally {
+      semantic.restore();
+    }
+  });
+
+  it('does not let root-scope self-matches starve the semantic seed budget', async () => {
+    const rootSeeds = Array.from({ length: 30 }, (_, index) => ({
+      id: `alpha-root-seed-${String(index).padStart(2, '0')}-${tag}`,
+      type: 'shared',
+      content: {
+        entityName: names.scope,
+        contents: [`alpha scope self text ${index}`],
+        addedBy: 'alpha-fixture',
+        timestamp: new Date().toISOString(),
+        metadata: {},
+      },
+      relevance: 0.99,
+      semanticSimilarity: 0.99,
+      source: 'sqlite-vec:alpha-fixture',
+      timestamp: new Date(),
+      memoryType: 'observation',
+    }));
+    const semantic = installSemanticSearch(server, async () => ({
+      results: [...rootSeeds, semanticObservation(observations[names.semanticOnly], 0.7)],
+      degraded: false,
+      reasons: [],
+    }));
+    try {
+      const result = await callOk(server, 'discover_related_context', {
+        scope: { project: names.scope },
+        intent: 'root starvation probe',
+        candidateLimit: 10,
+        graphDepth: 1,
+        budget: 12000,
+      }, alphaContext);
+
+      const semanticOnly = result.candidates.find((candidate: any) => candidate.entity.name === names.semanticOnly);
+      expect(semanticOnly).toBeDefined();
+      expect(semanticOnly.scores.semantic).toBeCloseTo(0.7);
+      expect(result.candidates.some((candidate: any) => candidate.entity.name === names.scope)).toBe(false);
+      expect(result.degraded.semantic).toBe(false);
+      expect(result.coverage.examinedCount).toBeGreaterThanOrEqual(31);
+    } finally {
+      semantic.restore();
+    }
+  });
+
+  it('reports explicit degradation when every semantic seed resolves to the root scope', async () => {
+    const rootSeeds = Array.from({ length: 5 }, (_, index) => ({
+      id: `alpha-root-only-seed-${index}-${tag}`,
+      type: 'shared',
+      content: {
+        entityName: names.scope,
+        contents: [`alpha scope self text only ${index}`],
+        addedBy: 'alpha-fixture',
+        timestamp: new Date().toISOString(),
+        metadata: {},
+      },
+      relevance: 0.97,
+      semanticSimilarity: 0.97,
+      source: 'sqlite-vec:alpha-fixture',
+      timestamp: new Date(),
+      memoryType: 'observation',
+    }));
+    const semantic = installSemanticSearch(server, async () => ({
+      results: rootSeeds,
+      degraded: false,
+      reasons: [],
+    }));
+    try {
+      const result = await callOk(server, 'discover_related_context', {
+        scope: { project: names.scope },
+        intent: 'root-only attribution probe',
+        candidateLimit: 10,
+        graphDepth: 1,
+        budget: 3000,
+      }, alphaContext);
+
+      expect(result.error).toBeUndefined();
+      expect(result.degraded.semantic).toBe(true);
+      expect(result.degraded.reasons).toContain('semantic_seeds_root_scope_only');
+      expect(result.candidates.some((candidate: any) => candidate.entity.name === names.direct)).toBe(true);
+      expect(result.candidates.every((candidate: any) => candidate.scores.semantic === null)).toBe(true);
+      expect(result.coverage.examinedCount).toBeGreaterThanOrEqual(5);
+    } finally {
+      semantic.restore();
+    }
+  });
+
   it('the actual semantic adapter filters orphaned, stale, and type-mismatched vector rows and reports degradation', async () => {
     const manager = server.getMemoryManager() as any;
     const db = manager.getDb();
