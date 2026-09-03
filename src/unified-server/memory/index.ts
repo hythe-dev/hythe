@@ -4801,7 +4801,7 @@ export class MemoryManager {
    * Rehydration capsules for an entity (resume resultVersion=2): every
    * observation whose metadata.kind === 'capsule' that is NOT superseded by
    * any observation on the entity, newest first. Supersession is computed
-   * over ALL of the entity's observations (bounded window), so a non-capsule
+   * over ALL of the entity's indexed observations (full paged scan), so a non-capsule
    * observation that supersedes a capsule still retires it — but an unrelated
    * newer append never hides one (data-audit HIGH 1, 2026-09-03).
    */
@@ -4824,7 +4824,12 @@ export class MemoryManager {
     if (!entityName) return { capsules: [], candidatesConsidered: 0 };
     const canonicalKey = this.normalizeEntityLookup(entityName);
 
-    const rows = this.db.prepare(`
+    // FULL indexed scan, paged (review b2641137 blocker 2): a bounded window
+    // would silently drop a still-current capsule behind N newer unrelated
+    // rows, or hide an older superseder/conflict. Selection must be
+    // authoritative; only the RETURNED payload is budgeted (by resume).
+    const PAGE = 500;
+    const page = this.db.prepare(`
       SELECT sm.id, sm.content, sm.created_by, sm.created_at
       FROM graph_lookup_keys glk
       JOIN shared_memory sm
@@ -4835,8 +4840,15 @@ export class MemoryManager {
         AND glk.key_kind = 'entity_name'
         AND sm.memory_type = 'observation'
       ORDER BY sm.created_at DESC, sm.rowid DESC
-      LIMIT 500
-    `).all(tenantId, canonicalKey) as Array<{ id: string; content: string; created_by: string; created_at: string }>;
+      LIMIT ? OFFSET ?
+    `);
+    const rows: Array<{ id: string; content: string; created_by: string; created_at: string }> = [];
+    const seen = new Set<string>();
+    for (let offset = 0; ; offset += PAGE) {
+      const batch = page.all(tenantId, canonicalKey, PAGE, offset) as typeof rows;
+      for (const r of batch) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+      if (batch.length < PAGE) break;
+    }
 
     const parsed = rows.map((row) => {
       let content: any;

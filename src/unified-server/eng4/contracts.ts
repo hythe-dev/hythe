@@ -289,7 +289,12 @@ export type ResumeSectionName =
   | 'currentFacts'
   | 'decisions'
   | 'evidence'
-  | 'pointers';
+  | 'pointers'
+  /** schemaVersion=2 ONLY: the budgeted capsule section (item 0 = current, rest = conflicts). */
+  | 'capsule';
+
+/** The seven frozen v1 sections. */
+export type ResumeSectionNameV1 = Exclude<ResumeSectionName, 'capsule'>;
 
 // ---------------------------------------------------------------------------
 // resume (primitive 1 of exactly 2)
@@ -369,12 +374,22 @@ export interface CapsuleObservation {
 }
 
 export interface ResumeCapsule {
-  /** Newest unsuperseded kind=capsule observation, or null when none exists. */
+  /**
+   * Newest unsuperseded kind=capsule observation. null when none exists OR
+   * when the budget/cursor omitted it — coverage.capsule and `complete`
+   * distinguish the two; `current: null` is never silently "absent".
+   */
   current: CapsuleObservation | null;
-  /** Every OTHER unsuperseded kind=capsule observation, newest first — a fork to reconcile. */
+  /** Every OTHER unsuperseded kind=capsule observation delivered on this page, newest first — a fork to reconcile. */
   conflicts: CapsuleObservation[];
-  /** Observations on the scope entity that were examined for the selection. */
+  /** Every visible observation on the scope entity examined (FULL indexed scan, not a window). */
   candidatesConsidered: number;
+  /**
+   * true iff current AND all conflicts are delivered on this page
+   * (== coverage.capsule.contentComplete). false → continue with
+   * coverage.capsule.nextCursor or a larger budget; nothing was trimmed silently.
+   */
+  complete: boolean;
 }
 
 export interface ResumeBundle {
@@ -393,8 +408,9 @@ export interface ResumeBundle {
   decisions: Array<{ id: string; summary: string; recordedAt: string; evidenceRefs: string[] }>;
   evidence: ContentHandle[];
   pointers: Array<{ label: string; entity: string; relation: string }>;
-  /** All seven sections present ALWAYS (closedness — review e0d81d4d #2). */
-  coverage: Record<ResumeSectionName, SectionCoverage> & {
+  /** All seven v1 sections present ALWAYS (closedness — review e0d81d4d #2); `capsule` coverage ONLY on schemaVersion=2. */
+  coverage: Record<ResumeSectionNameV1, SectionCoverage> & {
+    capsule?: SectionCoverage;
     totalTokenEstimate: number;
     budget: number;
   };

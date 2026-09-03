@@ -21,6 +21,15 @@
  * - Unresolved scope under v2 → schemaVersion 2 with an empty capsule block,
  *   never a missing key.
  * - `definition` (immutable founding prose) is untouched and separate.
+ * - BUDGETED (review b2641137 blocker 1): under v2 the capsule is a section
+ *   ('capsule', ordered right after working) with closed coverage. A capsule
+ *   that does not fit is OMITTED with omittedReason=budget and a cursor;
+ *   capsule.current is then null and capsule.complete false — never a
+ *   silently trimmed bundle claiming completeness. totalTokenEstimate never
+ *   exceeds budget.
+ * - AUTHORITATIVE (review b2641137 blocker 2): the selector scans the
+ *   entity's FULL indexed observation set (paged), so a still-current
+ *   capsule behind 500+ newer unrelated rows is still found.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import Ajv from 'ajv';
@@ -73,6 +82,7 @@ const freshDb = () => {
 const state: WorkingState = { objective: 'o', status: 's', owner: 'claude-hythe', nextActions: [], blockers: [], guardrails: [] };
 const seed = (db: any, directory: ResumeDirectory) =>
   performCheckpoint(db, directory, TENANT, { agentId: 'claude-hythe', scope: { project: 'Proj' }, expectedRevision: null, idempotencyKey: 'k-seed-001', state });
+const v1Coverage = (db: any, directory: ResumeDirectory) => resume(db, directory).coverage;
 const resume = (db: any, directory: ResumeDirectory, over: Record<string, unknown> = {}) =>
   performResume(db, directory, TENANT, { agentId: 'claude-hythe', scope: { project: 'Proj' }, budget: 4000, ...over } as any) as any;
 
@@ -116,6 +126,9 @@ describe('resume capsule — resultVersion=2 (injected directory)', () => {
     expect(bundle.capsule.current.observationId).toBe('newest');
     expect(bundle.capsule.conflicts.map((c: any) => c.observationId)).toEqual(['older-fork']);
     expect(bundle.capsule.candidatesConsidered).toBe(7);
+    expect(bundle.capsule.complete).toBe(true);
+    expect(bundle.coverage.capsule).toMatchObject({ includedCount: 2, totalCount: 2, contentComplete: true, omittedReason: 'none', nextCursor: null });
+    expect('capsule' in v1Coverage(db, directory)).toBe(false);
     expect(bundle.definition).toBe('FOUNDING CAPSULE 2026-08-07 (immutable, stale)'); // separate, untouched
     expect(validV2(bundle), ajv.errorsText(validV2.errors)).toBe(true);
     expect(() => validateEng4Output('resume', bundle)).not.toThrow();
@@ -126,7 +139,8 @@ describe('resume capsule — resultVersion=2 (injected directory)', () => {
     const directory = makeDirectory([], 3);
     seed(db, directory);
     const bundle = resume(db, directory, { resultVersion: 2 });
-    expect(bundle.capsule).toEqual({ current: null, conflicts: [], candidatesConsidered: 3 });
+    expect(bundle.capsule).toEqual({ current: null, conflicts: [], candidatesConsidered: 3, complete: true });
+    expect(bundle.coverage.capsule).toMatchObject({ includedCount: 0, totalCount: 0, contentComplete: true, omittedReason: 'none' });
     expect(() => validateEng4Output('resume', bundle)).not.toThrow();
   });
 
@@ -136,7 +150,8 @@ describe('resume capsule — resultVersion=2 (injected directory)', () => {
     const bundle = resume(db, directory, { resultVersion: 2, scope: { project: 'Nope' } });
     expect(bundle.schemaVersion).toBe(2);
     expect(bundle.resolvedScope.scopeKey).toBeNull();
-    expect(bundle.capsule).toEqual({ current: null, conflicts: [], candidatesConsidered: 0 });
+    expect(bundle.capsule).toEqual({ current: null, conflicts: [], candidatesConsidered: 0, complete: true });
+    expect(bundle.coverage.capsule).toMatchObject({ includedCount: 0, totalCount: 0, contentComplete: true });
     expect(() => validateEng4Output('resume', bundle)).not.toThrow();
   });
 
@@ -154,6 +169,79 @@ describe('resume capsule — resultVersion=2 (injected directory)', () => {
     expect(validBundle({ ...v1, schemaVersion: 2 })).toBe(false); // v2 without capsule
     expect(validBundle({ ...v2, schemaVersion: 1 })).toBe(false); // v1 with capsule
     expect(() => validateEng4Output('resume', { ...v1, schemaVersion: 2 })).toThrow(Eng4OutputValidationError);
+  });
+});
+
+describe('resume capsule — budget, cursor and section accounting (review b2641137 blocker 1)', () => {
+  const big = (id: string, recordedAt: string): CapsuleObservation => ({ ...cap(id, recordedAt), contents: ['x'.repeat(20_000)] });
+
+  it('REPRO: a 20,000-char capsule under budget=256 is OMITTED with closed coverage — current null, complete false, cursor present, bundle within budget', () => {
+    const db = freshDb();
+    const directory = makeDirectory([big('huge', '2026-09-03T02:00:00Z')]);
+    seed(db, directory);
+    const bundle = resume(db, directory, { resultVersion: 2, budget: 256 });
+    expect(bundle.capsule.current).toBeNull();
+    expect(bundle.capsule.conflicts).toEqual([]);
+    expect(bundle.capsule.complete).toBe(false);
+    expect(bundle.coverage.capsule).toMatchObject({ includedCount: 0, totalCount: 1, contentComplete: false, omittedReason: 'budget' });
+    expect(bundle.coverage.capsule.nextCursor).toEqual(expect.any(String));
+    expect(bundle.coverage.totalTokenEstimate).toBeLessThanOrEqual(256);
+    expect(JSON.stringify(bundle).length).toBeLessThan(5_000);
+    expect(() => validateEng4Output('resume', bundle)).not.toThrow();
+  });
+
+  it('with a sufficient budget the same capsule is delivered complete', () => {
+    const db = freshDb();
+    const directory = makeDirectory([big('huge', '2026-09-03T02:00:00Z')]);
+    seed(db, directory);
+    const bundle = resume(db, directory, { resultVersion: 2, budget: 20_000 });
+    expect(bundle.capsule.current.observationId).toBe('huge');
+    expect(bundle.capsule.complete).toBe(true);
+    expect(bundle.coverage.capsule.contentComplete).toBe(true);
+    expect(bundle.coverage.totalTokenEstimate).toBeLessThanOrEqual(20_000);
+  });
+
+  it('budget cut inside the capsule section: current delivered, conflict deferred to the cursor page (never silently dropped)', () => {
+    const db = freshDb();
+    const directory = makeDirectory([cap('current', '2026-09-03T02:00:00Z'), big('fork', '2026-09-03T01:00:00Z')]);
+    seed(db, directory);
+    const first = resume(db, directory, { resultVersion: 2, budget: 400 });
+    expect(first.capsule.current.observationId).toBe('current');
+    expect(first.capsule.conflicts).toEqual([]);
+    expect(first.capsule.complete).toBe(false);
+    expect(first.coverage.capsule).toMatchObject({ includedCount: 1, totalCount: 2, contentComplete: false, omittedReason: 'budget' });
+    const cursor = first.coverage.capsule.nextCursor;
+    expect(cursor).toEqual(expect.any(String));
+    const second = resume(db, directory, { resultVersion: 2, budget: 20_000, cursor });
+    expect(second.capsule.current).toBeNull(); // delivered on the earlier page — accounted, not repeated
+    expect(second.capsule.conflicts.map((c: any) => c.observationId)).toEqual(['fork']);
+    expect(second.capsule.complete).toBe(false);
+    expect(second.coverage.capsule).toMatchObject({ includedCount: 1, totalCount: 2 });
+    expect(second.coverage.working.omittedReason).toBe('cursor');
+  });
+
+  it('sections filter: resultVersion=2 with sections:["capsule"] delivers only the capsule; the rest are accounted as not-requested', () => {
+    const db = freshDb();
+    const directory = makeDirectory([cap('c1', '2026-09-03T02:00:00Z')]);
+    seed(db, directory);
+    const bundle = resume(db, directory, { resultVersion: 2, sections: ['capsule'] });
+    expect(bundle.capsule.current.observationId).toBe('c1');
+    expect(bundle.working).toBeNull();
+    expect(bundle.coverage.working.omittedReason).toBe('not-requested');
+    expect(bundle.coverage.capsule.contentComplete).toBe(true);
+    expect(() => validateEng4Output('resume', bundle)).not.toThrow();
+  });
+
+  it('v1 ignores the capsule section entirely: no capsule coverage, and a v2 capsule cursor is rejected as malformed under v1', () => {
+    const db = freshDb();
+    const directory = makeDirectory([cap('c1', '2026-09-03T02:00:00Z')]);
+    seed(db, directory);
+    const v1 = resume(db, directory, { sections: ['working', 'capsule'] });
+    expect(v1.schemaVersion).toBe(1);
+    expect('capsule' in v1.coverage).toBe(false);
+    const cursorIntoCapsule = Buffer.from(JSON.stringify({ s: 'capsule', o: 0 }), 'utf8').toString('base64url');
+    expect(() => resume(db, directory, { cursor: cursorIntoCapsule })).toThrow(/malformed resume cursor/);
+    expect(() => resume(db, directory, { resultVersion: 2, cursor: cursorIntoCapsule })).not.toThrow();
   });
 });
 
@@ -239,6 +327,25 @@ describe('resume capsule — REAL store selection by kind (the audit repro)', ()
     const sel = manager.getCapsuleObservations(ENTITY_ID, 'default');
     expect(sel.capsules.map((c: any) => c.observationId)).toEqual(['obs-B']);
     expect(sel.candidatesConsidered).toBe(5);
+  });
+
+  it('REPRO (review b2641137 blocker 2): a still-current capsule behind 600 newer unrelated findings is STILL selected (full paged scan)', () => {
+    const insertMany = manager.getDb().transaction(() => {
+      for (let i = 0; i < 600; i++) {
+        insertObs(`obs-noise-${String(i).padStart(3, '0')}`, `2026-09-06T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`, 'finding');
+      }
+    });
+    insertMany();
+    manager.rebuildGraphLookupIndex();
+    const sel = manager.getCapsuleObservations(ENTITY_ID, 'default');
+    expect(sel.capsules.map((c: any) => c.observationId)).toEqual(['obs-B']);
+    expect(sel.candidatesConsidered).toBe(605);
+    const bundle = performResume(manager.getDb(), manager, 'default', {
+      agentId: 'claude-hythe', scope: { project: 'capsule-proj' }, budget: 4000, resultVersion: 2,
+    } as any) as any;
+    expect(bundle.capsule.current.observationId).toBe('obs-B');
+    expect(bundle.capsule.complete).toBe(true);
+    expect(bundle.capsule.candidatesConsidered).toBe(605);
   });
 
   it('unknown entity id → empty selection, zero candidates', () => {

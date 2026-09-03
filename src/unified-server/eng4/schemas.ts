@@ -157,7 +157,7 @@ export const RESUME_INPUT_SCHEMA = {
     resultVersion: { type: 'integer', enum: [1, 2], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts.' },
     sections: {
       type: 'array',
-      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers'] },
+      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule'], description: 'Section filter. `capsule` is meaningful only with resultVersion=2.' },
     },
     cursor: { type: 'string' },
   },
@@ -392,12 +392,19 @@ export const RESUME_OUTPUT_SCHEMA_V2 = {
     capsule: {
       type: 'object',
       additionalProperties: false,
-      required: ['current', 'conflicts', 'candidatesConsidered'],
+      required: ['current', 'conflicts', 'candidatesConsidered', 'complete'],
       properties: {
         current: { anyOf: [CAPSULE_OBSERVATION, { type: 'null' }] },
         conflicts: { type: 'array', items: CAPSULE_OBSERVATION },
         candidatesConsidered: { type: 'integer', minimum: 0 },
+        complete: { type: 'boolean' },
       },
+    },
+    // The capsule is a BUDGETED section: its coverage is closed like the seven.
+    coverage: {
+      ...RESUME_OUTPUT_SCHEMA_V1.properties.coverage,
+      required: [...RESUME_OUTPUT_SCHEMA_V1.properties.coverage.required, 'capsule'],
+      properties: { ...RESUME_OUTPUT_SCHEMA_V1.properties.coverage.properties, capsule: SECTION_COVERAGE },
     },
   },
 } as const;
