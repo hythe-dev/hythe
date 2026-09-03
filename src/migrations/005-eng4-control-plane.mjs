@@ -260,6 +260,145 @@ export const DDL = [
      FOREIGN KEY (tenant_id, scope_key, state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
    )`,
 
+  // 9. ENG-4 H2 — version foundation (design §6.2, merged 3429000).
+  //
+  // 9a. Same-scope parent targets: a fact/loop belongs to exactly one scope,
+  // so a version in scope P can never reference a fact owned by scope Q.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_eng4_facts_scope_id
+     ON eng4_facts (tenant_id, scope_key, fact_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_eng4_loops_scope_id
+     ON eng4_open_loops (tenant_id, scope_key, loop_id)`,
+  // 9b. Append-only fact/loop versions keyed by the writing snapshot AND the
+  // change ordinal (= eng4_snapshot_changes (state_id, kind, ordinal)). The
+  // in-place tables stay the frozen v1/v2 last-writer-wins view; versions are
+  // the v3 view (H4 reads them; H2 only writes and verifies them).
+  `CREATE TABLE IF NOT EXISTS eng4_fact_versions (
+     tenant_id    TEXT NOT NULL,
+     scope_key    TEXT NOT NULL,
+     fact_id      TEXT NOT NULL,
+     state_id     TEXT NOT NULL,
+     ordinal      INTEGER NOT NULL CHECK (ordinal >= 0),
+     subject      TEXT NOT NULL,
+     predicate    TEXT NOT NULL,
+     object       TEXT NOT NULL,
+     status       TEXT NOT NULL CHECK (status IN ('asserted','verified','disputed','superseded')),
+     effective_at TEXT,
+     refs_json    TEXT NOT NULL,
+     author       TEXT NOT NULL,
+     recorded_at  TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, fact_id, state_id, ordinal),
+     FOREIGN KEY (tenant_id, scope_key, fact_id)  REFERENCES eng4_facts(tenant_id, scope_key, fact_id),
+     FOREIGN KEY (tenant_id, scope_key, state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_fact_versions_immutable
+     BEFORE UPDATE ON eng4_fact_versions
+     BEGIN SELECT RAISE(ABORT, 'eng4: fact versions are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_fact_versions_no_delete
+     BEFORE DELETE ON eng4_fact_versions
+     BEGIN SELECT RAISE(ABORT, 'eng4: fact versions are append-only'); END`,
+  `CREATE TABLE IF NOT EXISTS eng4_loop_versions (
+     tenant_id    TEXT NOT NULL,
+     scope_key    TEXT NOT NULL,
+     loop_id      TEXT NOT NULL,
+     state_id     TEXT NOT NULL,
+     ordinal      INTEGER NOT NULL CHECK (ordinal >= 0),
+     owner        TEXT NOT NULL,
+     status       TEXT NOT NULL CHECK (status IN ('open','blocked','closed')),
+     next_action  TEXT NOT NULL,
+     due_at       TEXT,
+     blocked_on   TEXT,
+     close_json   TEXT,
+     author       TEXT NOT NULL,
+     recorded_at  TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, loop_id, state_id, ordinal),
+     FOREIGN KEY (tenant_id, scope_key, loop_id)  REFERENCES eng4_open_loops(tenant_id, scope_key, loop_id),
+     FOREIGN KEY (tenant_id, scope_key, state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_loop_versions_immutable
+     BEFORE UPDATE ON eng4_loop_versions
+     BEGIN SELECT RAISE(ABORT, 'eng4: loop versions are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_loop_versions_no_delete
+     BEFORE DELETE ON eng4_loop_versions
+     BEGIN SELECT RAISE(ABORT, 'eng4: loop versions are append-only'); END`,
+  // 9c. Coverage manifest: exactly one explicit disposition per digest-bound
+  // ledger tuple, so an intentionally unversioned historical change is
+  // distinguishable from a deleted or missing version row. `source` records
+  // whether the row was emitted by the writer that KNEW the materialized
+  // result ('write') or reconstructed by the H2 backfill ('backfill'); only a
+  // backfill may declare a tuple unversioned, and only for the one reason the
+  // design names (a historical loop update that omitted `owner` whose exact
+  // inherited value cannot be proven from immutable data).
+  `CREATE TABLE IF NOT EXISTS eng4_version_coverage (
+     tenant_id   TEXT NOT NULL,
+     scope_key   TEXT NOT NULL,
+     state_id    TEXT NOT NULL,
+     kind        TEXT NOT NULL CHECK (kind IN ('fact','loop')),
+     ordinal     INTEGER NOT NULL CHECK (ordinal >= 0),
+     change_id   TEXT NOT NULL,
+     disposition TEXT NOT NULL CHECK (disposition IN ('materialized','unversioned')),
+     reason      TEXT CHECK (reason IS NULL OR reason IN ('pre-h2-inherited-owner')),
+     source      TEXT NOT NULL CHECK (source IN ('write','backfill')),
+     CHECK ((disposition = 'materialized' AND reason IS NULL) OR
+            (disposition = 'unversioned' AND reason IS NOT NULL AND source = 'backfill')),
+     PRIMARY KEY (tenant_id, state_id, kind, ordinal),
+     FOREIGN KEY (tenant_id, state_id, kind, ordinal)
+       REFERENCES eng4_snapshot_changes(tenant_id, state_id, kind, ordinal),
+     FOREIGN KEY (tenant_id, scope_key, state_id)
+       REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_coverage_immutable
+     BEFORE UPDATE ON eng4_version_coverage
+     BEGIN SELECT RAISE(ABORT, 'eng4: version coverage is append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_coverage_no_delete
+     BEFORE DELETE ON eng4_version_coverage
+     BEGIN SELECT RAISE(ABORT, 'eng4: version coverage is append-only'); END`,
+  // 9d. Immutable H2 cutover evidence (independent review of PR #12,
+  // findings 2 and 3). The backfill runs at every schema apply, so it needs
+  // to know, from rows it cannot infer from mutable state, (a) which
+  // snapshots' coverage came from a backfill and (b) up to which revision a
+  // scope is already covered.
+  //  - eng4_version_backfills: one append-only row per BACKFILLED snapshot.
+  //    The verifier derives the expected coverage `source` from it (row
+  //    present → 'backfill', absent → 'write'), so relabelling a backfilled
+  //    unversioned tuple as a writer's materialized value is detected.
+  //  - eng4_version_cutover: append-only per-scope "covered through this
+  //    revision" marks (effective = MAX). An uncovered ledger-bound snapshot
+  //    at or below the mark is erased coverage → the apply refuses; only
+  //    snapshots above it (written by a pre-H2 binary after a rollback) are
+  //    legitimately backfilled.
+  `CREATE TABLE IF NOT EXISTS eng4_version_backfills (
+     tenant_id  TEXT NOT NULL,
+     scope_key  TEXT NOT NULL,
+     state_id   TEXT NOT NULL,
+     applied_at TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, scope_key, state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_backfills_immutable
+     BEFORE UPDATE ON eng4_version_backfills
+     BEGIN SELECT RAISE(ABORT, 'eng4: backfill marks are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_backfills_no_delete
+     BEFORE DELETE ON eng4_version_backfills
+     BEGIN SELECT RAISE(ABORT, 'eng4: backfill marks are append-only'); END`,
+  `CREATE TABLE IF NOT EXISTS eng4_version_cutover (
+     tenant_id        TEXT NOT NULL,
+     scope_key        TEXT NOT NULL,
+     through_revision INTEGER NOT NULL CHECK (through_revision >= 1),
+     applied_at       TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, through_revision),
+     FOREIGN KEY (tenant_id, scope_key) REFERENCES eng4_scopes(tenant_id, scope_key)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_cutover_immutable
+     BEFORE UPDATE ON eng4_version_cutover
+     BEGIN SELECT RAISE(ABORT, 'eng4: cutover marks are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_version_cutover_no_delete
+     BEFORE DELETE ON eng4_version_cutover
+     BEGIN SELECT RAISE(ABORT, 'eng4: cutover marks are append-only'); END`,
+  // 9e. Predecessor lookups (inherited-owner provenance) scan the ledger by
+  // change id.
+  `CREATE INDEX IF NOT EXISTS idx_eng4_changes_by_id
+     ON eng4_snapshot_changes (tenant_id, kind, change_id)`,
+
   // 7. ai_messages scoping — additive columns + index (A6). SQLite ALTER ADD
   // COLUMN is cheap and non-rewriting; existing rows get NULLs (= unscoped).
   `ALTER TABLE ai_messages ADD COLUMN project_id TEXT`,
