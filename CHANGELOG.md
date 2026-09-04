@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- ENG-4 H5 (design §5, final internal increment of `resultVersion: 3`): checkpoint
+  gains `operation: 'record'` (fact/loop changes without resending state) and
+  `operation: 'patch'` (an RFC 7396 merge patch on the working state; arrays
+  replace wholesale; the result must be a complete valid state or the call fails
+  closed). Both forbid `state` in the request, admit ONLY the pointed head as
+  parent (`conflict` carrying heads and pointer otherwise — never a branch),
+  take the parent state from its hash-verified payload, and advance the pointer.
+  Fingerprints bind the operation, the resolved parent and (for patch) the raw
+  patch. `resume`/`checkpoint` now share a per-call verification memo so each
+  payload is hashed and parsed once per call (nothing cached across calls). The
+  exact v3 request/result/bundle schema is now final; publishing/deploying v3
+  remains a separate owner decision.
 - ENG-4 H4 (design §6.3–§6.5, internal increment of `resultVersion: 3`): the v3
   read model. `resume` `resultVersion: 3` now selects `currentFacts`/`openLoops`
   ONLY from verified materialized versions on the accepted lineage (newest per

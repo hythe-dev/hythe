@@ -55,6 +55,7 @@ import type {
 import { effectiveCurrentHead, liveHeadDetails, retiredHeadCount } from './heads.js';
 import { verifyReconcileRowsScopeWide, verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
 import { selectV3Values, type V3Selection } from './selection.js';
+import { runWithEnvelopeMemo } from './memo.js';
 import { verifyVersionParity } from './versions.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
@@ -130,6 +131,17 @@ function emptyCoverage(omittedReason: SectionCoverage['omittedReason'], totalCou
 }
 
 export function performResume(
+  db: DatabaseType.Database,
+  directory: ResumeDirectory,
+  tenantId: string,
+  params: ResumeParams
+): ResumeBundle {
+  // One verification memo per call (H5): every payload is hashed and parsed
+  // once per resume; nothing is cached across calls.
+  return runWithEnvelopeMemo(() => performResumeInner(db, directory, tenantId, params));
+}
+
+function performResumeInner(
   db: DatabaseType.Database,
   directory: ResumeDirectory,
   tenantId: string,

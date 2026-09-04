@@ -45,6 +45,7 @@ import type {
 import { canonicalize } from './canonical.js';
 import { CheckpointIntegrityError, readSnapshotChanges, verifyPayloadIntegrity } from './checkpoint.js';
 import { factVersionValue, verifyVersionParity, type LoopVersionValue } from './versions.js';
+import { memoGet, memoSet } from './memo.js';
 
 /** A malformed or inadmissible reconcile request — typed, nothing written. */
 export class CheckpointReconcileError extends Error {
@@ -180,11 +181,14 @@ function retiredHeads(db: DatabaseType.Database, tenantId: string, scopeKey: str
 
 export function readReconciliation(db: DatabaseType.Database, tenantId: string, contentHash: string): ReconciliationRecord | null {
   verifyPayloadIntegrity(db, tenantId, contentHash);
+  const memoKey = `reconciliation|${tenantId}|${contentHash}`;
+  const cached = memoGet<{ rec: ReconciliationRecord | null }>(memoKey);
+  if (cached) return cached.rec;
   const payload = db.prepare(`SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`).get(tenantId, contentHash) as { body: Buffer };
   let env: any;
   try { env = JSON.parse(payload.body.toString('utf-8')); } catch { throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not parseable`); }
   const rec = env.reconciliation;
-  if (rec === undefined || rec === null) return null;
+  if (rec === undefined || rec === null) { memoSet(memoKey, { rec: null }); return null; }
   // Shape check — a malformed record is corruption, not a TypeError later.
   const ok = typeof rec === 'object' && !Array.isArray(rec)
     && Array.isArray(rec.expectedHeads) && typeof rec.survivor === 'string' && Array.isArray(rec.retired)
@@ -195,6 +199,7 @@ export function readReconciliation(db: DatabaseType.Database, tenantId: string, 
       && typeof r.divergentStateId === 'string' && (r.decision === 'accept' || r.decision === 'reject')
       && (r.acceptedOrdinal === null || Number.isInteger(r.acceptedOrdinal)));
   if (!ok) throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} carries a malformed reconciliation record`);
+  memoSet(memoKey, { rec });
   return rec as ReconciliationRecord;
 }
 

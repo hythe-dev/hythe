@@ -56,11 +56,14 @@
  * reads to define "current" instead of max revision.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import Ajv from 'ajv';
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, CheckpointOperation, CheckpointParams, CheckpointResult, FactChange, LoopChange, ReconciledBlock, ReconciliationRecord } from './contracts.js';
-import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint } from './canonical.js';
+import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint, type CheckpointContentEnvelope } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
-import { advancePointerAfterInsert, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
+import { advancePointerAfterInsert, effectiveCurrentHead, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
+import { memoGet, memoSet, runWithEnvelopeMemo } from './memo.js';
+import { WORKING_STATE } from './schemas.js';
 import { writeVersionRows } from './versions.js';
 import {
   CheckpointReconcileError,
@@ -85,6 +88,32 @@ export class CheckpointScopeError extends Error {
     this.ambiguousCandidates = ambiguousCandidates;
   }
 }
+
+/**
+ * H5 §5.4: a `patch` whose merge-patched state is not a complete, valid
+ * working state fails CLOSED — nothing written.
+ */
+export class CheckpointPatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckpointPatchError';
+  }
+}
+
+/** RFC 7396 JSON Merge Patch. Arrays and scalars replace wholesale; null deletes. */
+export function applyMergePatch(target: unknown, patch: unknown): unknown {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return patch;
+  const out: Record<string, unknown> = (target !== null && typeof target === 'object' && !Array.isArray(target))
+    ? { ...(target as Record<string, unknown>) }
+    : {};
+  for (const [k, v] of Object.entries(patch as Record<string, unknown>)) {
+    if (v === null) delete out[k];
+    else out[k] = applyMergePatch(out[k], v);
+  }
+  return out;
+}
+
+const validWorkingState = new Ajv({ allErrors: true }).compile(WORKING_STATE as any);
 
 /** Persisted payload bytes that no longer match their hash fail CLOSED. */
 export class CheckpointIntegrityError extends Error {
@@ -348,6 +377,10 @@ export function verifyPayloadIntegrity(
   tenantId: string,
   contentHash: string
 ): void {
+  // Per-call memo (H5): within one resume/checkpoint the same payload is
+  // verified once; the first read of every call still hashes the bytes.
+  const memoKey = `verified|${tenantId}|${contentHash}`;
+  if (memoGet<boolean>(memoKey)) return;
   const row = db.prepare(
     `SELECT body, byte_length FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
   ).get(tenantId, contentHash) as { body: Buffer; byte_length: number } | undefined;
@@ -360,6 +393,7 @@ export function verifyPayloadIntegrity(
       `eng4: persisted payload failed hash/size verification for ${contentHash}`
     );
   }
+  memoSet(memoKey, true);
 }
 
 /**
@@ -386,22 +420,32 @@ export function performCheckpoint(
   const canonicalAgentId = directory.resolveCanonicalAgent(params.agentId, tenantId).canonical;
   if (!canonicalAgentId) throw new Error('Invalid agent identity');
 
-  const baseEnvelope = {
+  const baseEnvelope: CheckpointContentEnvelope = {
     scopeKey,
-    state: params.state,
+    state: params.state ?? null,
     events: params.events ?? [],
     factChanges: params.factChanges ?? [],
     loopChanges: params.loopChanges ?? [],
     evidenceRefs: params.evidenceRefs ?? [],
   };
   const resultVersion: 1 | 2 | 3 = params.resultVersion === 3 ? 3 : params.resultVersion === 2 ? 2 : 1;
-  const operation: CheckpointOperation = resultVersion === 3 && params.operation === 'reconcile' ? 'reconcile' : 'write';
+  const operation: CheckpointOperation =
+    resultVersion === 3 && (params.operation === 'reconcile' || params.operation === 'record' || params.operation === 'patch')
+      ? params.operation
+      : 'write';
+  // record/patch (H5 §5) carry no state: it is derived from the verified
+  // parent payload inside the transaction. Their fingerprint content binds
+  // state: null (plus the raw patch for `patch`); contentHash binds the
+  // materialized envelope.
+  const derivesState = operation === 'record' || operation === 'patch';
+  if (derivesState) baseEnvelope.state = null;
   // Canonicalization (RFC 8785, fail-closed on malformed input) happens
   // before the transaction opens — a rejected envelope writes nothing. A
   // reconcile's envelope additionally carries the reconciliation record,
   // which is derived INSIDE the transaction (§4.2 step 4), so its final bytes
   // and contentHash are computed there; the base envelope is validated here.
   canonicalEnvelopeBytes(baseEnvelope);
+  if (operation === 'patch') canonicalize(params.statePatch ?? null);
   const normalized = operation === 'reconcile' ? normalizeReconcileRequest(params) : undefined;
 
   const run = db.transaction((): CheckpointResult => {
@@ -424,6 +468,7 @@ export function performCheckpoint(
       resultVersion,
       operation,
       reconcile: normalized,
+      patch: operation === 'patch' ? params.statePatch : undefined,
     });
     const pointerNow = (): string | null => readScopePointer(db, tenantId, scopeKey)?.stateId ?? null;
     // v3 conflicts also carry the pointer, so a reconcile caller can restate
@@ -507,10 +552,34 @@ export function performCheckpoint(
       return conflict(heads);
     }
 
-    // H3: reconcile CAS + causal divergence evaluation (§4.2 steps 2, 3, 6),
-    // or the v3 resurrection acknowledgement for a plain write (§4.5).
+    // H3: reconcile CAS + causal divergence evaluation (§4.2 steps 2, 3, 6);
+    // H5: record/patch admit only the POINTED head as parent and derive the
+    // state from its verified payload (§5.1–§5.4); or the v3 resurrection
+    // acknowledgement for a plain write (§4.5).
     let reconciliation: ReconciliationRecord | undefined;
-    if (operation === 'reconcile' && normalized) {
+    let derivedState: unknown;
+    if (derivesState) {
+      const eff = effectiveCurrentHead(db, tenantId, scopeKey);
+      if (eff.selection !== 'pointer' || !eff.head || resolvedParentStateId !== eff.head.stateId) {
+        // Not the pointed head (stale parent, legacy scope, invalid designation): conflict, never a branch (§5.1).
+        const live = liveHeads(db, tenantId, scopeKey);
+        if (live.length === 0) throw new CheckpointEmptyScopeError(`eng4: ${operation} on a scope with no history`);
+        return conflict(live);
+      }
+      // §5.2: the parent state comes from the hash/size-verified canonical payload, never from state_json.
+      const parentRow = db.prepare(`SELECT content_hash FROM eng4_state_snapshots WHERE tenant_id = ? AND state_id = ?`)
+        .get(tenantId, resolvedParentStateId) as { content_hash: string };
+      verifyPayloadIntegrity(db, tenantId, String(parentRow.content_hash));
+      const body = db.prepare(`SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`).get(tenantId, parentRow.content_hash) as { body: Buffer };
+      let parentState: unknown;
+      try { parentState = (JSON.parse(body.body.toString('utf-8')) as { state: unknown }).state; }
+      catch { throw new CheckpointIntegrityError(`eng4: parent payload ${parentRow.content_hash} is not parseable`); }
+      if (!validWorkingState(parentState)) throw new CheckpointIntegrityError(`eng4: parent payload ${parentRow.content_hash} does not carry a valid working state`);
+      derivedState = operation === 'record' ? parentState : applyMergePatch(parentState, params.statePatch ?? {});
+      if (!validWorkingState(derivedState)) {
+        throw new CheckpointPatchError(`eng4: statePatch does not yield a complete valid working state — ${new Ajv().errorsText(validWorkingState.errors)}`);
+      }
+    } else if (operation === 'reconcile' && normalized) {
       const live = liveHeads(db, tenantId, scopeKey);
       if (live.length === 0) {
         throw new CheckpointEmptyScopeError('eng4: reconcile on a scope with no history');
@@ -547,8 +616,10 @@ export function performCheckpoint(
     }
 
     // The hashed envelope: base for a write; base + reconciliation record for
-    // a reconcile (bound by contentHash; the resource is self-contained).
-    const envelope = reconciliation ? { ...baseEnvelope, reconciliation } : baseEnvelope;
+    // a reconcile; base with the DERIVED state for record/patch (all bound by
+    // contentHash; the resource is self-contained).
+    const stateForSnapshot = derivesState ? derivedState : params.state;
+    const envelope = { ...baseEnvelope, state: stateForSnapshot, ...(reconciliation ? { reconciliation } : {}) };
     const payloadBytes = canonicalEnvelopeBytes(envelope);
     const contentHash = envelopeContentHash(envelope);
 
@@ -586,7 +657,7 @@ export function performCheckpoint(
     ).run(
       tenantId, stateId, scopeKey, revision, resolvedParentStateId, contentHash,
       fingerprint, params.idempotencyKey, canonicalAgentId, params.agentId,
-      recordedAt, JSON.stringify(params.state)
+      recordedAt, JSON.stringify(stateForSnapshot)
     );
 
     if (reconciliation) {
@@ -644,5 +715,7 @@ export function performCheckpoint(
     };
   });
 
-  return run();
+  // The whole call shares one verification memo (H5): payloads are hashed and
+  // parsed once per checkpoint, never cached across calls.
+  return runWithEnvelopeMemo(run);
 }

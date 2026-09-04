@@ -542,14 +542,22 @@ export interface CheckpointParams {
    * and legacy fingerprints are unchanged.
    */
   resultVersion?: 1 | 2 | 3;
-  state: WorkingState;
+  /** Required for write/reconcile; FORBIDDEN for record/patch (H5 §5.1), whose state comes from the verified parent payload. */
+  state?: WorkingState;
+  /** patch only (H5 §5.4): RFC 7396 merge patch applied to the verified parent state; arrays replace wholesale. */
+  statePatch?: Record<string, unknown>;
   events?: Array<{ kind: string; summary: string; at?: string }>;
   factChanges?: FactChange[];
   loopChanges?: LoopChange[];
   evidenceRefs?: string[];
   // --- ENG-4 H3, resultVersion 3 ONLY (design §4, §4.5, §5.1). A v1/v2
   // request carrying any of these fails input validation.
-  /** Absent → legacy `write`. `record`/`patch` arrive with H5. */
+  /**
+   * Absent → legacy `write`. `reconcile` (H3), `record`/`patch` (H5 §5):
+   * record/patch require the POINTED head as parent (conflict otherwise),
+   * materialize the parent's state from its hash-verified payload, and
+   * advance the pointer like any write on the pointed head.
+   */
   operation?: CheckpointOperation;
   /** v3 `write` extending a RETIRED parent must say so (§4.5); never moves the pointer. */
   acknowledgeRetired?: boolean;
@@ -569,7 +577,7 @@ export interface CheckpointParams {
   rejectLineages?: string[];
 }
 
-export type CheckpointOperation = 'write' | 'reconcile';
+export type CheckpointOperation = 'write' | 'reconcile' | 'record' | 'patch';
 
 /** One requested resolution of a divergent terminal change (§6.3). */
 export interface DivergenceResolutionRequest {

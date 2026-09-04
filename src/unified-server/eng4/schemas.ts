@@ -118,7 +118,7 @@ const STATE_HEAD = {
   },
 } as const;
 
-const WORKING_STATE = {
+export const WORKING_STATE = {
   type: 'object',
   additionalProperties: false,
   required: ['objective', 'status', 'owner', 'nextActions', 'blockers', 'guardrails'],
@@ -626,14 +626,17 @@ export const RESUME_OUTPUT_SCHEMA = {
 export const CHECKPOINT_INPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['agentId', 'scope', 'expectedRevision', 'idempotencyKey', 'state'],
+  // `state` is required for write/reconcile and FORBIDDEN for record/patch —
+  // enforced by the allOf rules below (v1/v2 requests always require it).
+  required: ['agentId', 'scope', 'expectedRevision', 'idempotencyKey'],
   properties: {
     agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'ASSERTED exact opaque caller identity (platform max 100); case and transport-looking suffixes are identity-significant, and the raw asserted id is preserved in audit metadata.' },
     scope: SCOPE_SCHEMA,
     expectedRevision: { type: ['integer', 'null'], description: 'CAS guard; null asserts first write in scope.' },
     idempotencyKey: { type: 'string', minLength: 8 },
     resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (INTERNAL, not final until the ENG-4 H-series completes): v2 plus the `operation` discriminant (`reconcile` since H3) and its fields; required for any of them.' },
-    operation: { enum: ['write', 'reconcile'], description: 'resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally.' },
+    operation: { enum: ['write', 'reconcile', 'record', 'patch'], description: 'resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally. `record` logs fact/loop changes without resending state and `patch` applies an RFC 7396 merge patch to the state; both require expectedRevision to be the POINTED head (conflict otherwise, carrying heads and pointer), take the parent state from its hash-verified payload, and advance the pointer.' },
+    statePatch: { type: 'object', description: 'patch only: RFC 7396 merge patch against the verified parent state (null deletes a key; arrays replace wholesale). The result must be a complete valid working state or the call fails closed.' },
     acknowledgeRetired: { type: 'boolean', description: 'resultVersion 3 only: a write extending a RETIRED parent must set true (it never moves the pointer); a reconcile whose survivor descends from retired snapshots must set true (the re-adopted snapshots are recorded as adoptedRetired).' },
     expectedHeads: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'reconcile: the exact set of live head stateIds (order irrelevant).' },
     expectedPointer: { type: ['string', 'null'], description: 'reconcile: the current pointer stateId, or null for a scope without one.' },
@@ -714,10 +717,24 @@ export const CHECKPOINT_INPUT_SCHEMA = {
       if: { not: { required: ['resultVersion'], properties: { resultVersion: { const: 3 } } } },
       then: {
         not: {
-          anyOf: ['operation', 'acknowledgeRetired', 'expectedHeads', 'expectedPointer', 'survivor', 'reason', 'strict', 'resolutions', 'rejectLineages']
+          anyOf: ['operation', 'acknowledgeRetired', 'expectedHeads', 'expectedPointer', 'survivor', 'reason', 'strict', 'resolutions', 'rejectLineages', 'statePatch']
             .map((f) => ({ required: [f] })),
         },
       },
+    },
+    // H5 §5.1: state is required unless the operation derives it (record/patch);
+    // record forbids both state and statePatch; patch requires statePatch and forbids state.
+    {
+      if: { not: { required: ['operation'], properties: { operation: { enum: ['record', 'patch'] } } } },
+      then: { required: ['state'], not: { required: ['statePatch'] } },
+    },
+    {
+      if: { required: ['operation'], properties: { operation: { const: 'record' } } },
+      then: { not: { anyOf: [{ required: ['state'] }, { required: ['statePatch'] }] } },
+    },
+    {
+      if: { required: ['operation'], properties: { operation: { const: 'patch' } } },
+      then: { required: ['statePatch'], not: { required: ['state'] } },
     },
     {
       if: { required: ['operation'], properties: { operation: { const: 'reconcile' } } },

@@ -1065,8 +1065,7 @@ Parameters
     "agentId",
     "scope",
     "expectedRevision",
-    "idempotencyKey",
-    "state"
+    "idempotencyKey"
   ],
   "properties": {
     "agentId": {
@@ -1125,9 +1124,15 @@ Parameters
     "operation": {
       "enum": [
         "write",
-        "reconcile"
+        "reconcile",
+        "record",
+        "patch"
       ],
-      "description": "resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally."
+      "description": "resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally. `record` logs fact/loop changes without resending state and `patch` applies an RFC 7396 merge patch to the state; both require expectedRevision to be the POINTED head (conflict otherwise, carrying heads and pointer), take the parent state from its hash-verified payload, and advance the pointer."
+    },
+    "statePatch": {
+      "type": "object",
+      "description": "patch only: RFC 7396 merge patch against the verified parent state (null deletes a key; arrays replace wholesale). The result must be a complete valid working state or the call fails closed."
     },
     "acknowledgeRetired": {
       "type": "boolean",
@@ -1483,7 +1488,89 @@ Parameters
               "required": [
                 "rejectLineages"
               ]
+            },
+            {
+              "required": [
+                "statePatch"
+              ]
             }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "operation"
+          ],
+          "properties": {
+            "operation": {
+              "enum": [
+                "record",
+                "patch"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "state"
+        ],
+        "not": {
+          "required": [
+            "statePatch"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "record"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "required": [
+                "statePatch"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "patch"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "statePatch"
+        ],
+        "not": {
+          "required": [
+            "state"
           ]
         }
       }

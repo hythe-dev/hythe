@@ -158,7 +158,15 @@ export function requestFingerprint(input: {
    * discriminant is bound ONLY when present and ≠ 'write' — legacy bytes
    * unchanged.
    */
-  operation?: 'write' | 'reconcile';
+  operation?: 'write' | 'reconcile' | 'record' | 'patch';
+  /**
+   * ENG-4 H5 (§5.4): the RAW RFC 7396 merge patch of a `patch` request,
+   * bound as sent (canonicalized) — the materialized state is derived inside
+   * the transaction and bound by contentHash, not by the fingerprint. For
+   * record/patch the fingerprint's content carries `state: null` (the request
+   * has no state); the resolved parent binds what the state is derived from.
+   */
+  patch?: unknown;
   /**
    * ENG-4 H3 (§4.1, §6.3 Q4): the NORMALIZED reconcile request — sorted
    * expectedHeads, expectedPointer, survivor, reason, strict, explicit
@@ -177,6 +185,7 @@ export function requestFingerprint(input: {
     ...(input.resultVersion === 3 ? { resultVersion: 3 } : {}),
     ...(input.operation !== undefined && input.operation !== 'write' ? { operation: input.operation } : {}),
     ...(input.reconcile !== undefined ? { reconcile: input.reconcile } : {}),
+    ...(input.patch !== undefined ? { patch: input.patch } : {}),
     // Content is the BASE envelope — the reconciliation record is derived
     // inside the transaction and bound by contentHash, not by the fingerprint.
     content: canonicalize({
