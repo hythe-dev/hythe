@@ -13,6 +13,13 @@ import { metrics } from '../observability/index.js';
 
 const router = Router();
 
+/**
+ * Express 5 types a route parameter as `string | string[]` (a repeated or
+ * wildcard segment); every route here declares a single `:id` / `:keyId`
+ * segment, so the value is a string at runtime. Take the first segment.
+ */
+const param = (value: string | string[]): string => (Array.isArray(value) ? value[0] : value);
+
 // ============================================================================
 // MIDDLEWARE: Admin Authorization
 // ============================================================================
@@ -111,7 +118,7 @@ router.post('/tenants', adminAuthMiddleware, (req: Request, res: Response) => {
 router.get('/tenants/:id', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const tenant = tenantManager.getTenant(req.params.id);
+    const tenant = tenantManager.getTenant(param(req.params.id));
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -137,7 +144,7 @@ router.patch('/tenants/:id', adminAuthMiddleware, (req: Request, res: Response) 
     const { name, tier, metadata } = req.body;
     const tenantManager = getTenantManager();
 
-    const tenant = tenantManager.updateTenant(req.params.id, { name, tier, metadata });
+    const tenant = tenantManager.updateTenant(param(req.params.id), { name, tier, metadata });
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -159,14 +166,14 @@ router.patch('/tenants/:id', adminAuthMiddleware, (req: Request, res: Response) 
 router.delete('/tenants/:id', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const deleted = tenantManager.deleteTenant(req.params.id);
+    const deleted = tenantManager.deleteTenant(param(req.params.id));
 
     if (!deleted) {
       res.status(404).json({ error: 'Tenant not found' });
       return;
     }
 
-    metrics.logEvent('info', 'admin', `Deleted tenant via API: ${req.params.id}`);
+    metrics.logEvent('info', 'admin', `Deleted tenant via API: ${param(req.params.id)}`);
 
     res.json({ success: true, message: 'Tenant deleted' });
   } catch (error: any) {
@@ -189,7 +196,7 @@ router.delete('/tenants/:id', adminAuthMiddleware, (req: Request, res: Response)
 router.get('/tenants/:id/quotas', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const tenant = tenantManager.getTenant(req.params.id);
+    const tenant = tenantManager.getTenant(param(req.params.id));
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -210,7 +217,7 @@ router.get('/tenants/:id/quotas', adminAuthMiddleware, (req: Request, res: Respo
 router.put('/tenants/:id/quotas', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const tenant = tenantManager.getTenant(req.params.id);
+    const tenant = tenantManager.getTenant(param(req.params.id));
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -261,7 +268,7 @@ router.put('/tenants/:id/quotas', adminAuthMiddleware, (req: Request, res: Respo
 router.get('/tenants/:id/usage', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const tenant = tenantManager.getTenant(req.params.id);
+    const tenant = tenantManager.getTenant(param(req.params.id));
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -298,7 +305,7 @@ router.get('/tenants/:id/usage', adminAuthMiddleware, (req: Request, res: Respon
 router.get('/tenants/:id/keys', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const tenant = tenantManager.getTenant(req.params.id);
+    const tenant = tenantManager.getTenant(param(req.params.id));
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -320,7 +327,7 @@ router.post('/tenants/:id/keys', adminAuthMiddleware, (req: Request, res: Respon
   try {
     const { name, permissions, isAdmin, expiresInDays } = req.body;
     const tenantManager = getTenantManager();
-    const tenant = tenantManager.getTenant(req.params.id);
+    const tenant = tenantManager.getTenant(param(req.params.id));
 
     if (!tenant) {
       res.status(404).json({ error: 'Tenant not found' });
@@ -363,14 +370,14 @@ router.post('/tenants/:id/keys', adminAuthMiddleware, (req: Request, res: Respon
 router.delete('/keys/:keyId', adminAuthMiddleware, (req: Request, res: Response) => {
   try {
     const tenantManager = getTenantManager();
-    const deleted = tenantManager.revokeApiKey(req.params.keyId);
+    const deleted = tenantManager.revokeApiKey(param(req.params.keyId));
 
     if (!deleted) {
       res.status(404).json({ error: 'API key not found' });
       return;
     }
 
-    metrics.logEvent('info', 'admin', `Revoked API key: ${req.params.keyId}`);
+    metrics.logEvent('info', 'admin', `Revoked API key: ${param(req.params.keyId)}`);
 
     res.json({ success: true, message: 'API key revoked' });
   } catch (error) {
