@@ -31,9 +31,10 @@
  *   currently shows exactly this value (isV1CurrentValue), and whether a
  *   reconcile ON the accepted lineage has resolved it. Interior versions are
  *   history. Opaque (unversioned) terminals have no truthful value to show:
- *   they are not listed but are COUNTED (asOf.opaqueDivergentCount) so the
- *   operator knows a reconcile will have to reject them; the in-place row,
- *   if any, is in legacyValues.
+ *   they are listed with value null and opaque:true (identity and provenance
+ *   are proven) and counted on asOf.opaqueDivergentCount, so a reconcile's
+ *   mandatory rejection is visible even when the same id has an accepted
+ *   value; the in-place row, if any, is in legacyValues.
  * - Loops follow the same rule (§6.3): a close written off the lineage
  *   leaves the loop OPEN in v3 and lists the close as a divergent value.
  * - Revision numbers never decide anything across lineages.
@@ -83,9 +84,12 @@ export interface DivergentValue {
   stateId: string;
   revision: number;
   ordinal: number;
-  value: FactValueView | LoopValueView;
+  /** null iff opaque: the terminal exists (id and provenance proven) but its value is unversioned. */
+  value: FactValueView | LoopValueView | null;
   isV1CurrentValue: boolean;
   resolved: boolean;
+  /** true for an unversioned terminal — listed so the operator knows a reconcile must REJECT it (codex-hythe review of PR #14, finding 1). */
+  opaque: boolean;
 }
 
 export interface LegacyValue {
@@ -301,7 +305,14 @@ export function selectV3Values(
   const normRefs = (evidenceRefs: string[], sourceRefs: string[], contradicts: string[]) =>
     canonicalize({ evidenceRefs: [...new Set(evidenceRefs)].sort(), sourceRefs: [...new Set(sourceRefs)].sort(), contradicts: [...new Set(contradicts)].sort() });
   for (const t of terminals.values()) {
-    if (t.comparable === null) { opaqueDivergentCount++; continue; }
+    if (t.comparable === null) {
+      // Opaque terminal: identity and provenance are proven, the value is not.
+      // Listed with value null so it can never hide behind an accepted value
+      // for the same id; also counted on asOf.
+      opaqueDivergentCount++;
+      divergentValues.push({ kind: t.kind, id: t.id, lineageHead: [...t.heads].sort()[0], stateId: t.stateId, revision: t.revision, ordinal: t.ordinal, value: null, isV1CurrentValue: false, resolved: resolvedKeys.has(terminalKey(t)), opaque: true });
+      continue;
+    }
     const lineageHead = [...t.heads].sort()[0];
     let value: FactValueView | LoopValueView;
     let isV1CurrentValue = false;
@@ -328,7 +339,7 @@ export function selectV3Values(
           closeJson: ip.closeEvent ? JSON.stringify(ip.closeEvent) : null }) === t.comparable;
       }
     }
-    divergentValues.push({ kind: t.kind, id: t.id, lineageHead, stateId: t.stateId, revision: t.revision, ordinal: t.ordinal, value, isV1CurrentValue, resolved: resolvedKeys.has(terminalKey(t)) });
+    divergentValues.push({ kind: t.kind, id: t.id, lineageHead, stateId: t.stateId, revision: t.revision, ordinal: t.ordinal, value, isV1CurrentValue, resolved: resolvedKeys.has(terminalKey(t)), opaque: false });
   }
   divergentValues.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : a.stateId < b.stateId ? -1 : 1));
 

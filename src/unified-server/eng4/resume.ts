@@ -319,14 +319,18 @@ export function performResume(
   // currentFacts = non-superseded facts; refs join in; effectiveAt only
   // when recorded — never invented. Dangling contradicts refs surface
   // verbatim as unresolved contradictions (deferred-resolution rule).
-  const factRows = db.prepare(
-    `SELECT * FROM eng4_facts WHERE tenant_id = ? AND scope_key = ? AND status != 'superseded'
+  // All in-place fact rows, superseded included: v1/v2 currentFacts filter
+  // superseded out (frozen rule); the v3 legacy view must be able to expose
+  // EVERY persisted in-place row (codex-hythe review of PR #14, finding 3).
+  const allFactRows = db.prepare(
+    `SELECT * FROM eng4_facts WHERE tenant_id = ? AND scope_key = ?
       ORDER BY recorded_at DESC, fact_id ASC`
   ).all(tenantId, scopeKey) as any[];
+  const factRows = allFactRows.filter((r) => r.status !== 'superseded');
   const refStmt = db.prepare(
     `SELECT ref_kind, ref FROM eng4_fact_refs WHERE tenant_id = ? AND fact_id = ? ORDER BY ref ASC`
   );
-  const currentFacts: CurrentFact[] = factRows.map((r) => {
+  const toCurrentFact = (r: any): CurrentFact => {
     const refs = refStmt.all(tenantId, r.fact_id) as Array<{ ref_kind: string; ref: string }>;
     const pick = (kind: string) => refs.filter((x) => x.ref_kind === kind).map((x) => x.ref);
     const fact: CurrentFact = {
@@ -341,7 +345,9 @@ export function performResume(
     };
     if (r.effective_at) fact.effectiveAt = r.effective_at;
     return fact;
-  });
+  };
+  const currentFacts: CurrentFact[] = factRows.map(toCurrentFact);
+  const allInPlaceFacts: CurrentFact[] = resultVersion === 3 ? allFactRows.map(toCurrentFact) : currentFacts;
 
   // decisions = 'decision' events from the CURRENT head's persisted envelope.
   const decisions: ResumeBundle['decisions'] = [];
@@ -375,7 +381,7 @@ export function performResume(
   // --- H4 v3 read model: accepted-lineage selection from verified versions.
   // The in-place lists above stay the frozen v1/v2 view and feed legacyValues.
   const selection: V3Selection | null = resultVersion === 3
-    ? selectV3Values(db, tenantId, scopeKey, effective.selection === 'pointer' && current ? current.stateId : null, currentFacts, openLoops)
+    ? selectV3Values(db, tenantId, scopeKey, effective.selection === 'pointer' && current ? current.stateId : null, allInPlaceFacts, openLoops)
     : null;
 
   const pointers: ResumeBundle['pointers'] = [];

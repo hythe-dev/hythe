@@ -503,7 +503,7 @@ const OPEN_LOOP_V3 = {
 const DIVERGENT_VALUE = {
   type: 'object',
   additionalProperties: false,
-  required: ['kind', 'id', 'lineageHead', 'stateId', 'revision', 'ordinal', 'value', 'isV1CurrentValue', 'resolved'],
+  required: ['kind', 'id', 'lineageHead', 'stateId', 'revision', 'ordinal', 'value', 'isV1CurrentValue', 'resolved', 'opaque'],
   properties: {
     kind: { enum: ['fact', 'loop'] },
     id: { type: 'string', minLength: 1 },
@@ -511,8 +511,10 @@ const DIVERGENT_VALUE = {
     stateId: { type: 'string', minLength: 1 },
     revision: { type: 'integer', minimum: 0 },
     ordinal: { type: 'integer', minimum: 0 },
+    opaque: { type: 'boolean' },
     value: {
       oneOf: [
+        { type: 'null' },
         {
           type: 'object',
           additionalProperties: false,
@@ -539,6 +541,12 @@ const DIVERGENT_VALUE = {
     isV1CurrentValue: { type: 'boolean' },
     resolved: { type: 'boolean' },
   },
+  // Exact objects: an opaque terminal has value null (and can never be the v1
+  // value); a materialized one has a value object.
+  allOf: [
+    { if: { properties: { opaque: { const: true } } }, then: { properties: { value: { type: 'null' }, isV1CurrentValue: { const: false } } } },
+    { if: { properties: { opaque: { const: false } } }, then: { properties: { value: { type: 'object' } } } },
+  ],
 } as const;
 
 /** A non-authoritative in-place row (H4 §6.4/§6.5): provenance null, accepted false, always. */

@@ -141,7 +141,7 @@ describe('H4 accepted-lineage selection (§6.3)', () => {
     expect(b.divergentValues).toEqual([{
       kind: 'fact', id: F, lineageHead: c.stateId, stateId: c.stateId, revision: c.revision, ordinal: 0,
       value: expect.objectContaining({ assertion: { subject: 'bad', predicate: 'p', object: 'o' }, author: 'claude-hythe' }),
-      isV1CurrentValue: true, resolved: false,
+      isV1CurrentValue: true, resolved: false, opaque: false,
     }]);
     expect(b.legacyValues).toEqual([]);
     expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
@@ -532,10 +532,12 @@ describe('H4 independent review round 1 — coverage key parity, paged suppressi
     makePreLedger(db, root.stateId); // C's tuple becomes unversioned (opaque)
     const b = v3(db);
     expect(b.asOf.opaqueDivergentCount).toBe(1);
-    expect(b.divergentValues).toEqual([]);
+    // Listed with value null and opaque:true (codex-hythe finding 1): never hidden behind an accepted value for the same id.
+    expect(b.divergentValues).toEqual([{ kind: 'loop', id: L, lineageHead: c.stateId, stateId: c.stateId, revision: c.revision, ordinal: 0, value: null, isV1CurrentValue: false, resolved: false, opaque: true }]);
     expect(b.legacyValues).toEqual([expect.objectContaining({ kind: 'loop', id: L })]); // in-place row shows C's write
     expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
-    void c;
+    expect(validV3({ ...b, divergentValues: [{ ...b.divergentValues[0], opaque: false }] })).toBe(false); // opaque:false needs a value object
+    expect(validV3({ ...b, divergentValues: [{ ...b.divergentValues[0], isV1CurrentValue: true }] })).toBe(false);
   });
 
   it('more cases: suppressed id with divergent versions; divergent value equal to the accepted one; superseded on a divergent branch; closed loop in legacyValues; empty scope', () => {
@@ -581,5 +583,49 @@ describe('H4 independent review round 1 — coverage key parity, paged suppressi
     expect(empty.asOf).toMatchObject({ selection: 'empty-scope', opaqueDivergentCount: 0 });
     expect(empty.coverage.currentFacts).toMatchObject({ totalCount: 0, suppressedCount: 0, contentComplete: true });
     expect(validV3(empty), ajv.errorsText(validV3.errors)).toBe(true);
+  });
+});
+
+describe('H4 codex-hythe review d3333310 — opaque terminal beside an accepted value; superseded rows in legacyValues', () => {
+  it('FINDING 1: an opaque off-lineage terminal whose id ALSO has an accepted materialized value is still listed (value null, opaque true) and counted', () => {
+    const db = freshDb();
+    const root = write(db, { loopChanges: [{ status: 'open', nextAction: 'n', owner: 'orig' }] });
+    const L = root.changes.loops[0].loopId;
+    // C first (owner omitted; its only predecessor will be the unknowable creation → opaque), then A on the other branch with an explicit owner (materialized).
+    const c = write(db, { expectedRevision: 1, state: state('c'), loopChanges: [{ loopId: L, status: 'blocked', nextAction: 'x' }] });
+    const a = write(db, { expectedRevision: 1, state: state('a'), loopChanges: [{ loopId: L, status: 'open', nextAction: 'accepted-update', owner: 'orig' }] });
+    db.prepare(`UPDATE eng4_scope_current SET state_id=? WHERE tenant_id=? AND scope_key=?`).run(a.stateId, TENANT, SCOPE); // make A the accepted head (a live head → valid designation)
+    makePreLedger(db, root.stateId);
+    const b = v3(db);
+    expect(b.asOf.selection).toBe('pointer');
+    expect(b.openLoops).toEqual([expect.objectContaining({ loopId: L, nextAction: 'accepted-update', provenance: expect.objectContaining({ stateId: a.stateId }) })]);
+    expect(b.divergentValues).toEqual([expect.objectContaining({ kind: 'loop', id: L, stateId: c.stateId, value: null, opaque: true, resolved: false })]);
+    expect(b.asOf.opaqueDivergentCount).toBe(1);
+    expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
+    // And a strict reconcile indeed demands its rejection.
+    expect(() => reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId })).toThrow(/opaque terminal/);
+  });
+
+  it('FINDING 3: a persisted superseded in-place fact reaches legacyValues under an undesignated scope and is counted; v1/v2 still filter it', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('live'), fact('old')] });
+    const [F, G] = root.changes.facts.map((f: any) => f.factId);
+    write(db, { expectedRevision: 1, factChanges: [fact('old', { factId: G, status: 'superseded' })] });
+    dropPointer(db);
+    const b = v3(db);
+    expect(b.currentFacts).toEqual([]);
+    expect(b.coverage.currentFacts).toMatchObject({ totalCount: 2, suppressedCount: 2, omittedReason: 'undesignated' });
+    expect(b.legacyValues.map((l: any) => [l.id, l.value.status]).sort()).toEqual([[F, 'asserted'], [G, 'superseded']].sort());
+    expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
+    expect(resume(db).currentFacts.map((f: any) => f.factId)).toEqual([F]);
+    expect(resume(db, { resultVersion: 2 }).currentFacts.map((f: any) => f.factId)).toEqual([F]);
+    // Under a pointer, an accepted superseded fact is excluded by rule, not suppressed, and not legacy.
+    const db2 = freshDb();
+    const r2 = write(db2, { factChanges: [fact('x')] });
+    write(db2, { expectedRevision: 1, factChanges: [fact('x', { factId: r2.changes.facts[0].factId, status: 'superseded' })] });
+    const b2 = v3(db2);
+    expect(b2.currentFacts).toEqual([]);
+    expect(b2.coverage.currentFacts).toMatchObject({ totalCount: 0, suppressedCount: 0, contentComplete: true });
+    expect(b2.legacyValues).toEqual([]);
   });
 });
