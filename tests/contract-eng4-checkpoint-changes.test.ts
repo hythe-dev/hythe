@@ -147,12 +147,13 @@ describe('ENG-4 PR A — frozen v1 default', () => {
     expect(res.outcome).toBe('idempotency-mismatch');
   });
 
-  it('input schema: resultVersion accepts only 1 or 2 and is optional', () => {
+  it('input schema: resultVersion accepts 1, 2 or 3 (3 = ENG-4 H-series, internal) and is optional', () => {
     const base = cp();
     expect(validCheckpointInput(base)).toBe(true);
     expect(validCheckpointInput({ ...base, resultVersion: 2 })).toBe(true);
     expect(validCheckpointInput({ ...base, resultVersion: 1 })).toBe(true);
-    expect(validCheckpointInput({ ...base, resultVersion: 3 })).toBe(false);
+    expect(validCheckpointInput({ ...base, resultVersion: 3 })).toBe(true);
+    expect(validCheckpointInput({ ...base, resultVersion: 4 })).toBe(false);
     expect(validCheckpointInput({ ...base, resultVersion: '2' })).toBe(false);
   });
 });

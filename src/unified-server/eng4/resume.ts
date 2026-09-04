@@ -52,7 +52,8 @@ import type {
   SectionCoverage,
   WorkingState,
 } from './contracts.js';
-import { effectiveCurrentHead } from './heads.js';
+import { effectiveCurrentHead, liveHeadDetails, retiredHeadCount } from './heads.js';
+import { verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 
@@ -171,9 +172,21 @@ export function performResume(
   // --- Current state: the ONE resolver (H1 §3.3). Pointer when designated;
   // max-revision only for legacy undesignated scopes; null (fail closed) on
   // an invalid designation. Forks surface as conflicts / the heads section.
+  // H3: under v3, retirement rows are trusted only when the reconcile they
+  // are attributed to records them in its hash-verified payload — otherwise
+  // one out-of-band row could hide a live head. Scope-wide, before any head
+  // computation.
+  if (resultVersion === 3) verifyRetirementAttribution(db, tenantId, scopeKey);
   const effective = effectiveCurrentHead(db, tenantId, scopeKey);
-  const heads = effective.live; // revision-ASC
+  const heads = effective.live; // revision-ASC, retired heads excluded (H3 §4.4)
   const current = effective.head;
+  // H3 §4.3: under v3, every reconcile snapshot on the accepted lineage must
+  // have merge-input/retirement/resolution rows that exactly match its
+  // hash-verified payload record; any difference fails the whole resume.
+  // Rows attributed to snapshots off the lineage do not count.
+  if (resultVersion === 3 && effective.selection === 'pointer' && current) {
+    verifyResolutionRowsOnLineage(db, tenantId, scopeKey, current.stateId);
+  }
   const currentRow = current
     ? db.prepare(
         `SELECT state_id, revision, recorded_at, state_json, content_hash
@@ -197,9 +210,13 @@ export function performResume(
     : { capsules: [] as CapsuleObservation[], candidatesConsidered: 0 };
 
   // --- heads (v3 only): every live head, revision ASC; exactly the effective
-  // current head is flagged. parentRetired is constantly false until H3.
+  // current head is flagged; parentRetired marks a resurrection (§4.5).
   const headItems: HeadItem[] = resultVersion === 3
-    ? heads.map((h) => ({ ...h, isCurrent: current !== null && h.stateId === current.stateId, parentRetired: false }))
+    ? liveHeadDetails(db, tenantId, scopeKey).map((h) => ({
+        stateId: h.stateId, revision: h.revision, author: h.author, recordedAt: h.recordedAt,
+        isCurrent: current !== null && h.stateId === current.stateId,
+        parentRetired: h.parentRetired,
+      }))
     : [];
 
   // --- Section item sources (all SELECT-only).
@@ -439,7 +456,7 @@ export function performResume(
         pointer: effective.pointer,
         liveHeadCount: heads.length,
         divergentHeadCount: heads.length - (current ? 1 : 0),
-        retiredHeadCount: 0,
+        retiredHeadCount: retiredHeadCount(db, tenantId, scopeKey),
       }
     : {};
 

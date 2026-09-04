@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- ENG-4 H3 (design §4, §6.3, internal increment of `resultVersion: 3`): checkpoint
+  gains `operation: 'reconcile'` — names the exact live-head set and the pointer
+  (both compare-and-set; a mismatch is `conflict` carrying heads and pointer),
+  chooses a survivor as parent, retires every other head (recorded in
+  `eng4_head_retirements` and `eng4_snapshot_merge_inputs`, never deleted), sets
+  the pointer to itself, and resolves every divergent fact/loop terminal value
+  causally: strict by default (unresolved materialized terminals refuse the
+  call), `accept` bound to a same-request change with an equal value, `reject`
+  or `rejectLineages` otherwise; opaque (unversioned) terminals can only be
+  rejected. The normalized reconciliation record is bound into the snapshot's
+  payload; idempotent replay and `resume` `resultVersion: 3` verify the
+  merge-input/retirement/resolution rows against it and fail closed on any
+  difference. Live heads exclude retired snapshots; a write extending a retired
+  head is live but never current (`heads[].parentRetired: true`) and under v3
+  requires `acknowledgeRetired: true`. v1/v2 request and result shapes are
+  unchanged; H-series fields fail validation there.
 - ENG-4 H2 (design §6.2, internal increment, data-only): append-only
   `eng4_fact_versions` / `eng4_loop_versions` keyed by (writing snapshot, change
   ordinal) with same-scope composite FKs, plus the `eng4_version_coverage`

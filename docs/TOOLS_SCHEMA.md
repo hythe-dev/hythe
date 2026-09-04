@@ -1117,9 +1117,132 @@ Parameters
       "type": "integer",
       "enum": [
         1,
-        2
+        2,
+        3
       ],
-      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2."
+      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (INTERNAL, not final until the ENG-4 H-series completes): v2 plus the `operation` discriminant (`reconcile` since H3) and its fields; required for any of them."
+    },
+    "operation": {
+      "enum": [
+        "write",
+        "reconcile"
+      ],
+      "description": "resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally."
+    },
+    "acknowledgeRetired": {
+      "type": "boolean",
+      "description": "resultVersion 3 only: a write extending a RETIRED parent must set true (it never moves the pointer); a reconcile whose survivor descends from retired snapshots must set true (the re-adopted snapshots are recorded as adoptedRetired)."
+    },
+    "expectedHeads": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "reconcile: the exact set of live head stateIds (order irrelevant)."
+    },
+    "expectedPointer": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "reconcile: the current pointer stateId, or null for a scope without one."
+    },
+    "survivor": {
+      "type": "string",
+      "minLength": 1,
+      "description": "reconcile: the head that becomes the parent; must be in expectedHeads and match expectedRevision."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "reconcile: required free text."
+    },
+    "strict": {
+      "type": "boolean",
+      "description": "reconcile: default true — any unresolved materialized divergent terminal refuses the call. Opaque (unversioned) terminals must be rejected regardless."
+    },
+    "resolutions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "id",
+          "divergentStateId",
+          "decision"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "fact",
+              "loop"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "divergentStateId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "decision": {
+            "enum": [
+              "accept",
+              "reject"
+            ]
+          },
+          "acceptedOrdinal": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "const": "accept"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "acceptedOrdinal"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "const": "reject"
+                }
+              }
+            },
+            "then": {
+              "not": {
+                "required": [
+                  "acceptedOrdinal"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "rejectLineages": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "reconcile: divergent head ids whose every unresolved terminal is rejected (expanded server-side to per-value rejects)."
     },
     "state": {
       "type": "object",
@@ -1298,7 +1421,149 @@ Parameters
         "type": "string"
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "not": {
+          "required": [
+            "resultVersion"
+          ],
+          "properties": {
+            "resultVersion": {
+              "const": 3
+            }
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "operation"
+              ]
+            },
+            {
+              "required": [
+                "acknowledgeRetired"
+              ]
+            },
+            {
+              "required": [
+                "expectedHeads"
+              ]
+            },
+            {
+              "required": [
+                "expectedPointer"
+              ]
+            },
+            {
+              "required": [
+                "survivor"
+              ]
+            },
+            {
+              "required": [
+                "reason"
+              ]
+            },
+            {
+              "required": [
+                "strict"
+              ]
+            },
+            {
+              "required": [
+                "resolutions"
+              ]
+            },
+            {
+              "required": [
+                "rejectLineages"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "reconcile"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "expectedHeads",
+          "expectedPointer",
+          "survivor",
+          "reason"
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "operation"
+          ],
+          "properties": {
+            "operation": {
+              "const": "reconcile"
+            }
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "expectedHeads"
+              ]
+            },
+            {
+              "required": [
+                "expectedPointer"
+              ]
+            },
+            {
+              "required": [
+                "survivor"
+              ]
+            },
+            {
+              "required": [
+                "reason"
+              ]
+            },
+            {
+              "required": [
+                "strict"
+              ]
+            },
+            {
+              "required": [
+                "resolutions"
+              ]
+            },
+            {
+              "required": [
+                "rejectLineages"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
 }
 ```
 

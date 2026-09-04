@@ -57,11 +57,20 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import type DatabaseType from 'better-sqlite3';
-import type { CheckpointChanges, CheckpointParams, CheckpointResult, FactChange, LoopChange } from './contracts.js';
+import type { CheckpointChanges, CheckpointOperation, CheckpointParams, CheckpointResult, FactChange, LoopChange, ReconciledBlock, ReconciliationRecord } from './contracts.js';
 import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
-import { advancePointerAfterInsert, liveHeads } from './heads.js';
+import { advancePointerAfterInsert, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
 import { writeVersionRows } from './versions.js';
+import {
+  CheckpointReconcileError,
+  CheckpointRetiredParentError,
+  evaluateDivergence,
+  normalizeReconcileRequest,
+  readReconciliation,
+  verifyReconcileParity,
+  writeReconcileRows,
+} from './reconcile.js';
 
 /** Re-exported for existing importers; the definition lives in heads.ts (H1). */
 export { liveHeads } from './heads.js';
@@ -377,7 +386,7 @@ export function performCheckpoint(
   const canonicalAgentId = directory.resolveCanonicalAgent(params.agentId, tenantId).canonical;
   if (!canonicalAgentId) throw new Error('Invalid agent identity');
 
-  const envelope = {
+  const baseEnvelope = {
     scopeKey,
     state: params.state,
     events: params.events ?? [],
@@ -385,10 +394,15 @@ export function performCheckpoint(
     loopChanges: params.loopChanges ?? [],
     evidenceRefs: params.evidenceRefs ?? [],
   };
+  const resultVersion: 1 | 2 | 3 = params.resultVersion === 3 ? 3 : params.resultVersion === 2 ? 2 : 1;
+  const operation: CheckpointOperation = resultVersion === 3 && params.operation === 'reconcile' ? 'reconcile' : 'write';
   // Canonicalization (RFC 8785, fail-closed on malformed input) happens
-  // before the transaction opens — a rejected envelope writes nothing.
-  const payloadBytes = canonicalEnvelopeBytes(envelope);
-  const contentHash = envelopeContentHash(envelope);
+  // before the transaction opens — a rejected envelope writes nothing. A
+  // reconcile's envelope additionally carries the reconciliation record,
+  // which is derived INSIDE the transaction (§4.2 step 4), so its final bytes
+  // and contentHash are computed there; the base envelope is validated here.
+  canonicalEnvelopeBytes(baseEnvelope);
+  const normalized = operation === 'reconcile' ? normalizeReconcileRequest(params) : undefined;
 
   const run = db.transaction((): CheckpointResult => {
     // Parent resolution is a same-scope revision lookup; a revision from
@@ -401,18 +415,29 @@ export function performCheckpoint(
         ).get(tenantId, scopeKey, params.expectedRevision) as { state_id: string } | undefined;
     const resolvedParentStateId = parentRow ? String(parentRow.state_id) : null;
 
-    const resultVersion: 1 | 2 = params.resultVersion === 2 ? 2 : 1;
     const fingerprint = requestFingerprint({
       canonicalAgentId,
       scopeKey,
       expectedRevision: params.expectedRevision,
       resolvedParentStateId,
-      envelope,
+      envelope: baseEnvelope,
       resultVersion,
+      operation,
+      reconcile: normalized,
+    });
+    const pointerNow = (): string | null => readScopePointer(db, tenantId, scopeKey)?.stateId ?? null;
+    // v3 conflicts also carry the pointer, so a reconcile caller can restate
+    // both CAS values; v1/v2 conflict shapes are frozen.
+    const conflict = (heads: ReturnType<typeof liveHeads>): CheckpointResult => ({
+      outcome: 'conflict',
+      heads,
+      ...(resultVersion === 3 ? { pointer: pointerNow() } : {}),
     });
 
     // Idempotency FIRST (before CAS validation): a retry of the initial
-    // write must replay even though the scope now has snapshots.
+    // write must replay even though the scope now has snapshots — and a
+    // retry of a successful reconcile must replay even though it changed the
+    // live-head set (§4.2 step 1).
     const existing = db.prepare(
       `SELECT state_id, scope_key, revision, parent_state_id, content_hash,
               request_fingerprint, author, recorded_at, changes_hash
@@ -435,27 +460,40 @@ export function performCheckpoint(
       const replayChanges = readSnapshotChanges(
         db, tenantId, String(existing.state_id), String(existing.content_hash),
         existing.changes_hash === null || existing.changes_hash === undefined ? null : String(existing.changes_hash),
-        resultVersion === 2
+        resultVersion >= 2
       );
+      let reconciled: ReconciledBlock | undefined;
+      if (operation === 'reconcile') {
+        // §4.3 replay integrity: the payload record is the authority; the
+        // merge-input / retirement / resolution rows must match it exactly.
+        const record = readReconciliation(db, tenantId, String(existing.content_hash));
+        if (!record) throw new CheckpointIntegrityError(`eng4: matched reconcile replay for ${existing.state_id} but its payload carries no reconciliation record`);
+        verifyReconcileParity(db, tenantId, scopeKey, String(existing.state_id), record);
+        reconciled = {
+          survivor: record.survivor, retired: record.retired, pointer: String(existing.state_id),
+          resolutions: record.resolutions, adoptedRetired: record.adoptedRetired, unresolvedDivergent: record.unresolvedDivergent,
+        };
+      }
       return {
         outcome: 'idempotent-replay',
         stateId: String(existing.state_id),
         scopeKey: String(existing.scope_key),
         revision: Number(existing.revision),
         contentHash: String(existing.content_hash),
-        // A matched v2 replay can never be pre-ledger (fingerprint-bound), so
-        // replayChanges is non-null here; the throw above guarantees it.
-        ...(resultVersion === 2 ? { changes: replayChanges as CheckpointChanges } : {}),
+        // A matched v2/v3 replay can never be pre-ledger (fingerprint-bound),
+        // so replayChanges is non-null here; the throw above guarantees it.
+        ...(resultVersion >= 2 ? { changes: replayChanges as CheckpointChanges } : {}),
+        ...(reconciled ? { reconciled } : {}),
       };
     }
 
-    // Branch-preserving CAS validation (frozen semantics).
+    // Branch-preserving CAS validation (frozen semantics for `write`).
     if (params.expectedRevision === null) {
       const count = db.prepare(
         `SELECT COUNT(*) AS n FROM eng4_state_snapshots WHERE tenant_id = ? AND scope_key = ?`
       ).get(tenantId, scopeKey) as { n: number };
       if (count.n > 0) {
-        return { outcome: 'conflict', heads: liveHeads(db, tenantId, scopeKey) };
+        return conflict(liveHeads(db, tenantId, scopeKey));
       }
     } else if (!parentRow) {
       const heads = liveHeads(db, tenantId, scopeKey);
@@ -466,8 +504,53 @@ export function performCheckpoint(
           `eng4: expectedRevision ${params.expectedRevision} references a scope with no history — use expectedRevision=null for the first write in a scope`
         );
       }
-      return { outcome: 'conflict', heads };
+      return conflict(heads);
     }
+
+    // H3: reconcile CAS + causal divergence evaluation (§4.2 steps 2, 3, 6),
+    // or the v3 resurrection acknowledgement for a plain write (§4.5).
+    let reconciliation: ReconciliationRecord | undefined;
+    if (operation === 'reconcile' && normalized) {
+      const live = liveHeads(db, tenantId, scopeKey);
+      if (live.length === 0) {
+        throw new CheckpointEmptyScopeError('eng4: reconcile on a scope with no history');
+      }
+      const liveIds = live.map((h) => h.stateId).sort();
+      if (canonicalize(liveIds) !== canonicalize(normalized.expectedHeads)) return conflict(live);
+      if (pointerNow() !== normalized.expectedPointer) return conflict(live);
+      if (resolvedParentStateId !== normalized.survivor) {
+        throw new CheckpointReconcileError('eng4: expectedRevision must be the survivor\'s revision');
+      }
+      const outcome = evaluateDivergence(
+        db, tenantId, scopeKey, normalized,
+        { factChanges: params.factChanges ?? [], loopChanges: params.loopChanges ?? [] },
+        canonicalAgentId
+      );
+      reconciliation = {
+        expectedHeads: normalized.expectedHeads,
+        survivor: normalized.survivor,
+        retired: outcome.retired,
+        expectedPointer: normalized.expectedPointer,
+        reason: normalized.reason,
+        strict: normalized.strict,
+        resolutions: outcome.resolutions,
+        adoptedRetired: outcome.adoptedRetired,
+        unresolvedDivergent: outcome.unresolvedDivergent,
+      };
+    } else if (
+      resultVersion === 3 && resolvedParentStateId !== null &&
+      isRetired(db, tenantId, scopeKey, resolvedParentStateId) && params.acknowledgeRetired !== true
+    ) {
+      throw new CheckpointRetiredParentError(
+        `eng4: parent ${resolvedParentStateId} is a retired head — a resultVersion 3 write must set acknowledgeRetired: true to extend it (the pointer will not move)`
+      );
+    }
+
+    // The hashed envelope: base for a write; base + reconciliation record for
+    // a reconcile (bound by contentHash; the resource is self-contained).
+    const envelope = reconciliation ? { ...baseEnvelope, reconciliation } : baseEnvelope;
+    const payloadBytes = canonicalEnvelopeBytes(envelope);
+    const contentHash = envelopeContentHash(envelope);
 
     // Scope row, payload, revision allocation, snapshot — all in THIS
     // transaction; any failure below rolls all of it back.
@@ -506,15 +589,20 @@ export function performCheckpoint(
       recordedAt, JSON.stringify(params.state)
     );
 
-    // H1 advance rule (§3.2a/§3.4) — same transaction, right after the
-    // insert: first write sets the pointer; parent == pointer advances it;
-    // anything else is a branch and leaves it alone. Result shapes unchanged.
-    advancePointerAfterInsert(db, tenantId, scopeKey, {
-      stateId,
-      parentStateId: resolvedParentStateId,
-      advancedBy: canonicalAgentId,
-      advancedAt: recordedAt,
-    });
+    if (reconciliation) {
+      // §4.2 step 7: a reconcile sets the pointer to itself, explicitly.
+      setPointerOnReconcile(db, tenantId, scopeKey, stateId, canonicalAgentId, recordedAt);
+    } else {
+      // H1 advance rule (§3.2a/§3.4) — same transaction, right after the
+      // insert: first write sets the pointer; parent == live pointer advances
+      // it; anything else is a branch and leaves it alone.
+      advancePointerAfterInsert(db, tenantId, scopeKey, {
+        stateId,
+        parentStateId: resolvedParentStateId,
+        advancedBy: canonicalAgentId,
+        advancedAt: recordedAt,
+      });
+    }
 
     // 2(c) materialization — same transaction, after the snapshot; a bad
     // change throws and rolls back the ENTIRE checkpoint.
@@ -528,6 +616,22 @@ export function performCheckpoint(
     writeVersionRows(db, tenantId, scopeKey, stateId, canonicalAgentId, recordedAt,
       { factChanges: params.factChanges ?? [], loopChanges: params.loopChanges ?? [] }, changes, appliedLoops.owners);
 
+    let reconciled: ReconciledBlock | undefined;
+    if (reconciliation) {
+      // §4.2 steps 5–6 rows, after the ledger (accepts FK their own ledger row).
+      writeReconcileRows(db, tenantId, scopeKey, stateId, reconciliation, canonicalAgentId, recordedAt);
+      // A reconcile must pass its OWN replay parity before it commits: if the
+      // rows just written could not be verified against the record just
+      // hashed, throwing here rolls everything back instead of leaving a
+      // snapshot that poisons every later replay and v3 resume.
+      verifyReconcileParity(db, tenantId, scopeKey, stateId, reconciliation);
+      reconciled = {
+        survivor: reconciliation.survivor, retired: reconciliation.retired, pointer: stateId,
+        resolutions: reconciliation.resolutions, adoptedRetired: reconciliation.adoptedRetired,
+        unresolvedDivergent: reconciliation.unresolvedDivergent,
+      };
+    }
+
     return {
       outcome: 'written',
       stateId,
@@ -535,7 +639,8 @@ export function performCheckpoint(
       revision,
       parentStateId: resolvedParentStateId,
       contentHash,
-      ...(resultVersion === 2 ? { changes } : {}),
+      ...(resultVersion >= 2 ? { changes } : {}),
+      ...(reconciled ? { reconciled } : {}),
     };
   });
 

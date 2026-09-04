@@ -399,6 +399,84 @@ export const DDL = [
   `CREATE INDEX IF NOT EXISTS idx_eng4_changes_by_id
      ON eng4_snapshot_changes (tenant_id, kind, change_id)`,
 
+  // 10. ENG-4 H3 — atomic, integrity-bound reconciliation (design §4, §6.3).
+  // A reconcile snapshot names the exact live-head set and the pointer (both
+  // CAS), chooses one survivor (its parent), RETIRES the other heads and
+  // records them as merge inputs, and resolves every divergent terminal
+  // value causally. Snapshots are never deleted: retirement is a recorded
+  // act. All three tables are same-scope by composite FK and append-only by
+  // trigger; the envelope of the reconcile snapshot carries the normalized
+  // reconciliation record, so the hash-verified payload — not these rows —
+  // is the authority and replay/resume verify exact parity against it.
+  `CREATE TABLE IF NOT EXISTS eng4_snapshot_merge_inputs (
+     tenant_id      TEXT NOT NULL,
+     scope_key      TEXT NOT NULL,
+     state_id       TEXT NOT NULL,
+     input_state_id TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, state_id, input_state_id),
+     FOREIGN KEY (tenant_id, scope_key, state_id)       REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, scope_key, input_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_merge_inputs_immutable
+     BEFORE UPDATE ON eng4_snapshot_merge_inputs
+     BEGIN SELECT RAISE(ABORT, 'eng4: merge inputs are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_merge_inputs_no_delete
+     BEFORE DELETE ON eng4_snapshot_merge_inputs
+     BEGIN SELECT RAISE(ABORT, 'eng4: merge inputs are append-only'); END`,
+  `CREATE TABLE IF NOT EXISTS eng4_head_retirements (
+     tenant_id           TEXT NOT NULL,
+     scope_key           TEXT NOT NULL,
+     state_id            TEXT NOT NULL,
+     retired_by_state_id TEXT NOT NULL,
+     retired_at          TEXT NOT NULL,
+     retired_by          TEXT NOT NULL,
+     reason              TEXT NOT NULL,
+     PRIMARY KEY (tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, scope_key, state_id)            REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, scope_key, retired_by_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_eng4_retirements_by
+     ON eng4_head_retirements (tenant_id, scope_key, retired_by_state_id)`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_retirements_immutable
+     BEFORE UPDATE ON eng4_head_retirements
+     BEGIN SELECT RAISE(ABORT, 'eng4: head retirements are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_retirements_no_delete
+     BEFORE DELETE ON eng4_head_retirements
+     BEGIN SELECT RAISE(ABORT, 'eng4: head retirements are append-only'); END`,
+  // Resolution of one divergent terminal change (kind, id, its snapshot) by
+  // one reconcile snapshot on the accepted lineage. `accept` MUST name the
+  // reconcile's own re-asserting change (FK into the ledger); `reject` has
+  // no change. Both are bound into the reconcile payload as well.
+  // The resolving snapshot is PART OF THE KEY (codex-hythe review of PR #13,
+  // finding 3): a resolution only counts while its resolver is on the
+  // accepted lineage, so after a survivor switch moves that resolver off the
+  // lineage the same terminal must be resolvable again by a later reconcile.
+  `CREATE TABLE IF NOT EXISTS eng4_divergence_resolutions (
+     tenant_id            TEXT NOT NULL,
+     scope_key            TEXT NOT NULL,
+     kind                 TEXT NOT NULL CHECK (kind IN ('fact','loop')),
+     change_id            TEXT NOT NULL,
+     divergent_state_id   TEXT NOT NULL,
+     resolved_by_state_id TEXT NOT NULL,
+     decision             TEXT NOT NULL CHECK (decision IN ('accept','reject')),
+     accepted_ordinal     INTEGER,
+     CHECK ((decision = 'accept' AND accepted_ordinal IS NOT NULL) OR
+            (decision = 'reject' AND accepted_ordinal IS NULL)),
+     PRIMARY KEY (tenant_id, scope_key, kind, change_id, divergent_state_id, resolved_by_state_id),
+     FOREIGN KEY (tenant_id, scope_key, divergent_state_id)   REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, scope_key, resolved_by_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
+     FOREIGN KEY (tenant_id, resolved_by_state_id, kind, accepted_ordinal)
+       REFERENCES eng4_snapshot_changes(tenant_id, state_id, kind, ordinal)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_eng4_resolutions_by
+     ON eng4_divergence_resolutions (tenant_id, scope_key, resolved_by_state_id)`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_resolutions_immutable
+     BEFORE UPDATE ON eng4_divergence_resolutions
+     BEGIN SELECT RAISE(ABORT, 'eng4: divergence resolutions are append-only'); END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_eng4_resolutions_no_delete
+     BEFORE DELETE ON eng4_divergence_resolutions
+     BEGIN SELECT RAISE(ABORT, 'eng4: divergence resolutions are append-only'); END`,
+
   // 7. ai_messages scoping — additive columns + index (A6). SQLite ALTER ADD
   // COLUMN is cheap and non-rewriting; existing rows get NULLs (= unscoped).
   `ALTER TABLE ai_messages ADD COLUMN project_id TEXT`,

@@ -600,14 +600,14 @@ describe('H1 — v1/v2 requests carrying H-series fields fail validation (constr
     ['acknowledgeRetired', true], ['statePatch', {}],
   ];
 
-  it('checkpoint: every H-series field is rejected on v1 and v2 requests; resultVersion 3 is not yet a checkpoint request (arrives with H3/H5)', () => {
+  it('checkpoint: every H-series field is rejected on v1 and v2 requests; a plain resultVersion 3 request is accepted (H3)', () => {
     const base = cp();
     expect(validCheckpointInput(base)).toBe(true);
     for (const [field, value] of H_SERIES_CHECKPOINT_FIELDS) {
       expect(validCheckpointInput({ ...base, [field]: value }), field).toBe(false);
       expect(validCheckpointInput({ ...base, resultVersion: 2, [field]: value }), field).toBe(false);
     }
-    expect(validCheckpointInput({ ...base, resultVersion: 3 })).toBe(false);
+    expect(validCheckpointInput({ ...base, resultVersion: 3 })).toBe(true);
   });
 
   it('resume: unknown H-series request fields are rejected regardless of resultVersion', () => {
