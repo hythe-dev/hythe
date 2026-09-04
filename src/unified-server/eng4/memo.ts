@@ -9,11 +9,16 @@
  * caller: `runWithEnvelopeMemo` installs an empty map, the readers consult
  * it, and it is discarded when the call returns (or throws).
  *
- * What is memoized: (a) "payload <hash> verified" — the sha256/byte-length
- * check of the persisted bytes, and (b) the parsed envelope for a verified
- * hash. Both are keyed by (tenant, content_hash); a payload row cannot change
- * legitimately (hash-addressed, verified), and an out-of-band change is still
- * caught on the FIRST read of every call. Nothing is cached across calls.
+ * What is memoized: ONE entry per (tenant, content_hash) — the verified
+ * payload as a whole (parsed envelope + handle metadata), written by the single
+ * loader in checkpoint.ts (`loadVerifiedPayload`) after the SELECT, the
+ * sha256/byte-length check and the parse. Every reader (integrity check,
+ * replay, ledger, parity, reconciliation, record/patch parent, v3 decisions)
+ * goes through that loader, so the second reader of a payload in the same
+ * call touches neither the database nor the hash. A payload row cannot change
+ * legitimately (hash-addressed, verified); an out-of-band change is caught on
+ * the FIRST read of every call and never reaches a later reader of the same
+ * call. Nothing is cached across calls.
  */
 let current: Map<string, unknown> | null = null;
 

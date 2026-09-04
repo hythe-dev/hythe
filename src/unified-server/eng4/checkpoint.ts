@@ -390,21 +390,29 @@ export function verifyPayloadIntegrity(
   contentHash: string
 ): void {
   // Per-call memo (H5): within one resume/checkpoint the same payload is
-  // verified once; the first read of every call still hashes the bytes.
-  if (memoGet<boolean>(`verified|${tenantId}|${contentHash}`)) return;
+  // SELECTed, hashed and parsed once, whichever reader gets there first.
   loadVerifiedPayload(db, tenantId, contentHash);
 }
 
 /** Verified handle metadata of a payload, read in the SAME statement as the verified bytes. */
 export interface VerifiedPayloadMeta { byteLength: number; mediaType: string }
 
+interface VerifiedPayload { envelope: PersistedEnvelope; meta: VerifiedPayloadMeta }
+
 /**
- * ONE SELECT + hash/size check of a payload; records "verified" and the
- * handle metadata in the per-call memo. Every verified fact about a payload
- * comes from this single statement, so a later out-of-band change within the
- * same call cannot reach any consumer (independent review of PR #15, finding 1).
+ * THE payload load (H5; codex re-review of PR #15 finding 2, independent
+ * review finding 1): one SELECT + hash/size check + parse per (tenant,
+ * content_hash) per call, memoized as a whole under ONE key — so the verdict,
+ * the envelope and the handle metadata are always facts about the same bytes,
+ * and no reader that follows the first (integrity check, replay, ledger,
+ * parity, reconciliation, record/patch parent, v3 decisions) touches the
+ * database again. Fail closed on a missing row, a hash/size mismatch, or
+ * unparseable bytes.
  */
-function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string): { body: Buffer; meta: VerifiedPayloadMeta } {
+function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string, stateIdForMessage?: string): VerifiedPayload {
+  const memoKey = `payload|${tenantId}|${contentHash}`;
+  const cached = memoGet<VerifiedPayload>(memoKey);
+  if (cached) return cached;
   const row = db.prepare(
     `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
   ).get(tenantId, contentHash) as { body: Buffer; byte_length: number; media_type: string } | undefined;
@@ -417,16 +425,24 @@ function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, conten
       `eng4: persisted payload failed hash/size verification for ${contentHash}`
     );
   }
-  const meta: VerifiedPayloadMeta = { byteLength: row.byte_length, mediaType: String(row.media_type) };
-  memoSet(`verified|${tenantId}|${contentHash}`, true);
-  memoSet(`meta|${tenantId}|${contentHash}`, meta);
-  return { body: row.body, meta };
+  let envelope: PersistedEnvelope;
+  try {
+    envelope = JSON.parse(row.body.toString('utf-8')) as PersistedEnvelope;
+  } catch {
+    throw new CheckpointIntegrityError(
+      `eng4: persisted envelope ${stateIdForMessage ? `for ${stateIdForMessage}` : contentHash} is not parseable`
+    );
+  }
+  if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not an object`);
+  }
+  const loaded: VerifiedPayload = { envelope, meta: { byteLength: row.byte_length, mediaType: String(row.media_type) } };
+  memoSet(memoKey, loaded);
+  return loaded;
 }
 
 /** Handle metadata (byteLength, mediaType) of a verified payload — from the verified read, never a separate SELECT. */
 export function readVerifiedPayloadMeta(db: DatabaseType.Database, tenantId: string, contentHash: string): VerifiedPayloadMeta {
-  const cached = memoGet<VerifiedPayloadMeta>(`meta|${tenantId}|${contentHash}`);
-  if (cached) return cached;
   return loadVerifiedPayload(db, tenantId, contentHash).meta;
 }
 
@@ -442,14 +458,11 @@ export interface PersistedEnvelope {
 }
 
 /**
- * The ONE payload reader (H5, codex review of PR #15 finding 2): every
- * consumer of persisted envelope bytes — the change ledger check, version
- * parity, the reconciliation record, record/patch parent materialization,
- * the v3 resume decisions — goes through here, so within one resume or
- * checkpoint call a payload is SELECTed, hashed and parsed exactly once
- * (memo keyed by tenant + content hash, discarded when the call returns).
- * Fail closed on a missing row, a hash/size mismatch, or unparseable bytes.
- * Callers must not mutate the returned object: it is shared for the call.
+ * The persisted envelope of a verified payload — every consumer of envelope
+ * bytes (change ledger check, version parity, reconciliation record,
+ * record/patch parent materialization, v3 resume decisions) reads through
+ * here and therefore through the one memoized load above. Callers must not
+ * mutate the returned object: it is shared for the call.
  */
 export function readVerifiedEnvelope(
   db: DatabaseType.Database,
@@ -457,23 +470,7 @@ export function readVerifiedEnvelope(
   contentHash: string,
   stateIdForMessage?: string
 ): PersistedEnvelope {
-  const memoKey = `envelope|${tenantId}|${contentHash}`;
-  const cached = memoGet<PersistedEnvelope>(memoKey);
-  if (cached) return cached;
-  const { body } = loadVerifiedPayload(db, tenantId, contentHash);
-  let envelope: PersistedEnvelope;
-  try {
-    envelope = JSON.parse(body.toString('utf-8')) as PersistedEnvelope;
-  } catch {
-    throw new CheckpointIntegrityError(
-      `eng4: persisted envelope ${stateIdForMessage ? `for ${stateIdForMessage}` : contentHash} is not parseable`
-    );
-  }
-  if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
-    throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not an object`);
-  }
-  memoSet(memoKey, envelope);
-  return envelope;
+  return loadVerifiedPayload(db, tenantId, contentHash, stateIdForMessage).envelope;
 }
 
 /**

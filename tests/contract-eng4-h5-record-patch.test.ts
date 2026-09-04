@@ -404,6 +404,37 @@ describe('H5 per-call verification memo', () => {
     return counts;
   };
 
+  /** Full payload-body SELECTs (the statement that hashes) per content hash while `run` executes. */
+  const countPayloadReads = (db: any, run: () => void): Map<string, number> => {
+    const counts = new Map<string, number>();
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      const stmt = realPrepare(sql);
+      if (/SELECT body\b[\s\S]*FROM eng4_payloads/.test(sql)) {
+        const get = stmt.get.bind(stmt);
+        stmt.get = (...args: any[]) => { counts.set(args[1], (counts.get(args[1]) ?? 0) + 1); return get(...args); };
+      }
+      return stmt;
+    };
+    try { run(); } finally { db.prepare = realPrepare; }
+    return counts;
+  };
+
+  it('an idempotent replay (v2 and v3) SELECTs and hashes each payload exactly once (codex re-review of PR #15, finding 2): the integrity check and the ledger read share one load', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('f')], resultVersion: 2, idempotencyKey: 'k-replay-v2' });
+    const rv2 = countPayloadReads(db, () => expect(write(db, { factChanges: [fact('f')], resultVersion: 2, idempotencyKey: 'k-replay-v2' }).outcome).toBe('idempotent-replay'));
+    expect(rv2.get(root.contentHash)).toBe(1);
+    for (const [hash, n] of rv2) expect(n, hash).toBe(1);
+    const rec = record(db, { factChanges: [fact('g')], idempotencyKey: 'k-replay-v3' });
+    const rv3 = countPayloadReads(db, () => expect(record(db, { factChanges: [fact('g')], idempotencyKey: 'k-replay-v3', expectedRevision: 1 }).outcome).toBe('idempotent-replay'));
+    expect(rv3.get(rec.contentHash)).toBe(1);
+    for (const [hash, n] of rv3) expect(n, hash).toBe(1);
+    // A fresh record reads its parent payload once; a v3 resume reads every payload once.
+    for (const [hash, n] of countPayloadReads(db, () => record(db, { factChanges: [fact('h')] }))) expect(n, hash).toBe(1);
+    for (const [hash, n] of countPayloadReads(db, () => resume(db, { resultVersion: 3 }))) expect(n, hash).toBe(1);
+  });
+
   it('one v3 resume parses EVERY payload at most once (codex review of PR #15, finding 2) and hits the memo on a lineage with reconciles; nothing persists across calls — an out-of-band payload change is caught by the next call', () => {
     const db = freshDb();
     const root = write(db, { factChanges: [fact('good')] });
