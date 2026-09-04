@@ -13,7 +13,8 @@
   patch. `resume`/`checkpoint` now share a per-call verification memo: every
   consumer of persisted envelope bytes reads through one verified reader, so
   each payload is selected, hashed and parsed exactly once per call (nothing
-  cached across calls). A v3 `write` binds `acknowledgeRetired: true` into its
+  cached across calls); the `engram://snapshot` resource serves exactly the
+  bytes that passed verification (one read, no second SELECT). A v3 `write` binds `acknowledgeRetired: true` into its
   fingerprint (a retry that drops the acknowledgment is an idempotency-mismatch,
   not a replay); v1/v2 fingerprints are byte-identical. record/patch on an
   empty scope fail closed with `CheckpointEmptyScopeError` (design §5.1

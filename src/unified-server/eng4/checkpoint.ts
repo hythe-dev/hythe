@@ -397,7 +397,8 @@ export function verifyPayloadIntegrity(
 /** Verified handle metadata of a payload, read in the SAME statement as the verified bytes. */
 export interface VerifiedPayloadMeta { byteLength: number; mediaType: string }
 
-interface VerifiedPayload { envelope: PersistedEnvelope; meta: VerifiedPayloadMeta }
+/** One verified payload: the exact bytes that passed the hash/size check, their parse, and the handle metadata from the same row. */
+export interface VerifiedPayload { body: Buffer; envelope: PersistedEnvelope; meta: VerifiedPayloadMeta }
 
 /**
  * THE payload load (H5; codex re-review of PR #15 finding 2, independent
@@ -436,9 +437,19 @@ function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, conten
   if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
     throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not an object`);
   }
-  const loaded: VerifiedPayload = { envelope, meta: { byteLength: row.byte_length, mediaType: String(row.media_type) } };
+  const loaded: VerifiedPayload = { body: row.body, envelope, meta: { byteLength: row.byte_length, mediaType: String(row.media_type) } };
   memoSet(memoKey, loaded);
   return loaded;
+}
+
+/**
+ * The verified payload as a whole — the resource layer serves `body` from
+ * here (codex re-review of PR #15 at b5aac16: the bytes returned under a
+ * contentHash must be the bytes that passed verification, never a second
+ * SELECT). Callers must not mutate `body` or `envelope`.
+ */
+export function readVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string, stateIdForMessage?: string): VerifiedPayload {
+  return loadVerifiedPayload(db, tenantId, contentHash, stateIdForMessage);
 }
 
 /** Handle metadata (byteLength, mediaType) of a verified payload — from the verified read, never a separate SELECT. */

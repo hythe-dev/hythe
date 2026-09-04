@@ -17,7 +17,7 @@
  */
 import type DatabaseType from 'better-sqlite3';
 import type { SnapshotSelector, StateSnapshot, ChangesSinceQuery } from './contracts.js';
-import { verifyPayloadIntegrity } from './checkpoint.js';
+import { readVerifiedPayload } from './checkpoint.js';
 import { parseScopeKey, resolveScope, type EntityDirectory } from './resolver.js';
 import { ENGRAM_URI_PATTERN } from './schemas.js';
 
@@ -81,10 +81,11 @@ interface SnapshotRow {
 }
 
 function loadVerified(db: DatabaseType.Database, tenantId: string, row: SnapshotRow): FetchedSnapshot {
-  verifyPayloadIntegrity(db, tenantId, row.content_hash);
-  const payload = db.prepare(
-    `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-  ).get(tenantId, row.content_hash) as { body: Buffer; byte_length: number; media_type: string };
+  // ONE read: the bytes served are exactly the bytes that passed the
+  // hash/size check (H5; codex re-review of PR #15 at b5aac16). A second
+  // SELECT here could return a row changed out of band between the two
+  // statements under the original contentHash.
+  const payload = readVerifiedPayload(db, tenantId, row.content_hash, row.state_id);
   return {
     snapshot: {
       stateId: row.state_id,
@@ -98,8 +99,8 @@ function loadVerified(db: DatabaseType.Database, tenantId: string, row: Snapshot
       state: JSON.parse(row.state_json),
     },
     body: Buffer.from(payload.body),
-    byteLength: payload.byte_length,
-    mediaType: payload.media_type,
+    byteLength: payload.meta.byteLength,
+    mediaType: payload.meta.mediaType,
   };
 }
 

@@ -38,6 +38,7 @@ import { CHECKPOINT_INPUT_SCHEMA, CHECKPOINT_OUTPUT_SCHEMA } from '../src/unifie
 import { applyEng4Schema } from '../src/unified-server/eng4/init.js';
 import { performCheckpoint, applyMergePatch, CheckpointPatchError, CheckpointEmptyScopeError, CheckpointIntegrityError, CheckpointParentStateError } from '../src/unified-server/eng4/checkpoint.js';
 import { CheckpointRetiredParentError } from '../src/unified-server/eng4/reconcile.js';
+import { fetchSnapshot, fetchResourceByUri } from '../src/unified-server/eng4/resource.js';
 import { performResume, type ResumeDirectory } from '../src/unified-server/eng4/resume.js';
 import { requestFingerprint } from '../src/unified-server/eng4/canonical.js';
 import { readScopePointer } from '../src/unified-server/eng4/heads.js';
@@ -433,6 +434,44 @@ describe('H5 per-call verification memo', () => {
     // A fresh record reads its parent payload once; a v3 resume reads every payload once.
     for (const [hash, n] of countPayloadReads(db, () => record(db, { factChanges: [fact('h')] }))) expect(n, hash).toBe(1);
     for (const [hash, n] of countPayloadReads(db, () => resume(db, { resultVersion: 3 }))) expect(n, hash).toBe(1);
+  });
+
+  it('a snapshot resource serves exactly the bytes that passed verification (codex re-review at b5aac16): one payload-body SELECT; a row replaced right after it cannot alter the returned body; the next fetch fails closed', () => {
+    const db = freshDb();
+    const root = write(db, { state: state('served') });
+    const original = db.prepare(`SELECT body, byte_length FROM eng4_payloads WHERE content_hash=?`).get(root.contentHash) as any;
+    const changed = Buffer.from('{"changed":true}', 'utf8');
+    const realPrepare = db.prepare.bind(db);
+    const replace = realPrepare(`UPDATE eng4_payloads SET body=?, byte_length=? WHERE content_hash=?`);
+    let bodyReads = 0;
+    (db as any).prepare = (sql: string) => {
+      const stmt = realPrepare(sql);
+      if (/SELECT body\b[\s\S]*FROM eng4_payloads/.test(sql)) {
+        const get = stmt.get.bind(stmt);
+        (stmt as any).get = (...args: any[]) => {
+          const row = get(...args);
+          if (args[1] === root.contentHash && bodyReads++ === 0) {
+            db.pragma('foreign_keys = OFF');
+            replace.run(changed, changed.length, root.contentHash); // an external writer between two statements
+            db.pragma('foreign_keys = ON');
+          }
+          return row;
+        };
+      }
+      return stmt;
+    };
+    try {
+      const fetched = fetchSnapshot(db, directory, TENANT, { scope: { project: 'Proj' }, stateId: root.stateId });
+      expect(bodyReads).toBe(1);
+      expect(createHash('sha256').update(fetched.body).digest('hex')).toBe(root.contentHash);
+      expect(fetched.byteLength).toBe(original.byte_length);
+      expect(fetched.body.equals(Buffer.from(original.body))).toBe(true);
+      expect(fetched.snapshot.state.status).toBe('served');
+    } finally {
+      (db as any).prepare = realPrepare;
+    }
+    expect(() => fetchSnapshot(db, directory, TENANT, { scope: { project: 'Proj' }, stateId: root.stateId })).toThrow(CheckpointIntegrityError);
+    expect(() => fetchResourceByUri(db, TENANT, `engram://snapshot/${encodeURIComponent(SCOPE)}/${encodeURIComponent(root.stateId)}`)).toThrow(CheckpointIntegrityError);
   });
 
   it('one v3 resume parses EVERY payload at most once (codex review of PR #15, finding 2) and hits the memo on a lineage with reconciles; nothing persists across calls — an out-of-band payload change is caught by the next call', () => {
