@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Dependencies: `express` 4.22.2 → 5.2.1 (with `@types/express` 5.0.6). Express 4
+  and body-parser 1 pin `qs` to the 6.15 line, which carries two moderate
+  advisories (GHSA-x5fp-wj9c-mxmx, GHSA-4mjr-xmp4-gh2g); Express 5 / body-parser
+  2 resolve `qs` 6.16.0, so `npm audit --omit=dev` and the packed-consumer gate
+  are clean again. Runtime contract preserved: the server restores the Express 4
+  `req.body` default (`{}` when no parser consumed the request) in one middleware
+  so every validator and handler is unchanged; route paths are plain
+  `/:param` literals (no wildcard/regex syntax to migrate); the default `simple`
+  query parser covers every `req.query` use (flat keys only). New contract test
+  `tests/contract-express5-body-contract.test.ts`.
 - ENG-4 H5 (design §5, final internal increment of `resultVersion: 3`): checkpoint
   gains `operation: 'record'` (fact/loop changes without resending state) and
   `operation: 'patch'` (an RFC 7396 merge patch on the working state; arrays

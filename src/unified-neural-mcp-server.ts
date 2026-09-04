@@ -154,6 +154,16 @@ export class NeuralMCPServer {
       express.json({ limit: '10mb' })(req, res, next);
     });
 
+    // Express 5 (body-parser 2) leaves req.body undefined when no parser
+    // consumed the request — no body, or an unmatched content type — where
+    // Express 4 set `{}`. Every validator and handler below was written to
+    // the Express 4 contract (destructuring req.body, `typeof req.body ===
+    // 'object'` branches), so restore it once, here, before any of them run.
+    this.app.use((req, _res, next) => {
+      if (req.body === undefined) req.body = {};
+      next();
+    });
+
     // ============================================================================
     // SECURITY MIDDLEWARE - Phase 1 Implementation
     // ============================================================================
