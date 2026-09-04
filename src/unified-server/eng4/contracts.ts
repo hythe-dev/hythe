@@ -385,7 +385,7 @@ export interface AsOfHeader {
   divergentHeadCount?: number;
   /** Retired snapshots in the scope (H3). */
   retiredHeadCount?: number;
-  /** H4: divergent terminals with no truthful value (unversioned); not listed in divergentValues, a reconcile must reject them. */
+  /** H4: UNRESOLVED divergent terminals with no truthful value (unversioned) — rejections a reconcile still owes; they are also listed in divergentValues with value null. */
   opaqueDivergentCount?: number;
 }
 

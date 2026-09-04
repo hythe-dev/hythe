@@ -538,6 +538,12 @@ describe('H4 independent review round 1 — coverage key parity, paged suppressi
     expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
     expect(validV3({ ...b, divergentValues: [{ ...b.divergentValues[0], opaque: false }] })).toBe(false); // opaque:false needs a value object
     expect(validV3({ ...b, divergentValues: [{ ...b.divergentValues[0], isV1CurrentValue: true }] })).toBe(false);
+    // Once a reconcile rejects it, it stays listed (resolved) but no longer counts as owed (delta re-review LOW 1).
+    const aHead = b.asOf.stateId;
+    reconcile(db, { expectedHeads: [aHead, c.stateId], survivor: aHead, rejectLineages: [c.stateId] });
+    const after = v3(db);
+    expect(after.asOf.opaqueDivergentCount).toBe(0);
+    expect(after.divergentValues).toEqual([expect.objectContaining({ id: L, stateId: c.stateId, opaque: true, resolved: true })]);
   });
 
   it('more cases: suppressed id with divergent versions; divergent value equal to the accepted one; superseded on a divergent branch; closed loop in legacyValues; empty scope', () => {

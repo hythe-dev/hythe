@@ -110,7 +110,7 @@ export interface V3Selection {
   suppressedReason: 'undesignated' | 'unversioned';
   divergentValues: DivergentValue[];
   legacyValues: LegacyValue[];
-  /** Divergent terminals with NO truthful value to show (unversioned coverage); a reconcile must reject them. */
+  /** UNRESOLVED divergent terminals with no truthful value (unversioned coverage): rejections a reconcile still owes. */
   opaqueDivergentCount: number;
 }
 
@@ -308,9 +308,11 @@ export function selectV3Values(
     if (t.comparable === null) {
       // Opaque terminal: identity and provenance are proven, the value is not.
       // Listed with value null so it can never hide behind an accepted value
-      // for the same id; also counted on asOf.
-      opaqueDivergentCount++;
-      divergentValues.push({ kind: t.kind, id: t.id, lineageHead: [...t.heads].sort()[0], stateId: t.stateId, revision: t.revision, ordinal: t.ordinal, value: null, isV1CurrentValue: false, resolved: resolvedKeys.has(terminalKey(t)), opaque: true });
+      // for the same id. Counted on asOf only while UNRESOLVED — the count
+      // means "rejections a reconcile still owes" (delta re-review, LOW 1).
+      const resolved = resolvedKeys.has(terminalKey(t));
+      if (!resolved) opaqueDivergentCount++;
+      divergentValues.push({ kind: t.kind, id: t.id, lineageHead: [...t.heads].sort()[0], stateId: t.stateId, revision: t.revision, ordinal: t.ordinal, value: null, isV1CurrentValue: false, resolved, opaque: true });
       continue;
     }
     const lineageHead = [...t.heads].sort()[0];
