@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- ENG-4 H5 (design §5, final internal increment of `resultVersion: 3`): checkpoint
+  gains `operation: 'record'` (fact/loop changes without resending state) and
+  `operation: 'patch'` (an RFC 7396 merge patch on the working state; arrays
+  replace wholesale; the result must be a complete valid state or the call fails
+  closed). Both forbid `state` in the request, admit ONLY the pointed head as
+  parent (`conflict` carrying heads and pointer otherwise — never a branch),
+  take the parent state from its hash-verified payload, and advance the pointer.
+  Fingerprints bind the operation, the resolved parent and (for patch) the raw
+  patch. `resume`/`checkpoint` now share a per-call verification memo: every
+  consumer of persisted envelope bytes reads through one verified reader, so
+  each payload is selected, hashed and parsed exactly once per call (nothing
+  cached across calls); the `engram://snapshot` resource serves exactly the
+  bytes that passed verification (one read, no second SELECT). A v3 `write` binds `acknowledgeRetired: true` into its
+  fingerprint (a retry that drops the acknowledgment is an idempotency-mismatch,
+  not a replay); v1/v2 fingerprints are byte-identical. record/patch on an
+  empty scope fail closed with `CheckpointEmptyScopeError` (design §5.1
+  amended); a patch carrying a prototype key (`__proto__`, `constructor`,
+  `prototype`) fails closed; a pointed head whose verified state no longer
+  validates is a typed `CheckpointParentStateError` (send a full write);
+  record/patch reject `acknowledgeRetired`. The exact v3 request/result/bundle
+  schema is now final; publishing/deploying v3 remains a separate owner
+  decision.
 - ENG-4 H4 (design §6.3–§6.5, internal increment of `resultVersion: 3`): the v3
   read model. `resume` `resultVersion: 3` now selects `currentFacts`/`openLoops`
   ONLY from verified materialized versions on the accepted lineage (newest per

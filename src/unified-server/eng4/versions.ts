@@ -54,7 +54,7 @@
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, FactChange, LoopChange } from './contracts.js';
 import { canonicalize } from './canonical.js';
-import { CheckpointIntegrityError, readSnapshotChanges, verifyPayloadIntegrity } from './checkpoint.js';
+import { CheckpointIntegrityError, readSnapshotChanges, readVerifiedEnvelope, verifyPayloadIntegrity } from './checkpoint.js';
 
 export const UNVERSIONED_REASON_INHERITED_OWNER = 'pre-h2-inherited-owner';
 
@@ -145,15 +145,12 @@ export function assertLedgerAgreesWithEnvelope(stateId: string, changes: Checkpo
 }
 
 function readEnvelope(db: DatabaseType.Database, tenantId: string, contentHash: string, stateId: string): Envelope {
-  const payload = db.prepare(`SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`)
-    .get(tenantId, contentHash) as { body: Buffer } | undefined;
-  if (!payload) throw new CheckpointIntegrityError(`eng4: payload missing for content hash ${contentHash}`);
-  try {
-    const env = JSON.parse(payload.body.toString('utf-8')) as Partial<Envelope>;
-    return { factChanges: env.factChanges ?? [], loopChanges: env.loopChanges ?? [] };
-  } catch {
-    throw new CheckpointIntegrityError(`eng4: persisted envelope for ${stateId} is not parseable`);
-  }
+  // One verified parse per payload per call (H5 memo) — see readVerifiedEnvelope.
+  const env = readVerifiedEnvelope(db, tenantId, contentHash, stateId);
+  return {
+    factChanges: (env.factChanges ?? []) as Envelope['factChanges'],
+    loopChanges: (env.loopChanges ?? []) as Envelope['loopChanges'],
+  };
 }
 
 // ---------------------------------------------------------------------------

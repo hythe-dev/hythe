@@ -52,9 +52,11 @@ import type {
   SectionCoverage,
   WorkingState,
 } from './contracts.js';
+import { readVerifiedEnvelope, readVerifiedPayloadMeta } from './checkpoint.js';
 import { effectiveCurrentHead, liveHeadDetails, retiredHeadCount } from './heads.js';
 import { verifyReconcileRowsScopeWide, verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
 import { selectV3Values, type V3Selection } from './selection.js';
+import { runWithEnvelopeMemo } from './memo.js';
 import { verifyVersionParity } from './versions.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
@@ -130,6 +132,17 @@ function emptyCoverage(omittedReason: SectionCoverage['omittedReason'], totalCou
 }
 
 export function performResume(
+  db: DatabaseType.Database,
+  directory: ResumeDirectory,
+  tenantId: string,
+  params: ResumeParams
+): ResumeBundle {
+  // One verification memo per call (H5): every payload is hashed and parsed
+  // once per resume; nothing is cached across calls.
+  return runWithEnvelopeMemo(() => performResumeInner(db, directory, tenantId, params));
+}
+
+function performResumeInner(
   db: DatabaseType.Database,
   directory: ResumeDirectory,
   tenantId: string,
@@ -353,11 +366,25 @@ export function performResume(
   const decisions: ResumeBundle['decisions'] = [];
   let evidence: ContentHandle[] = [];
   if (currentRow) {
-    const payload = db.prepare(
-      `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-    ).get(tenantId, currentRow.content_hash) as any;
-    if (payload) {
-      const envelope = JSON.parse(Buffer.from(payload.body).toString('utf8'));
+    let envelope: any;
+    let handle: { byteLength: number; mediaType: string } | null = null;
+    if (resultVersion === 3) {
+      // v3 (H5): the verified, per-call memoized parse — the same envelope
+      // and the same SELECT the verifiers read, so the handle metadata and
+      // the decisions cannot come from bytes changed out of band mid-call.
+      envelope = readVerifiedEnvelope(db, tenantId, currentRow.content_hash, currentRow.state_id);
+      handle = readVerifiedPayloadMeta(db, tenantId, currentRow.content_hash);
+    } else {
+      // v1/v2: the frozen unverified read.
+      const payload = db.prepare(
+        `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
+      ).get(tenantId, currentRow.content_hash) as any;
+      if (payload) {
+        envelope = JSON.parse(Buffer.from(payload.body).toString('utf8'));
+        handle = { byteLength: payload.byte_length, mediaType: payload.media_type };
+      }
+    }
+    if (envelope && handle) {
       (envelope.events ?? []).forEach((event: any, index: number) => {
         if (event?.kind === 'decision') {
           decisions.push({
@@ -372,8 +399,8 @@ export function performResume(
         kind: 'state-snapshot',
         uri: `engram://snapshot/${encodeURIComponent(scopeKey)}/${encodeURIComponent(currentRow.state_id)}`,
         contentHash: currentRow.content_hash,
-        byteLength: payload.byte_length,
-        mediaType: payload.media_type,
+        byteLength: handle.byteLength,
+        mediaType: handle.mediaType,
       }];
     }
   }

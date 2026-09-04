@@ -158,7 +158,25 @@ export function requestFingerprint(input: {
    * discriminant is bound ONLY when present and ≠ 'write' — legacy bytes
    * unchanged.
    */
-  operation?: 'write' | 'reconcile';
+  operation?: 'write' | 'reconcile' | 'record' | 'patch';
+  /**
+   * ENG-4 H5 (§5.4): the RAW RFC 7396 merge patch of a `patch` request,
+   * bound as sent (canonicalized) — the materialized state is derived inside
+   * the transaction and bound by contentHash, not by the fingerprint. For
+   * record/patch the fingerprint's content carries `state: null` (the request
+   * has no state); the resolved parent binds what the state is derived from.
+   */
+  patch?: unknown;
+  /**
+   * ENG-4 H5 (codex review of PR #15, finding 1): a v3 `write`'s
+   * `acknowledgeRetired: true` is admission-significant (§4.5 — it is what
+   * admits a retired parent), so it is bound into the fingerprint when true.
+   * Absent/false binds nothing (legacy bytes and every v3 request that never
+   * acknowledged stay unchanged); a retry that drops the acknowledgment is an
+   * idempotency-mismatch, never a replay. `reconcile` already binds it inside
+   * its normalized request and does not set this.
+   */
+  acknowledgeRetired?: boolean;
   /**
    * ENG-4 H3 (§4.1, §6.3 Q4): the NORMALIZED reconcile request — sorted
    * expectedHeads, expectedPointer, survivor, reason, strict, explicit
@@ -177,6 +195,8 @@ export function requestFingerprint(input: {
     ...(input.resultVersion === 3 ? { resultVersion: 3 } : {}),
     ...(input.operation !== undefined && input.operation !== 'write' ? { operation: input.operation } : {}),
     ...(input.reconcile !== undefined ? { reconcile: input.reconcile } : {}),
+    ...(input.patch !== undefined ? { patch: input.patch } : {}),
+    ...(input.acknowledgeRetired === true ? { acknowledgeRetired: true } : {}),
     // Content is the BASE envelope — the reconciliation record is derived
     // inside the transaction and bound by contentHash, not by the fingerprint.
     content: canonicalize({

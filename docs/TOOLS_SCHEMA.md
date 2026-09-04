@@ -1065,8 +1065,7 @@ Parameters
     "agentId",
     "scope",
     "expectedRevision",
-    "idempotencyKey",
-    "state"
+    "idempotencyKey"
   ],
   "properties": {
     "agentId": {
@@ -1120,14 +1119,20 @@ Parameters
         2,
         3
       ],
-      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (INTERNAL, not final until the ENG-4 H-series completes): v2 plus the `operation` discriminant (`reconcile` since H3) and its fields; required for any of them."
+      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (final as of ENG-4 H5; internal until the owner publishes v3): v2 plus the `operation` discriminant (`reconcile`, `record`, `patch`) and its fields; required for any of them."
     },
     "operation": {
       "enum": [
         "write",
-        "reconcile"
+        "reconcile",
+        "record",
+        "patch"
       ],
-      "description": "resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally."
+      "description": "resultVersion 3 only. Absent = legacy write. `reconcile` names the exact live-head set and pointer (CAS), retires every head but the survivor, and resolves divergent values causally. `record` logs fact/loop changes without resending state and `patch` applies an RFC 7396 merge patch to the state; both require expectedRevision to be the POINTED head (conflict otherwise, carrying heads and pointer), take the parent state from its hash-verified payload, and advance the pointer."
+    },
+    "statePatch": {
+      "type": "object",
+      "description": "patch only: RFC 7396 merge patch against the verified parent state (null deletes a key; arrays replace wholesale). The result must be a complete valid working state or the call fails closed."
     },
     "acknowledgeRetired": {
       "type": "boolean",
@@ -1482,6 +1487,102 @@ Parameters
             {
               "required": [
                 "rejectLineages"
+              ]
+            },
+            {
+              "required": [
+                "statePatch"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "operation"
+          ],
+          "properties": {
+            "operation": {
+              "enum": [
+                "record",
+                "patch"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "state"
+        ],
+        "not": {
+          "required": [
+            "statePatch"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "record"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "required": [
+                "statePatch"
+              ]
+            },
+            {
+              "required": [
+                "acknowledgeRetired"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "const": "patch"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "statePatch"
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "required": [
+                "acknowledgeRetired"
               ]
             }
           ]

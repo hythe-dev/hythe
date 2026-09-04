@@ -43,7 +43,7 @@ import type {
   ResolutionRecord,
 } from './contracts.js';
 import { canonicalize } from './canonical.js';
-import { CheckpointIntegrityError, readSnapshotChanges, verifyPayloadIntegrity } from './checkpoint.js';
+import { CheckpointIntegrityError, readSnapshotChanges, readVerifiedEnvelope, verifyPayloadIntegrity } from './checkpoint.js';
 import { factVersionValue, verifyVersionParity, type LoopVersionValue } from './versions.js';
 
 /** A malformed or inadmissible reconcile request — typed, nothing written. */
@@ -179,11 +179,8 @@ function retiredHeads(db: DatabaseType.Database, tenantId: string, scopeKey: str
 // ---------------------------------------------------------------------------
 
 export function readReconciliation(db: DatabaseType.Database, tenantId: string, contentHash: string): ReconciliationRecord | null {
-  verifyPayloadIntegrity(db, tenantId, contentHash);
-  const payload = db.prepare(`SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`).get(tenantId, contentHash) as { body: Buffer };
-  let env: any;
-  try { env = JSON.parse(payload.body.toString('utf-8')); } catch { throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not parseable`); }
-  const rec = env.reconciliation;
+  // Verified + parsed once per call (H5 memo); the shape check below is cheap.
+  const rec: any = readVerifiedEnvelope(db, tenantId, contentHash).reconciliation;
   if (rec === undefined || rec === null) return null;
   // Shape check — a malformed record is corruption, not a TypeError later.
   const ok = typeof rec === 'object' && !Array.isArray(rec)

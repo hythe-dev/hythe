@@ -56,11 +56,14 @@
  * reads to define "current" instead of max revision.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import Ajv from 'ajv';
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, CheckpointOperation, CheckpointParams, CheckpointResult, FactChange, LoopChange, ReconciledBlock, ReconciliationRecord } from './contracts.js';
-import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint } from './canonical.js';
+import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint, type CheckpointContentEnvelope } from './canonical.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
-import { advancePointerAfterInsert, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
+import { advancePointerAfterInsert, effectiveCurrentHead, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
+import { memoGet, memoSet, runWithEnvelopeMemo } from './memo.js';
+import { WORKING_STATE } from './schemas.js';
 import { writeVersionRows } from './versions.js';
 import {
   CheckpointReconcileError,
@@ -85,6 +88,54 @@ export class CheckpointScopeError extends Error {
     this.ambiguousCandidates = ambiguousCandidates;
   }
 }
+
+/**
+ * H5 §5.4: a `patch` whose merge-patched state is not a complete, valid
+ * working state fails CLOSED — nothing written.
+ */
+export class CheckpointPatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckpointPatchError';
+  }
+}
+
+/**
+ * H5 (independent review of PR #15, finding 4): the pointed head's verified
+ * payload carries a state that no longer validates as a working state (schema
+ * drift). The bytes are intact — this is an admission failure, not corruption:
+ * send a full `write` to re-establish a valid state.
+ */
+export class CheckpointParentStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckpointParentStateError';
+  }
+}
+
+/** Keys a merge patch may never carry: they would set the prototype of the derived object, not a field. */
+const PROTOTYPE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * RFC 7396 JSON Merge Patch. Arrays and scalars replace wholesale; null
+ * deletes. Fails CLOSED (CheckpointPatchError) on a prototype key anywhere in
+ * the patch — `{"__proto__": {...}}` would otherwise be silently dropped
+ * (independent review of PR #15, finding 3).
+ */
+export function applyMergePatch(target: unknown, patch: unknown): unknown {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return patch;
+  const out: Record<string, unknown> = (target !== null && typeof target === 'object' && !Array.isArray(target))
+    ? { ...(target as Record<string, unknown>) }
+    : {};
+  for (const [k, v] of Object.entries(patch as Record<string, unknown>)) {
+    if (PROTOTYPE_KEYS.has(k)) throw new CheckpointPatchError(`eng4: statePatch carries the prototype key "${k}"`);
+    if (v === null) delete out[k];
+    else out[k] = applyMergePatch(out[k], v);
+  }
+  return out;
+}
+
+const validWorkingState = new Ajv({ allErrors: true }).compile(WORKING_STATE as any);
 
 /** Persisted payload bytes that no longer match their hash fail CLOSED. */
 export class CheckpointIntegrityError extends Error {
@@ -293,19 +344,9 @@ export function readSnapshotChanges(
   storedHash: string | null,
   requireLedger: boolean
 ): CheckpointChanges | null {
-  const payload = db.prepare(
-    `SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-  ).get(tenantId, contentHash) as { body: Buffer } | undefined;
-  if (!payload) throw new CheckpointIntegrityError(`eng4: payload missing for content hash ${contentHash}`);
-  let expectedFacts = 0;
-  let expectedLoops = 0;
-  try {
-    const envelope = JSON.parse(payload.body.toString('utf-8')) as { factChanges?: unknown[]; loopChanges?: unknown[] };
-    expectedFacts = envelope.factChanges?.length ?? 0;
-    expectedLoops = envelope.loopChanges?.length ?? 0;
-  } catch {
-    throw new CheckpointIntegrityError(`eng4: persisted envelope for ${stateId} is not parseable`);
-  }
+  const envelope = readVerifiedEnvelope(db, tenantId, contentHash, stateId);
+  const expectedFacts = Array.isArray(envelope.factChanges) ? envelope.factChanges.length : 0;
+  const expectedLoops = Array.isArray(envelope.loopChanges) ? envelope.loopChanges.length : 0;
 
   const rows = db.prepare(
     `SELECT kind, ordinal, change_id, created FROM eng4_snapshot_changes
@@ -348,9 +389,34 @@ export function verifyPayloadIntegrity(
   tenantId: string,
   contentHash: string
 ): void {
+  // Per-call memo (H5): within one resume/checkpoint the same payload is
+  // SELECTed, hashed and parsed once, whichever reader gets there first.
+  loadVerifiedPayload(db, tenantId, contentHash);
+}
+
+/** Verified handle metadata of a payload, read in the SAME statement as the verified bytes. */
+export interface VerifiedPayloadMeta { byteLength: number; mediaType: string }
+
+/** One verified payload: the exact bytes that passed the hash/size check, their parse, and the handle metadata from the same row. */
+export interface VerifiedPayload { body: Buffer; envelope: PersistedEnvelope; meta: VerifiedPayloadMeta }
+
+/**
+ * THE payload load (H5; codex re-review of PR #15 finding 2, independent
+ * review finding 1): one SELECT + hash/size check + parse per (tenant,
+ * content_hash) per call, memoized as a whole under ONE key — so the verdict,
+ * the envelope and the handle metadata are always facts about the same bytes,
+ * and no reader that follows the first (integrity check, replay, ledger,
+ * parity, reconciliation, record/patch parent, v3 decisions) touches the
+ * database again. Fail closed on a missing row, a hash/size mismatch, or
+ * unparseable bytes.
+ */
+function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string, stateIdForMessage?: string): VerifiedPayload {
+  const memoKey = `payload|${tenantId}|${contentHash}`;
+  const cached = memoGet<VerifiedPayload>(memoKey);
+  if (cached) return cached;
   const row = db.prepare(
-    `SELECT body, byte_length FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-  ).get(tenantId, contentHash) as { body: Buffer; byte_length: number } | undefined;
+    `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
+  ).get(tenantId, contentHash) as { body: Buffer; byte_length: number; media_type: string } | undefined;
   if (!row) {
     throw new CheckpointIntegrityError(`eng4: payload missing for content hash ${contentHash}`);
   }
@@ -360,6 +426,62 @@ export function verifyPayloadIntegrity(
       `eng4: persisted payload failed hash/size verification for ${contentHash}`
     );
   }
+  let envelope: PersistedEnvelope;
+  try {
+    envelope = JSON.parse(row.body.toString('utf-8')) as PersistedEnvelope;
+  } catch {
+    throw new CheckpointIntegrityError(
+      `eng4: persisted envelope ${stateIdForMessage ? `for ${stateIdForMessage}` : contentHash} is not parseable`
+    );
+  }
+  if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not an object`);
+  }
+  const loaded: VerifiedPayload = { body: row.body, envelope, meta: { byteLength: row.byte_length, mediaType: String(row.media_type) } };
+  memoSet(memoKey, loaded);
+  return loaded;
+}
+
+/**
+ * The verified payload as a whole — the resource layer serves `body` from
+ * here (codex re-review of PR #15 at b5aac16: the bytes returned under a
+ * contentHash must be the bytes that passed verification, never a second
+ * SELECT). Callers must not mutate `body` or `envelope`.
+ */
+export function readVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string, stateIdForMessage?: string): VerifiedPayload {
+  return loadVerifiedPayload(db, tenantId, contentHash, stateIdForMessage);
+}
+
+/** Handle metadata (byteLength, mediaType) of a verified payload — from the verified read, never a separate SELECT. */
+export function readVerifiedPayloadMeta(db: DatabaseType.Database, tenantId: string, contentHash: string): VerifiedPayloadMeta {
+  return loadVerifiedPayload(db, tenantId, contentHash).meta;
+}
+
+/** The persisted checkpoint envelope as parsed from its verified bytes. Treat as read-only. */
+export interface PersistedEnvelope {
+  scopeKey?: unknown;
+  state?: unknown;
+  events?: unknown[];
+  factChanges?: unknown[];
+  loopChanges?: unknown[];
+  evidenceRefs?: unknown[];
+  reconciliation?: unknown;
+}
+
+/**
+ * The persisted envelope of a verified payload — every consumer of envelope
+ * bytes (change ledger check, version parity, reconciliation record,
+ * record/patch parent materialization, v3 resume decisions) reads through
+ * here and therefore through the one memoized load above. Callers must not
+ * mutate the returned object: it is shared for the call.
+ */
+export function readVerifiedEnvelope(
+  db: DatabaseType.Database,
+  tenantId: string,
+  contentHash: string,
+  stateIdForMessage?: string
+): PersistedEnvelope {
+  return loadVerifiedPayload(db, tenantId, contentHash, stateIdForMessage).envelope;
 }
 
 /**
@@ -386,22 +508,43 @@ export function performCheckpoint(
   const canonicalAgentId = directory.resolveCanonicalAgent(params.agentId, tenantId).canonical;
   if (!canonicalAgentId) throw new Error('Invalid agent identity');
 
-  const baseEnvelope = {
+  const baseEnvelope: CheckpointContentEnvelope = {
     scopeKey,
-    state: params.state,
+    state: params.state ?? null,
     events: params.events ?? [],
     factChanges: params.factChanges ?? [],
     loopChanges: params.loopChanges ?? [],
     evidenceRefs: params.evidenceRefs ?? [],
   };
   const resultVersion: 1 | 2 | 3 = params.resultVersion === 3 ? 3 : params.resultVersion === 2 ? 2 : 1;
-  const operation: CheckpointOperation = resultVersion === 3 && params.operation === 'reconcile' ? 'reconcile' : 'write';
+  const operation: CheckpointOperation =
+    resultVersion === 3 && (params.operation === 'reconcile' || params.operation === 'record' || params.operation === 'patch')
+      ? params.operation
+      : 'write';
+  // record/patch (H5 §5) carry no state: it is derived from the verified
+  // parent payload inside the transaction. Their fingerprint content binds
+  // state: null (plus the raw patch for `patch`); contentHash binds the
+  // materialized envelope.
+  const derivesState = operation === 'record' || operation === 'patch';
+  if (derivesState) baseEnvelope.state = null;
   // Canonicalization (RFC 8785, fail-closed on malformed input) happens
   // before the transaction opens — a rejected envelope writes nothing. A
   // reconcile's envelope additionally carries the reconciliation record,
   // which is derived INSIDE the transaction (§4.2 step 4), so its final bytes
   // and contentHash are computed there; the base envelope is validated here.
+  // Explicit guards behind the input schema (independent review of PR #15,
+  // finding 6): a direct caller gets a typed failure, never a TypeError.
+  if (!derivesState && (params.state === null || typeof params.state !== 'object')) {
+    throw new Error(`eng4: ${operation} requires a full working state`);
+  }
+  if (operation === 'patch' && (params.statePatch === null || typeof params.statePatch !== 'object' || Array.isArray(params.statePatch))) {
+    throw new CheckpointPatchError('eng4: patch requires statePatch to be an object');
+  }
   canonicalEnvelopeBytes(baseEnvelope);
+  if (operation === 'patch') {
+    canonicalize(params.statePatch);
+    applyMergePatch({}, params.statePatch); // prototype keys fail closed before the transaction opens
+  }
   const normalized = operation === 'reconcile' ? normalizeReconcileRequest(params) : undefined;
 
   const run = db.transaction((): CheckpointResult => {
@@ -424,6 +567,9 @@ export function performCheckpoint(
       resultVersion,
       operation,
       reconcile: normalized,
+      patch: operation === 'patch' ? params.statePatch : undefined,
+      // v3 only; reconcile binds it inside `normalized` (legacy bytes unchanged).
+      acknowledgeRetired: resultVersion === 3 && operation !== 'reconcile' && params.acknowledgeRetired === true ? true : undefined,
     });
     const pointerNow = (): string | null => readScopePointer(db, tenantId, scopeKey)?.stateId ?? null;
     // v3 conflicts also carry the pointer, so a reconcile caller can restate
@@ -507,10 +653,34 @@ export function performCheckpoint(
       return conflict(heads);
     }
 
-    // H3: reconcile CAS + causal divergence evaluation (§4.2 steps 2, 3, 6),
-    // or the v3 resurrection acknowledgement for a plain write (§4.5).
+    // H3: reconcile CAS + causal divergence evaluation (§4.2 steps 2, 3, 6);
+    // H5: record/patch admit only the POINTED head as parent and derive the
+    // state from its verified payload (§5.1–§5.4); or the v3 resurrection
+    // acknowledgement for a plain write (§4.5).
     let reconciliation: ReconciliationRecord | undefined;
-    if (operation === 'reconcile' && normalized) {
+    let derivedState: unknown;
+    if (derivesState) {
+      const eff = effectiveCurrentHead(db, tenantId, scopeKey);
+      if (eff.selection !== 'pointer' || !eff.head || resolvedParentStateId !== eff.head.stateId) {
+        // Not the pointed head (stale parent, legacy scope, invalid designation): conflict, never a branch (§5.1).
+        const live = liveHeads(db, tenantId, scopeKey);
+        if (live.length === 0) throw new CheckpointEmptyScopeError(`eng4: ${operation} on a scope with no history`);
+        return conflict(live);
+      }
+      // §5.2: the parent state comes from the hash/size-verified canonical payload, never from state_json.
+      const parentRow = db.prepare(`SELECT content_hash FROM eng4_state_snapshots WHERE tenant_id = ? AND state_id = ?`)
+        .get(tenantId, resolvedParentStateId) as { content_hash: string };
+      const parentState = readVerifiedEnvelope(db, tenantId, String(parentRow.content_hash), resolvedParentStateId).state;
+      if (!validWorkingState(parentState)) {
+        throw new CheckpointParentStateError(
+          `eng4: the pointed head ${resolvedParentStateId} carries a state that does not validate as a working state (${new Ajv().errorsText(validWorkingState.errors)}) — send a full write to re-establish one`
+        );
+      }
+      derivedState = operation === 'record' ? parentState : applyMergePatch(parentState, params.statePatch);
+      if (!validWorkingState(derivedState)) {
+        throw new CheckpointPatchError(`eng4: statePatch does not yield a complete valid working state — ${new Ajv().errorsText(validWorkingState.errors)}`);
+      }
+    } else if (operation === 'reconcile' && normalized) {
       const live = liveHeads(db, tenantId, scopeKey);
       if (live.length === 0) {
         throw new CheckpointEmptyScopeError('eng4: reconcile on a scope with no history');
@@ -547,8 +717,10 @@ export function performCheckpoint(
     }
 
     // The hashed envelope: base for a write; base + reconciliation record for
-    // a reconcile (bound by contentHash; the resource is self-contained).
-    const envelope = reconciliation ? { ...baseEnvelope, reconciliation } : baseEnvelope;
+    // a reconcile; base with the DERIVED state for record/patch (all bound by
+    // contentHash; the resource is self-contained).
+    const stateForSnapshot = derivesState ? derivedState : params.state;
+    const envelope = { ...baseEnvelope, state: stateForSnapshot, ...(reconciliation ? { reconciliation } : {}) };
     const payloadBytes = canonicalEnvelopeBytes(envelope);
     const contentHash = envelopeContentHash(envelope);
 
@@ -586,7 +758,7 @@ export function performCheckpoint(
     ).run(
       tenantId, stateId, scopeKey, revision, resolvedParentStateId, contentHash,
       fingerprint, params.idempotencyKey, canonicalAgentId, params.agentId,
-      recordedAt, JSON.stringify(params.state)
+      recordedAt, JSON.stringify(stateForSnapshot)
     );
 
     if (reconciliation) {
@@ -644,5 +816,7 @@ export function performCheckpoint(
     };
   });
 
-  return run();
+  // The whole call shares one verification memo (H5): payloads are hashed and
+  // parsed once per checkpoint, never cached across calls.
+  return runWithEnvelopeMemo(run);
 }
