@@ -154,19 +154,19 @@ export const RESUME_INPUT_SCHEMA = {
     agentId: { type: 'string', minLength: 1, maxLength: 100, pattern: AGENT_ID_PATTERN, description: 'Exact opaque caller identity (platform max 100). With per-agent proof the server injects and authorizes the authenticated principal; observe-mode legacy calls may assert it explicitly. Case and transport-looking suffixes are identity-significant; this principal owns authorship, acks, and views.' },
     scope: SCOPE_SCHEMA,
     budget: { type: 'integer', minimum: 256, description: 'Hard total token budget for the bundle.' },
-    resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts. 3 (INTERNAL, not final until the ENG-4 H-series completes): schemaVersion=3 — v2 plus fixed-size head-selection fields on asOf (selection, pointer, liveHeadCount, divergentHeadCount, retiredHeadCount) and the budgeted `heads` section listing every live head.' },
+    resultVersion: { type: 'integer', enum: [1, 2, 3], description: 'Bundle-shape opt-in. Omit or 1: the frozen schemaVersion=1 bundle. 2: schemaVersion=2 — the same bundle plus `capsule`: the scope entity\'s rehydration capsule selected BY KIND (newest unsuperseded observation with metadata.kind=capsule, never displaced by unrelated newer appends), with other unsuperseded capsules listed as conflicts. 3 (INTERNAL, not final until the ENG-4 H-series completes): schemaVersion=3 — v2 plus fixed-size head-selection fields on asOf (selection, pointer, liveHeadCount, divergentHeadCount, retiredHeadCount), the budgeted `heads` section, currentFacts/openLoops selected from verified versions on the ACCEPTED lineage (each item carries provenance; ids without a proven accepted version are suppressed with omittedReason unversioned/undesignated), `divergentValues` (materialized terminal values off the accepted lineage) and `legacyValues` (non-authoritative in-place rows, last).' },
     sections: {
       type: 'array',
-      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule', 'heads'], description: 'Section filter. `capsule` is meaningful only with resultVersion>=2. `heads` is an H-series section and REQUIRES an explicit resultVersion:3 — a v1/v2 request naming it fails validation.' },
+      items: { enum: ['working', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'capsule', 'heads', 'divergentValues', 'legacyValues'], description: 'Section filter. `capsule` is meaningful only with resultVersion>=2. `heads`, `divergentValues` and `legacyValues` are H-series sections and REQUIRE an explicit resultVersion:3 — a v1/v2 request naming them fails validation.' },
     },
     cursor: { type: 'string' },
   },
   // Frozen v1/v2 request surface (design 3429000 §2.2; codex-hythe review
-  // 186e1f91 MEDIUM 2): the H-series section `heads` is accepted ONLY on an
-  // explicit resultVersion:3 request — never inert on v1/v2.
+  // 186e1f91 MEDIUM 2): H-series sections are accepted ONLY on an explicit
+  // resultVersion:3 request — never inert on v1/v2.
   allOf: [
     {
-      if: { required: ['sections'], properties: { sections: { contains: { const: 'heads' } } } },
+      if: { required: ['sections'], properties: { sections: { contains: { enum: ['heads', 'divergentValues', 'legacyValues'] } } } },
       then: { required: ['resultVersion'], properties: { resultVersion: { const: 3 } } },
     },
   ],
@@ -448,24 +448,148 @@ const SCOPE_POINTER = {
 } as const;
 
 /**
+ * v3 coverage (H4, §6.4/§6.5): the frozen closedness rules plus two
+ * suppression reasons for currentFacts/openLoops — 'undesignated' (no
+ * accepted lineage) and 'unversioned' (no proven accepted version). Both
+ * mean contentComplete=false with nextCursor=null and legacyValues as the
+ * explicit alternate path. The v1/v2 SECTION_COVERAGE object is untouched.
+ */
+const SECTION_COVERAGE_V3 = {
+  ...SECTION_COVERAGE,
+  required: [...SECTION_COVERAGE.required, 'suppressedCount'],
+  properties: {
+    ...SECTION_COVERAGE.properties,
+    omittedReason: { enum: ['budget', 'cursor', 'not-requested', 'none', 'undesignated', 'unversioned'] },
+    suppressedCount: { type: 'integer', minimum: 0, maximum: { $data: '1/totalCount' } },
+  },
+  allOf: [
+    SECTION_COVERAGE.allOf[0],
+    {
+      if: { properties: { contentComplete: { const: false } } },
+      then: { properties: { omittedReason: { enum: ['budget', 'cursor', 'not-requested', 'undesignated', 'unversioned'] } } },
+    },
+    {
+      if: { properties: { omittedReason: { enum: ['undesignated', 'unversioned'] } } },
+      then: { properties: { nextCursor: { type: 'null' } } },
+    },
+  ],
+} as const;
+
+/** Provenance of a v3 accepted item (H4): the writing snapshot, its revision and change ordinal. */
+const PROVENANCE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['stateId', 'revision', 'ordinal', 'outsideAcceptedLineage'],
+  properties: {
+    stateId: { type: 'string', minLength: 1 },
+    revision: { type: 'integer', minimum: 0 },
+    ordinal: { type: 'integer', minimum: 0 },
+    outsideAcceptedLineage: { type: 'boolean' },
+  },
+} as const;
+
+const CURRENT_FACT_V3 = {
+  ...RESUME_OUTPUT_SCHEMA_V1.properties.currentFacts.items,
+  required: [...RESUME_OUTPUT_SCHEMA_V1.properties.currentFacts.items.required, 'provenance'],
+  properties: { ...RESUME_OUTPUT_SCHEMA_V1.properties.currentFacts.items.properties, provenance: PROVENANCE },
+} as const;
+const OPEN_LOOP_V3 = {
+  ...RESUME_OUTPUT_SCHEMA_V1.properties.openLoops.items,
+  required: [...RESUME_OUTPUT_SCHEMA_V1.properties.openLoops.items.required, 'provenance'],
+  properties: { ...RESUME_OUTPUT_SCHEMA_V1.properties.openLoops.items.properties, provenance: PROVENANCE },
+} as const;
+
+/** A divergent terminal value (H4 §6.3): a materialized version off the accepted lineage. */
+const DIVERGENT_VALUE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'id', 'lineageHead', 'stateId', 'revision', 'ordinal', 'value', 'isV1CurrentValue', 'resolved', 'opaque'],
+  properties: {
+    kind: { enum: ['fact', 'loop'] },
+    id: { type: 'string', minLength: 1 },
+    lineageHead: { type: 'string', minLength: 1 },
+    stateId: { type: 'string', minLength: 1 },
+    revision: { type: 'integer', minimum: 0 },
+    ordinal: { type: 'integer', minimum: 0 },
+    opaque: { type: 'boolean' },
+    value: {
+      oneOf: [
+        { type: 'null' },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['assertion', 'status', 'evidenceRefs', 'sourceRefs', 'contradicts', 'author', 'recordedAt'],
+          properties: {
+            assertion: FACT_ASSERTION, status: FACT_STATUS, effectiveAt: { type: 'string' },
+            evidenceRefs: { type: 'array', items: { type: 'string' } }, sourceRefs: { type: 'array', items: { type: 'string' } },
+            contradicts: { type: 'array', items: { type: 'string' } }, author: { type: 'string' }, recordedAt: { type: 'string' },
+          },
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['owner', 'status', 'nextAction', 'author', 'recordedAt'],
+          properties: {
+            owner: { type: 'string' }, status: { enum: ['open', 'blocked', 'closed'] }, nextAction: { type: 'string' },
+            dueAt: { type: 'string' }, blockedOn: { type: 'string' },
+            closeEvent: RESUME_OUTPUT_SCHEMA_V1.properties.openLoops.items.properties.closeEvent,
+            author: { type: 'string' }, recordedAt: { type: 'string' },
+          },
+        },
+      ],
+    },
+    isV1CurrentValue: { type: 'boolean' },
+    resolved: { type: 'boolean' },
+  },
+  // Exact objects: an opaque terminal has value null (and can never be the v1
+  // value); a materialized one has a value object.
+  allOf: [
+    { if: { properties: { opaque: { const: true } } }, then: { properties: { value: { type: 'null' }, isV1CurrentValue: { const: false } } } },
+    { if: { properties: { opaque: { const: false } } }, then: { properties: { value: { type: 'object' } } } },
+  ],
+} as const;
+
+/** A non-authoritative in-place row (H4 §6.4/§6.5): provenance null, accepted false, always. */
+const LEGACY_VALUE = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'id', 'value', 'provenance', 'accepted'],
+  properties: {
+    kind: { enum: ['fact', 'loop'] },
+    id: { type: 'string', minLength: 1 },
+    value: { oneOf: [RESUME_OUTPUT_SCHEMA_V1.properties.currentFacts.items, RESUME_OUTPUT_SCHEMA_V1.properties.openLoops.items] },
+    provenance: { type: 'null' },
+    accepted: { const: false },
+  },
+} as const;
+
+/**
  * schemaVersion=3 bundle (request resultVersion=3) — ENG-4 H-series,
  * INTERNAL increment (design 3429000 §2.10: the exact v3 schema is not final
  * until H5; H1–H4 merge as internal increments, v3 is published once).
  * H1: v2 + fixed-size head-selection fields on asOf + the budgeted `heads`
  * section (every live head; ordered right after capsule). `asOf.conflicts`
  * keeps its frozen v1 meaning.
+ * H4: currentFacts/openLoops are the ACCEPTED-LINEAGE selection (items carry
+ * provenance; suppressed ids are accounted with omittedReason
+ * 'undesignated'/'unversioned'); `divergentValues` and `legacyValues` are
+ * budgeted sections at the end of the order (legacyValues last, §9.3).
  */
 export const RESUME_OUTPUT_SCHEMA_V3 = {
   ...RESUME_OUTPUT_SCHEMA_V2,
-  required: [...RESUME_OUTPUT_SCHEMA_V2.required, 'heads'],
+  required: [...RESUME_OUTPUT_SCHEMA_V2.required, 'heads', 'divergentValues', 'legacyValues'],
   properties: {
     ...RESUME_OUTPUT_SCHEMA_V2.properties,
     schemaVersion: { const: 3 },
+    currentFacts: { type: 'array', items: CURRENT_FACT_V3 },
+    openLoops: { type: 'array', items: OPEN_LOOP_V3 },
+    divergentValues: { type: 'array', items: DIVERGENT_VALUE },
+    legacyValues: { type: 'array', items: LEGACY_VALUE },
     asOf: {
       ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf,
       required: [
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.required,
-        'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount',
+        'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount', 'opaqueDivergentCount',
       ],
       properties: {
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.properties,
@@ -474,13 +598,21 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
         liveHeadCount: { type: 'integer', minimum: 0 },
         divergentHeadCount: { type: 'integer', minimum: 0 },
         retiredHeadCount: { type: 'integer', minimum: 0 },
+        opaqueDivergentCount: { type: 'integer', minimum: 0 },
       },
     },
     heads: { type: 'array', items: HEAD_ITEM },
     coverage: {
       ...RESUME_OUTPUT_SCHEMA_V2.properties.coverage,
-      required: [...RESUME_OUTPUT_SCHEMA_V2.properties.coverage.required, 'heads'],
-      properties: { ...RESUME_OUTPUT_SCHEMA_V2.properties.coverage.properties, heads: SECTION_COVERAGE },
+      required: [...RESUME_OUTPUT_SCHEMA_V2.properties.coverage.required, 'heads', 'divergentValues', 'legacyValues'],
+      properties: {
+        ...RESUME_OUTPUT_SCHEMA_V2.properties.coverage.properties,
+        currentFacts: SECTION_COVERAGE_V3,
+        openLoops: SECTION_COVERAGE_V3,
+        heads: SECTION_COVERAGE,
+        divergentValues: SECTION_COVERAGE,
+        legacyValues: SECTION_COVERAGE,
+      },
     },
   },
 } as const;

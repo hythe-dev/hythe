@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- ENG-4 H4 (design §6.3–§6.5, internal increment of `resultVersion: 3`): the v3
+  read model. `resume` `resultVersion: 3` now selects `currentFacts`/`openLoops`
+  ONLY from verified materialized versions on the accepted lineage (newest per
+  id by revision/ordinal within the lineage; every item carries `provenance`),
+  suppresses ids without a proven accepted version (accounted as
+  `omittedReason: 'unversioned'`, or `'undesignated'` for a scope without an
+  accepted lineage) into the non-authoritative `legacyValues` section, and lists
+  every materialized divergent terminal value in `divergentValues` with its
+  lineage head, provenance, `isV1CurrentValue` and `resolved` flag. A loop close
+  written off the lineage leaves the loop open in v3. Before selection, v3
+  resume verifies the version foundation and every reconcile's rows in both
+  directions (retirement attribution and payload-recorded retirements/merge
+  inputs scope-wide) and fails closed. v1/v2 bundles are unchanged. Also: the
+  divergence-resolution key now includes the resolving snapshot, and retirement
+  rows bind actor/time/reason to their reconcile.
 - ENG-4 H3 (design §4, §6.3, internal increment of `resultVersion: 3`): checkpoint
   gains `operation: 'reconcile'` — names the exact live-head set and the pointer
   (both compare-and-set; a mismatch is `conflict` carrying heads and pointer),

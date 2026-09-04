@@ -277,9 +277,23 @@ export interface SectionCoverage {
   includedCount: number;
   totalCount: number;
   contentComplete: boolean;
-  omittedReason: 'budget' | 'cursor' | 'not-requested' | 'none';
+  /**
+   * 'undesignated' / 'unversioned' are schemaVersion=3 ONLY (H4, §6.4/§6.5):
+   * currentFacts/openLoops ids suppressed because the scope has no accepted
+   * lineage, or because the id's newest accepted-lineage change has no
+   * proven version. totalCount includes them; legacyValues is the explicit
+   * alternate retrieval path; nextCursor is null.
+   */
+  omittedReason: 'budget' | 'cursor' | 'not-requested' | 'none' | 'undesignated' | 'unversioned';
   nextCursor: string | null;
   tokenEstimate: number;
+  /**
+   * schemaVersion=3 ONLY, currentFacts/openLoops: how many of totalCount are
+   * SUPPRESSED ids (never delivered on any page; see legacyValues). Fixed
+   * size, so the count is visible on every page regardless of budget/cursor
+   * (independent review of PR #14, finding 2).
+   */
+  suppressedCount?: number;
 }
 
 export type ResumeSectionName =
@@ -293,10 +307,14 @@ export type ResumeSectionName =
   /** schemaVersion>=2 ONLY: the budgeted capsule section (item 0 = current, rest = conflicts). */
   | 'capsule'
   /** schemaVersion=3 ONLY (H1): every live head, budgeted, ordered right after capsule. */
-  | 'heads';
+  | 'heads'
+  /** schemaVersion=3 ONLY (H4): materialized divergent terminal values off the accepted lineage. */
+  | 'divergentValues'
+  /** schemaVersion=3 ONLY (H4): non-authoritative in-place rows (undesignated scope or unversioned id); LAST in order (§9.3). */
+  | 'legacyValues';
 
 /** The seven frozen v1 sections. */
-export type ResumeSectionNameV1 = Exclude<ResumeSectionName, 'capsule' | 'heads'>;
+export type ResumeSectionNameV1 = Exclude<ResumeSectionName, 'capsule' | 'heads' | 'divergentValues' | 'legacyValues'>;
 
 // ---------------------------------------------------------------------------
 // resume (primitive 1 of exactly 2)
@@ -365,8 +383,10 @@ export interface AsOfHeader {
   liveHeadCount?: number;
   /** Live heads other than the effective current head. */
   divergentHeadCount?: number;
-  /** Always 0 until H3 introduces retirements. */
+  /** Retired snapshots in the scope (H3). */
   retiredHeadCount?: number;
+  /** H4: UNRESOLVED divergent terminals with no truthful value (unversioned) — rejections a reconcile still owes; they are also listed in divergentValues with value null. */
+  opaqueDivergentCount?: number;
 }
 
 export type HeadSelection = 'empty-scope' | 'max-revision' | 'pointer' | 'invalid-designation';
@@ -449,6 +469,10 @@ export interface ResumeBundle {
   capsule?: ResumeCapsule;
   /** Present ONLY on schemaVersion=3: every live head, budgeted (H1). */
   heads?: HeadItem[];
+  /** Present ONLY on schemaVersion=3 (H4): materialized divergent terminals off the accepted lineage. */
+  divergentValues?: unknown[];
+  /** Present ONLY on schemaVersion=3 (H4): non-authoritative in-place rows; last section. */
+  legacyValues?: unknown[];
   working: WorkingState | null;
   openLoops: OpenLoop[];
   messages: InboxItem[];
@@ -460,6 +484,8 @@ export interface ResumeBundle {
   coverage: Record<ResumeSectionNameV1, SectionCoverage> & {
     capsule?: SectionCoverage;
     heads?: SectionCoverage;
+    divergentValues?: SectionCoverage;
+    legacyValues?: SectionCoverage;
     totalTokenEstimate: number;
     budget: number;
   };

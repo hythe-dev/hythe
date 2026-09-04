@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **ACCEPTED v5.1** — reviewed by Tomas and merged to main as 3429000 (PR #10, 2026-09-03). Implementation proceeds per §7, one gated PR per step: **H1 merged** as e678479 (PR #11, codex LGTM ee5d9f89; `heads.ts`); **H2 merged** as 16a1eee (PR #12, independent fresh-context review; `versions.ts`); **H3 in progress** (branch `feat/eng4-h3-reconcile`; `src/unified-server/eng4/reconcile.ts`, `tests/contract-eng4-h3-reconcile.test.ts`). Prior draft history: v5.1 was codex-hythe's takeover revision incorporating review 12281537 while claude-hythe was temporarily disabled. §2.10 is **RULED**: the H-series is `resultVersion: 3` (Tomas, 2026-09-03). |
+| Status | **ACCEPTED v5.1** — reviewed by Tomas and merged to main as 3429000 (PR #10, 2026-09-03). Implementation proceeds per §7, one gated PR per step: **H1 merged** as e678479 (PR #11, codex LGTM ee5d9f89; `heads.ts`); **H2 merged** as 16a1eee (PR #12, independent fresh-context review; `versions.ts`); **H3 merged** as 8a8da05 (PR #13, codex-hythe review 0952b074 + two independent reviews; `reconcile.ts`); **H4 in progress** (branch `feat/eng4-h4-read-model`; `src/unified-server/eng4/selection.ts`, `tests/contract-eng4-h4-read-model.test.ts`). Implementation amendments from H3 review are recorded inline below, marked *[H3 impl]*. Prior draft history: v5.1 was codex-hythe's takeover revision incorporating review 12281537 while claude-hythe was temporarily disabled. §2.10 is **RULED**: the H-series is `resultVersion: 3` (Tomas, 2026-09-03). |
 | Author | claude-hythe through v5; codex-hythe takeover revision v5.1, 2026-09-03 |
 | Provenance | Field report cc554c26 (claude-desktop-ws01) items 1–3 and 6; codex-hythe adversarial review b8456917 findings 1–3 and Q1–Q3; data audit 1e5d0dc6 HIGH 1; PR #8 reviews 5e486718 / 882d39c7; PR #9 reviews b2641137 / 99735a88 Q4; design review aad3973c findings 1–8 and Q1–Q9; design re-review 19826044 findings 1–4, precision items, and Q1–Q4; design re-review 89c01374 blockers 1–4 and open-question rulings; design re-review 12281537 issues 1–4 and §9 answers |
 | Gates | Nothing in this note is authorized to ship. Each section ends with the PR it would become; every PR needs its own review. No Pavilion action is implied. |
@@ -175,6 +175,7 @@ The head list itself becomes a **budgeted v3 section** `heads` (aad3973c finding
   "strict": true,                          // default true (§6.3); false is the audited escape hatch
   "resolutions": [ { "kind": "fact"|"loop", "id": "...", "divergentStateId": "...", "decision": "accept"|"reject", "acceptedOrdinal": 0 /* accept only */ } ],
   "rejectLineages": ["<divergent head stateId>", ...],   // optional shorthand: expands server-side to per-value rejects (§6.3)
+  "acknowledgeRetired": true,              // *[H3 impl]* REQUIRED when the survivor's own chain contains retired snapshots (a resurrection): the re-adopted snapshots are recorded as `adoptedRetired`
   "state": {...},                          // full v1 working state — the reconciled truth
   // factChanges / loopChanges / events / evidenceRefs as in write (every accept MUST name its matching re-asserting change)
 }
@@ -219,6 +220,8 @@ CREATE TABLE IF NOT EXISTS eng4_head_retirements (
 
 On idempotent replay of a reconcile, the server re-reads `eng4_snapshot_merge_inputs`, `eng4_head_retirements` and `eng4_divergence_resolutions` for the snapshot and verifies **exact parity** with the `reconciliation` record in the hash-verified payload: same input set, same retired set, same resolution set (including the deterministic expansion of `rejectLineages`), `snapshot.parent_state_id == payload.survivor`, every retirement's `retired_by_state_id == this snapshot`, and the pointer row (if still pointing here) consistent.
 
+*[H3 impl]* Retirement evidence is verified BIDIRECTIONALLY and scope-wide on every v3 `resume` and before every reconcile: each retirement row's attributed snapshot payload must record retiring it (row → payload), and each reconcile payload must have exactly its retirement and merge-input rows (payload → row); each row's `retired_by`/`retired_at`/`reason` must equal the reconcile's author/recorded_at and recorded reason. A reconcile also verifies its OWN parity inside the transaction before committing.
+
 **Resolution rows are also verified on every ordinary v3 `resume`** (12281537 issue 2): the server derives the expected resolution set from every hash-verified reconciliation payload on the current accepted lineage, compares it bidirectionally by cardinality, keys, decision and accepted ordinal to the table rows for those snapshots, and then validates every `accept` against the referenced digest-verified change-ledger row and canonical payload value. A row counts only if its `resolved_by_state_id` is on the current accepted lineage. Missing, extra, or altered rows are corruption → `CheckpointIntegrityError`; a direct `INSERT` of a well-formed same-scope row can therefore never mark a value resolved because no immutable payload vouches for it. This is the same fail-closed shape PR #8 uses for the change ledger.
 
 ### 4.4 `liveHeads()` after H3
@@ -231,7 +234,7 @@ Extending a retired parent with `operation: write` stays legal under the frozen 
 
 ### 4.6 Result (v3)
 
-`written` + `changes` (PR #8) + `reconciled: { survivor, retired: [sorted], pointer, resolutions: [...], unresolvedDivergent: { facts, loops } }` (the counts are zero under `strict: true` by construction). Replay returns the same block after the §4.3 parity check.
+`written` + `changes` (PR #8) + `reconciled: { survivor, retired: [sorted], pointer, resolutions: [...], adoptedRetired: [sorted] /* [H3 impl] */, unresolvedDivergent: { facts, loops } }` (the counts are zero under `strict: true` by construction). Replay returns the same block after the §4.3 parity check.
 
 ### 4.7 Rejected alternatives
 
@@ -348,7 +351,7 @@ An H2-backfilled terminal tuple whose coverage is `unversioned` is an **opaque t
 
 **Resolution is causal, never revision-relative** (89c01374 blocker 2). A divergent terminal change is *resolved* iff a **verified** (§4.3) `eng4_divergence_resolutions` row exists for `(kind, id, divergentStateId = that terminal change's state_id)` written by a reconcile snapshot on the accepted lineage. Revision numbers play no part: survivor S holding *good@12* while non-survivor R holds *bad@11* leaves *bad* **unresolved** — it is a terminal value on a divergent lineage with no resolution row (the counterexample test).
 
-**`accept` is bound to a matching change in the same request** (12281537 issue 2). An `accept` resolution is valid only if the reconcile's own `factChanges`/`loopChanges` contain, at a stated ordinal, a change for that id whose canonical value (RFC 8785 over the fields the version stores) **equals** the divergent terminal value; the resolution row records `accepted_ordinal`, and the reconciliation payload binds `(kind, id, divergentStateId, decision, acceptedOrdinal)`. An `accept` without such a change is a typed error and nothing is written — strict can never pass with an accept while the accepted lineage still holds the old value. A `reject` needs no change (the accepted value or absence stands) but is payload-bound the same way. **`rejectLineages`** (Q4) is a shorthand limited to exact live-or-retired divergent head ids named in the request: it expands deterministically, inside the CAS transaction, to per-terminal-value rejects, sorted, and the expansion is written into the payload; the raw sorted shorthand is what the fingerprint binds so replay can locate the snapshot before recomputation, after which payload/row expansion parity is verified. Overlapping or contradictory explicit resolutions are rejected.
+**`accept` is bound to a matching change in the same request** (12281537 issue 2). *[H3 impl]* The accepted change must be the FINAL change for that id in the request (an amendment is `reject` + a fresh change, §9.2); a loop's comparable value excludes the server-owned close timestamps; `rejectLineages` expands by chain membership, so on a shared prefix rejecting one lineage also rejects the shared snapshot's terminals (two lineages agreeing on a terminal is not a conflict; overlap with an explicit resolution is). An `accept` resolution is valid only if the reconcile's own `factChanges`/`loopChanges` contain, at a stated ordinal, a change for that id whose canonical value (RFC 8785 over the fields the version stores) **equals** the divergent terminal value; the resolution row records `accepted_ordinal`, and the reconciliation payload binds `(kind, id, divergentStateId, decision, acceptedOrdinal)`. An `accept` without such a change is a typed error and nothing is written — strict can never pass with an accept while the accepted lineage still holds the old value. A `reject` needs no change (the accepted value or absence stands) but is payload-bound the same way. **`rejectLineages`** (Q4) is a shorthand limited to exact live-or-retired divergent head ids named in the request: it expands deterministically, inside the CAS transaction, to per-terminal-value rejects, sorted, and the expansion is written into the payload; the raw sorted shorthand is what the fingerprint binds so replay can locate the snapshot before recomputation, after which payload/row expansion parity is verified. Overlapping or contradictory explicit resolutions are rejected.
 
 ```sql
 CREATE TABLE IF NOT EXISTS eng4_divergence_resolutions (
@@ -360,7 +363,7 @@ CREATE TABLE IF NOT EXISTS eng4_divergence_resolutions (
   accepted_ordinal INTEGER,                 -- NOT NULL iff decision='accept': the reconcile's own change that re-asserts the value
   CHECK ((decision = 'accept' AND accepted_ordinal IS NOT NULL) OR
          (decision = 'reject' AND accepted_ordinal IS NULL)),
-  PRIMARY KEY (tenant_id, scope_key, kind, change_id, divergent_state_id),
+  PRIMARY KEY (tenant_id, scope_key, kind, change_id, divergent_state_id, resolved_by_state_id),  -- [H3 impl] the resolver is part of the key: a resolution counts only while its resolver is on the accepted lineage, so the same terminal may be resolved again after a survivor switch
   FOREIGN KEY (tenant_id, scope_key, divergent_state_id)   REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
   FOREIGN KEY (tenant_id, scope_key, resolved_by_state_id) REFERENCES eng4_state_snapshots(tenant_id, scope_key, state_id),
   FOREIGN KEY (tenant_id, resolved_by_state_id, kind, accepted_ordinal)

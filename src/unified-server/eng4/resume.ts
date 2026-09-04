@@ -53,7 +53,9 @@ import type {
   WorkingState,
 } from './contracts.js';
 import { effectiveCurrentHead, liveHeadDetails, retiredHeadCount } from './heads.js';
-import { verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
+import { verifyReconcileRowsScopeWide, verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
+import { selectV3Values, type V3Selection } from './selection.js';
+import { verifyVersionParity } from './versions.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
 import { resolveScope, type EntityDirectory } from './resolver.js';
 
@@ -80,9 +82,14 @@ const SECTION_ORDER: readonly ResumeSectionNameV1[] = [
 const SECTION_ORDER_V2: readonly ResumeSectionName[] = [
   'working', 'capsule', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers',
 ];
-/** schemaVersion=3 order (H1): the live-head list is budgeted right after the capsule (§3.5). */
+/**
+ * schemaVersion=3 order: the live-head list is budgeted right after the
+ * capsule (H1 §3.5); divergentValues then legacyValues close the bundle —
+ * legacyValues is non-authoritative and therefore the first section omitted
+ * under a tight budget (H4, §9.3).
+ */
 const SECTION_ORDER_V3: readonly ResumeSectionName[] = [
-  'working', 'capsule', 'heads', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers',
+  'working', 'capsule', 'heads', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'divergentValues', 'legacyValues',
 ];
 
 /** Deliberately coarse, deterministic estimator (chars/4). */
@@ -140,7 +147,7 @@ export function performResume(
   const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0, complete: true };
   // v3 fixed-size asOf fields for a scope with no storage at all.
   const emptyHeadFields = resultVersion === 3
-    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0 }
+    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0, opaqueDivergentCount: 0 }
     : {};
 
   if (!resolved.scopeKey) {
@@ -149,7 +156,7 @@ export function performResume(
     return {
       schemaVersion: resultVersion,
       ...(resultVersion >= 2 ? { capsule: emptyCapsule } : {}),
-      ...(resultVersion === 3 ? { heads: [] } : {}),
+      ...(resultVersion === 3 ? { heads: [], divergentValues: [], legacyValues: [] } : {}),
       resolvedScope: resolved,
       asOf: { assembledAt, stateId: null, revision: null, stateAgeSec: null, stale: true, conflicts: [], ...emptyHeadFields },
       definition: null,
@@ -161,7 +168,9 @@ export function performResume(
       evidence: [],
       pointers: [],
       coverage: {
-        ...coverageOf(order.map((s) => [s, emptyCoverage('none')])),
+        ...coverageOf(order.map((s) => [s, resultVersion === 3 && (s === 'currentFacts' || s === 'openLoops')
+          ? { ...emptyCoverage('none'), suppressedCount: 0 }
+          : emptyCoverage('none')])),
         totalTokenEstimate: 0,
         budget: params.budget,
       },
@@ -172,11 +181,17 @@ export function performResume(
   // --- Current state: the ONE resolver (H1 §3.3). Pointer when designated;
   // max-revision only for legacy undesignated scopes; null (fail closed) on
   // an invalid designation. Forks surface as conflicts / the heads section.
-  // H3: under v3, retirement rows are trusted only when the reconcile they
-  // are attributed to records them in its hash-verified payload — otherwise
-  // one out-of-band row could hide a live head. Scope-wide, before any head
-  // computation.
-  if (resultVersion === 3) verifyRetirementAttribution(db, tenantId, scopeKey);
+  // H3/H4: under v3 nothing is trusted until the stored evidence checks out,
+  // scope-wide and before any head computation: retirement rows must be
+  // recorded by their attributed reconcile payloads (row → payload) and every
+  // reconcile payload must have its retirement/merge-input rows (payload →
+  // row); the version foundation must be bidirectionally consistent (§6.2,
+  // "before selection"). Any failure fails the whole resume.
+  if (resultVersion === 3) {
+    verifyRetirementAttribution(db, tenantId, scopeKey);
+    verifyReconcileRowsScopeWide(db, tenantId, scopeKey);
+    verifyVersionParity(db, tenantId, scopeKey);
+  }
   const effective = effectiveCurrentHead(db, tenantId, scopeKey);
   const heads = effective.live; // revision-ASC, retired heads excluded (H3 §4.4)
   const current = effective.head;
@@ -304,14 +319,18 @@ export function performResume(
   // currentFacts = non-superseded facts; refs join in; effectiveAt only
   // when recorded — never invented. Dangling contradicts refs surface
   // verbatim as unresolved contradictions (deferred-resolution rule).
-  const factRows = db.prepare(
-    `SELECT * FROM eng4_facts WHERE tenant_id = ? AND scope_key = ? AND status != 'superseded'
+  // All in-place fact rows, superseded included: v1/v2 currentFacts filter
+  // superseded out (frozen rule); the v3 legacy view must be able to expose
+  // EVERY persisted in-place row (codex-hythe review of PR #14, finding 3).
+  const allFactRows = db.prepare(
+    `SELECT * FROM eng4_facts WHERE tenant_id = ? AND scope_key = ?
       ORDER BY recorded_at DESC, fact_id ASC`
   ).all(tenantId, scopeKey) as any[];
+  const factRows = allFactRows.filter((r) => r.status !== 'superseded');
   const refStmt = db.prepare(
     `SELECT ref_kind, ref FROM eng4_fact_refs WHERE tenant_id = ? AND fact_id = ? ORDER BY ref ASC`
   );
-  const currentFacts: CurrentFact[] = factRows.map((r) => {
+  const toCurrentFact = (r: any): CurrentFact => {
     const refs = refStmt.all(tenantId, r.fact_id) as Array<{ ref_kind: string; ref: string }>;
     const pick = (kind: string) => refs.filter((x) => x.ref_kind === kind).map((x) => x.ref);
     const fact: CurrentFact = {
@@ -326,7 +345,9 @@ export function performResume(
     };
     if (r.effective_at) fact.effectiveAt = r.effective_at;
     return fact;
-  });
+  };
+  const currentFacts: CurrentFact[] = factRows.map(toCurrentFact);
+  const allInPlaceFacts: CurrentFact[] = resultVersion === 3 ? allFactRows.map(toCurrentFact) : currentFacts;
 
   // decisions = 'decision' events from the CURRENT head's persisted envelope.
   const decisions: ResumeBundle['decisions'] = [];
@@ -357,6 +378,12 @@ export function performResume(
     }
   }
 
+  // --- H4 v3 read model: accepted-lineage selection from verified versions.
+  // The in-place lists above stay the frozen v1/v2 view and feed legacyValues.
+  const selection: V3Selection | null = resultVersion === 3
+    ? selectV3Values(db, tenantId, scopeKey, effective.selection === 'pointer' && current ? current.stateId : null, allInPlaceFacts, openLoops)
+    : null;
+
   const pointers: ResumeBundle['pointers'] = [];
   if (resolved.projectId) pointers.push({ label: 'project', entity: resolved.projectId, relation: 'scoped-to' });
   if (resolved.taskId) pointers.push({ label: 'task', entity: resolved.taskId, relation: 'scoped-to' });
@@ -368,8 +395,18 @@ export function performResume(
     working: working ? [working] : [],
     capsule: capsuleSelection.capsules,
     heads: headItems,
-    openLoops, messages, currentFacts, decisions, evidence, pointers,
+    openLoops: selection ? selection.openLoops : openLoops,
+    messages,
+    currentFacts: selection ? selection.currentFacts : currentFacts,
+    decisions, evidence, pointers,
+    divergentValues: selection ? selection.divergentValues : [],
+    legacyValues: selection ? selection.legacyValues : [],
   };
+  // v3 suppression accounting (§6.4/§6.5): suppressed ids count toward
+  // totalCount, are never delivered, and carry no cursor.
+  const suppressed: Partial<Record<ResumeSectionName, number>> = selection
+    ? { currentFacts: selection.suppressedFacts, openLoops: selection.suppressedLoops }
+    : {};
 
   const coverageEntries: Array<[ResumeSectionName, SectionCoverage]> = [];
   const included: Partial<Record<ResumeSectionName, unknown[]>> = {};
@@ -384,23 +421,27 @@ export function performResume(
   for (const section of order) {
     const items = sectionItems[section];
     if (beforeCursor && section === cursor!.s) beforeCursor = false;
+    const hiddenHere = suppressed[section] ?? 0;
+    // v3 currentFacts/openLoops always carry the fixed-size suppressedCount.
+    const sup = selection && (section === 'currentFacts' || section === 'openLoops') ? { suppressedCount: hiddenHere } : {};
     if (!requested.has(section)) {
       included[section] = [];
-      coverageEntries.push([section, { ...emptyCoverage('not-requested', items.length), contentComplete: false }]);
+      coverageEntries.push([section, { ...emptyCoverage('not-requested', items.length + hiddenHere), contentComplete: false, ...sup }]);
       continue;
     }
     if (beforeCursor) {
       // Delivered on an earlier page — accounted, not repeated.
       included[section] = [];
-      coverageEntries.push([section, { ...emptyCoverage('cursor', items.length), contentComplete: false }]);
+      coverageEntries.push([section, { ...emptyCoverage('cursor', items.length + hiddenHere), contentComplete: false, ...sup }]);
       continue;
     }
     if (truncated) {
       included[section] = [];
       coverageEntries.push([section, {
-        ...emptyCoverage('budget', items.length),
-        contentComplete: items.length === 0,
-        omittedReason: items.length === 0 ? 'none' : 'budget',
+        ...emptyCoverage('budget', items.length + hiddenHere),
+        contentComplete: items.length === 0 && hiddenHere === 0,
+        omittedReason: items.length === 0 ? (hiddenHere === 0 ? 'none' : (selection as V3Selection).suppressedReason) : 'budget',
+        ...sup,
       }]);
       continue;
     }
@@ -421,16 +462,21 @@ export function performResume(
     }
     included[section] = taken;
     const includedCount = taken.length;
+    const hidden = suppressed[section] ?? 0;
     const complete = startOffset === 0 && includedCount === items.length;
+    const delivered = complete || startOffset + includedCount >= items.length;
+    // Once every deliverable item has been delivered (this page or a cursor
+    // page), the only thing still missing is the suppressed set — say so.
     coverageEntries.push([section, {
       includedCount,
-      totalCount: items.length,
-      contentComplete: complete,
-      omittedReason: complete ? 'none' : (startOffset > 0 && includedCount + startOffset >= items.length ? 'cursor' : 'budget'),
-      nextCursor: complete || startOffset + includedCount >= items.length
-        ? null
-        : encodeCursor({ s: section, o: startOffset + includedCount }),
+      totalCount: items.length + hidden,
+      contentComplete: complete && hidden === 0,
+      omittedReason: delivered
+        ? (hidden > 0 ? (selection as V3Selection).suppressedReason : (complete ? 'none' : 'cursor'))
+        : 'budget',
+      nextCursor: delivered ? null : encodeCursor({ s: section, o: startOffset + includedCount }),
       tokenEstimate: sectionTokens,
+      ...sup,
     }]);
   }
 
@@ -457,13 +503,16 @@ export function performResume(
         liveHeadCount: heads.length,
         divergentHeadCount: heads.length - (current ? 1 : 0),
         retiredHeadCount: retiredHeadCount(db, tenantId, scopeKey),
+        opaqueDivergentCount: selection ? selection.opaqueDivergentCount : 0,
       }
     : {};
 
   return {
     schemaVersion: resultVersion,
     ...(capsule ? { capsule } : {}),
-    ...(resultVersion === 3 ? { heads: (included.heads ?? []) as HeadItem[] } : {}),
+    ...(resultVersion === 3
+      ? { heads: (included.heads ?? []) as HeadItem[], divergentValues: included.divergentValues ?? [], legacyValues: included.legacyValues ?? [] }
+      : {}),
     resolvedScope: resolved,
     asOf: {
       assembledAt,

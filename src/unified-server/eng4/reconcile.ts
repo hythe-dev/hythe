@@ -199,7 +199,7 @@ export function readReconciliation(db: DatabaseType.Database, tenantId: string, 
 }
 
 /** Every resolution recorded by reconcile snapshots ON the given lineage, keyed. */
-function verifiedResolutionKeys(db: DatabaseType.Database, tenantId: string, lineage: SnapRow[]): Set<string> {
+export function verifiedResolutionKeys(db: DatabaseType.Database, tenantId: string, lineage: SnapRow[]): Set<string> {
   const keys = new Set<string>();
   for (const s of lineage) {
     const rec = readReconciliation(db, tenantId, s.content_hash);
@@ -213,7 +213,7 @@ function verifiedResolutionKeys(db: DatabaseType.Database, tenantId: string, lin
 // Terminals
 // ---------------------------------------------------------------------------
 
-interface Terminal {
+export interface Terminal {
   kind: 'fact' | 'loop';
   id: string;
   stateId: string;
@@ -223,6 +223,39 @@ interface Terminal {
   comparable: string | null;
   /** Which divergent head(s) this terminal belongs to. */
   heads: Set<string>;
+}
+
+/** Sorted resolution-key string for a terminal (the same key the payload records use). */
+export const terminalKey = (t: { kind: string; id: string; stateId: string }) => resolutionKey({ kind: t.kind, id: t.id, divergentStateId: t.stateId });
+
+/**
+ * H4 read-model entry point: every divergent terminal relative to the given
+ * accepted head — the chains of every live head other than `acceptedHead`
+ * and of every retired snapshot not on its lineage, from their fork points —
+ * plus the verified resolution keys on that lineage. Shares the exact
+ * enumeration a reconcile uses: the materialized terminals resume lists and
+ * the opaque ones it counts are together what a reconcile would demand a
+ * resolution for.
+ */
+export function divergentTerminalsFor(
+  db: DatabaseType.Database,
+  tenantId: string,
+  scopeKey: string,
+  acceptedHead: string
+): { terminals: Map<string, Terminal>; chains: Map<string, Set<string>>; resolvedKeys: Set<string>; accepted: Set<string> } {
+  const acceptedRows = lineageOf(db, tenantId, scopeKey, acceptedHead);
+  const accepted = new Set(acceptedRows.map((s) => s.state_id));
+  const resolvedKeys = verifiedResolutionKeys(db, tenantId, acceptedRows);
+  const live = (db.prepare(
+    `SELECT s.state_id FROM eng4_state_snapshots s
+      WHERE s.tenant_id = ? AND s.scope_key = ? AND s.state_id != ?
+        AND NOT EXISTS (SELECT 1 FROM eng4_state_snapshots c WHERE c.tenant_id = s.tenant_id AND c.scope_key = s.scope_key AND c.parent_state_id = s.state_id)
+        AND NOT EXISTS (SELECT 1 FROM eng4_head_retirements r WHERE r.tenant_id = s.tenant_id AND r.scope_key = s.scope_key AND r.state_id = s.state_id)`
+  ).all(tenantId, scopeKey, acceptedHead) as Array<{ state_id: string }>).map((r) => String(r.state_id));
+  const retired = retiredHeads(db, tenantId, scopeKey).filter((h) => !accepted.has(h));
+  const heads = [...new Set([...live, ...retired])].sort();
+  const { terminals, chains } = terminalsFor(db, tenantId, scopeKey, heads, accepted);
+  return { terminals, chains, resolvedKeys, accepted };
 }
 
 /** The comparable value of a version (RFC 8785 over the fields the version stores; loop close timestamps excluded). */
@@ -376,6 +409,7 @@ export function evaluateDivergence(
   // row's attribution, and every prior reconcile on the survivor's lineage.
   verifyVersionParity(db, tenantId, scopeKey);
   verifyRetirementAttribution(db, tenantId, scopeKey);
+  verifyReconcileRowsScopeWide(db, tenantId, scopeKey);
   verifyResolutionRowsOnLineage(db, tenantId, scopeKey, req.survivor);
 
   const acceptedRows = lineageOf(db, tenantId, scopeKey, req.survivor);
@@ -630,6 +664,42 @@ function comparableAtNewest(db: DatabaseType.Database, tenantId: string, scopeKe
     .get(tenantId, stateId, kind, id) as { o: number | null };
   if (row.o === null) return null;
   return comparableAt(db, tenantId, scopeKey, kind, id, stateId, Number(row.o));
+}
+
+/**
+ * Payload → row direction for EVERY reconcile in the scope, on or off the
+ * accepted lineage (independent re-review of PR #13, LOW 1): each recorded
+ * retired id must have exactly its retirement row attributed to that
+ * snapshot, and the merge-input set must equal the recorded retired set.
+ * Together with verifyRetirementAttribution (row → payload) this makes
+ * retirement evidence bidirectional scope-wide, so a deleted retirement row
+ * cannot quietly bring a retired head back to life.
+ */
+export function verifyReconcileRowsScopeWide(db: DatabaseType.Database, tenantId: string, scopeKey: string): { reconcilesVerified: number } {
+  let n = 0;
+  const rows = db.prepare(
+    `SELECT state_id, content_hash, author, recorded_at FROM eng4_state_snapshots WHERE tenant_id = ? AND scope_key = ? ORDER BY revision ASC`
+  ).all(tenantId, scopeKey) as Array<{ state_id: string; content_hash: string; author: string; recorded_at: string }>;
+  for (const s of rows) {
+    const rec = readReconciliation(db, tenantId, s.content_hash);
+    if (!rec) continue;
+    const { inputs, retirements } = rowsFor(db, tenantId, scopeKey, s.state_id);
+    const expected = [...rec.retired].sort();
+    if (canonicalize(inputs) !== canonicalize(expected)) {
+      throw new CheckpointIntegrityError(`eng4: merge-input rows of reconcile ${s.state_id} differ from its recorded retired set`);
+    }
+    if (canonicalize(retirements.map((r) => r.state_id)) !== canonicalize(expected)) {
+      throw new CheckpointIntegrityError(`eng4: retirement rows attributed to reconcile ${s.state_id} differ from its recorded retired set`);
+    }
+    // Actor, time and reason are bound off-lineage too (independent review of PR #14, finding 5).
+    for (const r of retirements) {
+      if (r.retired_by !== s.author || r.retired_at !== s.recorded_at || r.reason !== rec.reason) {
+        throw new CheckpointIntegrityError(`eng4: retirement of ${r.state_id} attributed to reconcile ${s.state_id} carries an actor, time or reason that differs from the reconcile`);
+      }
+    }
+    n++;
+  }
+  return { reconcilesVerified: n };
 }
 
 /**

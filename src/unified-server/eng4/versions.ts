@@ -497,9 +497,14 @@ export function verifyVersionParity(db: DatabaseType.Database, tenantId: string,
     // never from the coverage row itself (review finding 2).
     const expectedSource: 'write' | 'backfill' = wasBackfilled(db, tenantId, scopeKey, snap.state_id) ? 'backfill' : 'write';
     const coverage = db.prepare(
-      `SELECT kind, ordinal, change_id, disposition, reason, source FROM eng4_version_coverage
+      `SELECT kind, ordinal, change_id, disposition, reason, source, scope_key FROM eng4_version_coverage
         WHERE tenant_id = ? AND state_id = ? ORDER BY kind, ordinal`
-    ).all(tenantId, snap.state_id) as CoverageRow[];
+    ).all(tenantId, snap.state_id) as Array<CoverageRow & { scope_key: string }>;
+    // Every coverage row must belong to THIS scope: selection keys coverage by
+    // (tenant, state_id) exactly like this verifier, so an out-of-band
+    // scope_key change is detected here rather than silently un-covering a
+    // tuple (independent review of PR #14, finding 1).
+    for (const c of coverage) if (c.scope_key !== scopeKey) fail(snap.state_id, `coverage ${c.kind}[${c.ordinal}] carries scope '${c.scope_key}'`);
     const expectedTuples = changes.facts.length + changes.loops.length;
     if (coverage.length !== expectedTuples) fail(snap.state_id, `expected ${expectedTuples} coverage rows, found ${coverage.length}`);
     const covOf = (kind: 'fact' | 'loop', ordinal: number, changeId: string): CoverageRow => {

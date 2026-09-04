@@ -310,17 +310,22 @@ describe('H2 dual write — every post-H2 change gets exact materialized coverag
     expect(summary).toEqual({ snapshotsVerified: 5, tuplesVerified: 9, materialized: 9, unversioned: 0 }); // 8 from history + the branch's loop close
   });
 
-  it('no public read-model change: v1/v2/v3 resume still serve the in-place rows and carry no H4 sections', () => {
+  it('the frozen v1/v2 read model is untouched (in-place rows, no H-series sections); v3 selects the same values from verified versions on this single lineage (H4)', () => {
     const db = freshDb();
     history(db);
-    for (const rv of [undefined, 2, 3]) {
+    for (const rv of [undefined, 2]) {
       const bundle = performResume(db, directory, TENANT, { agentId: 'claude-hythe', scope: { project: 'Proj' }, budget: 8000, ...(rv ? { resultVersion: rv } : {}) } as any) as any;
       expect(bundle.currentFacts.map((f: any) => f.assertion.subject)).toEqual(['alpha-2']);
       expect(bundle.openLoops).toHaveLength(2);
       expect('divergentValues' in bundle).toBe(false);
       expect('legacyValues' in bundle).toBe(false);
-      if (rv === 3) expect(validV3(bundle), ajv.errorsText(validV3.errors)).toBe(true);
     }
+    const v3 = performResume(db, directory, TENANT, { agentId: 'claude-hythe', scope: { project: 'Proj' }, budget: 8000, resultVersion: 3 } as any) as any;
+    expect(v3.currentFacts.map((f: any) => f.assertion.subject)).toEqual(['alpha-2']);
+    expect(v3.openLoops).toHaveLength(2);
+    expect(v3.divergentValues).toEqual([]);
+    expect(v3.legacyValues).toEqual([]);
+    expect(validV3(v3), ajv.errorsText(validV3.errors)).toBe(true);
   });
 });
 
