@@ -10,10 +10,15 @@
   parent (`conflict` carrying heads and pointer otherwise — never a branch),
   take the parent state from its hash-verified payload, and advance the pointer.
   Fingerprints bind the operation, the resolved parent and (for patch) the raw
-  patch. `resume`/`checkpoint` now share a per-call verification memo so each
-  payload is hashed and parsed once per call (nothing cached across calls). The
-  exact v3 request/result/bundle schema is now final; publishing/deploying v3
-  remains a separate owner decision.
+  patch. `resume`/`checkpoint` now share a per-call verification memo: every
+  consumer of persisted envelope bytes reads through one verified reader, so
+  each payload is selected, hashed and parsed exactly once per call (nothing
+  cached across calls). A v3 `write` binds `acknowledgeRetired: true` into its
+  fingerprint (a retry that drops the acknowledgment is an idempotency-mismatch,
+  not a replay); v1/v2 fingerprints are byte-identical. record/patch on an
+  empty scope fail closed with `CheckpointEmptyScopeError` (design §5.1
+  amended). The exact v3 request/result/bundle schema is now final;
+  publishing/deploying v3 remains a separate owner decision.
 - ENG-4 H4 (design §6.3–§6.5, internal increment of `resultVersion: 3`): the v3
   read model. `resume` `resultVersion: 3` now selects `currentFacts`/`openLoops`
   ONLY from verified materialized versions on the accepted lineage (newest per

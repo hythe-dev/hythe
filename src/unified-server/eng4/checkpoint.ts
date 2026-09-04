@@ -322,19 +322,9 @@ export function readSnapshotChanges(
   storedHash: string | null,
   requireLedger: boolean
 ): CheckpointChanges | null {
-  const payload = db.prepare(
-    `SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-  ).get(tenantId, contentHash) as { body: Buffer } | undefined;
-  if (!payload) throw new CheckpointIntegrityError(`eng4: payload missing for content hash ${contentHash}`);
-  let expectedFacts = 0;
-  let expectedLoops = 0;
-  try {
-    const envelope = JSON.parse(payload.body.toString('utf-8')) as { factChanges?: unknown[]; loopChanges?: unknown[] };
-    expectedFacts = envelope.factChanges?.length ?? 0;
-    expectedLoops = envelope.loopChanges?.length ?? 0;
-  } catch {
-    throw new CheckpointIntegrityError(`eng4: persisted envelope for ${stateId} is not parseable`);
-  }
+  const envelope = readVerifiedEnvelope(db, tenantId, contentHash, stateId);
+  const expectedFacts = Array.isArray(envelope.factChanges) ? envelope.factChanges.length : 0;
+  const expectedLoops = Array.isArray(envelope.loopChanges) ? envelope.loopChanges.length : 0;
 
   const rows = db.prepare(
     `SELECT kind, ordinal, change_id, created FROM eng4_snapshot_changes
@@ -379,8 +369,12 @@ export function verifyPayloadIntegrity(
 ): void {
   // Per-call memo (H5): within one resume/checkpoint the same payload is
   // verified once; the first read of every call still hashes the bytes.
-  const memoKey = `verified|${tenantId}|${contentHash}`;
-  if (memoGet<boolean>(memoKey)) return;
+  if (memoGet<boolean>(`verified|${tenantId}|${contentHash}`)) return;
+  loadVerifiedPayload(db, tenantId, contentHash);
+}
+
+/** SELECT + hash/size check of one payload; records "verified" in the per-call memo. */
+function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string): Buffer {
   const row = db.prepare(
     `SELECT body, byte_length FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
   ).get(tenantId, contentHash) as { body: Buffer; byte_length: number } | undefined;
@@ -393,7 +387,54 @@ export function verifyPayloadIntegrity(
       `eng4: persisted payload failed hash/size verification for ${contentHash}`
     );
   }
-  memoSet(memoKey, true);
+  memoSet(`verified|${tenantId}|${contentHash}`, true);
+  return row.body;
+}
+
+/** The persisted checkpoint envelope as parsed from its verified bytes. Treat as read-only. */
+export interface PersistedEnvelope {
+  scopeKey?: unknown;
+  state?: unknown;
+  events?: unknown[];
+  factChanges?: unknown[];
+  loopChanges?: unknown[];
+  evidenceRefs?: unknown[];
+  reconciliation?: unknown;
+}
+
+/**
+ * The ONE payload reader (H5, codex review of PR #15 finding 2): every
+ * consumer of persisted envelope bytes — the change ledger check, version
+ * parity, the reconciliation record, record/patch parent materialization,
+ * the v3 resume decisions — goes through here, so within one resume or
+ * checkpoint call a payload is SELECTed, hashed and parsed exactly once
+ * (memo keyed by tenant + content hash, discarded when the call returns).
+ * Fail closed on a missing row, a hash/size mismatch, or unparseable bytes.
+ * Callers must not mutate the returned object: it is shared for the call.
+ */
+export function readVerifiedEnvelope(
+  db: DatabaseType.Database,
+  tenantId: string,
+  contentHash: string,
+  stateIdForMessage?: string
+): PersistedEnvelope {
+  const memoKey = `envelope|${tenantId}|${contentHash}`;
+  const cached = memoGet<PersistedEnvelope>(memoKey);
+  if (cached) return cached;
+  const body = loadVerifiedPayload(db, tenantId, contentHash);
+  let envelope: PersistedEnvelope;
+  try {
+    envelope = JSON.parse(body.toString('utf-8')) as PersistedEnvelope;
+  } catch {
+    throw new CheckpointIntegrityError(
+      `eng4: persisted envelope ${stateIdForMessage ? `for ${stateIdForMessage}` : contentHash} is not parseable`
+    );
+  }
+  if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    throw new CheckpointIntegrityError(`eng4: persisted envelope ${contentHash} is not an object`);
+  }
+  memoSet(memoKey, envelope);
+  return envelope;
 }
 
 /**
@@ -469,6 +510,8 @@ export function performCheckpoint(
       operation,
       reconcile: normalized,
       patch: operation === 'patch' ? params.statePatch : undefined,
+      // v3 only; reconcile binds it inside `normalized` (legacy bytes unchanged).
+      acknowledgeRetired: resultVersion === 3 && operation !== 'reconcile' && params.acknowledgeRetired === true ? true : undefined,
     });
     const pointerNow = (): string | null => readScopePointer(db, tenantId, scopeKey)?.stateId ?? null;
     // v3 conflicts also carry the pointer, so a reconcile caller can restate
@@ -569,11 +612,7 @@ export function performCheckpoint(
       // §5.2: the parent state comes from the hash/size-verified canonical payload, never from state_json.
       const parentRow = db.prepare(`SELECT content_hash FROM eng4_state_snapshots WHERE tenant_id = ? AND state_id = ?`)
         .get(tenantId, resolvedParentStateId) as { content_hash: string };
-      verifyPayloadIntegrity(db, tenantId, String(parentRow.content_hash));
-      const body = db.prepare(`SELECT body FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`).get(tenantId, parentRow.content_hash) as { body: Buffer };
-      let parentState: unknown;
-      try { parentState = (JSON.parse(body.body.toString('utf-8')) as { state: unknown }).state; }
-      catch { throw new CheckpointIntegrityError(`eng4: parent payload ${parentRow.content_hash} is not parseable`); }
+      const parentState = readVerifiedEnvelope(db, tenantId, String(parentRow.content_hash), resolvedParentStateId).state;
       if (!validWorkingState(parentState)) throw new CheckpointIntegrityError(`eng4: parent payload ${parentRow.content_hash} does not carry a valid working state`);
       derivedState = operation === 'record' ? parentState : applyMergePatch(parentState, params.statePatch ?? {});
       if (!validWorkingState(derivedState)) {

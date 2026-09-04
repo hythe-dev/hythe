@@ -29,13 +29,14 @@
  *   once; nothing is cached across calls (an out-of-band change is caught on
  *   the next call).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import Ajv from 'ajv';
 import Database from 'better-sqlite3';
 import type { CheckpointParams, FactChange, WorkingState } from '../src/unified-server/eng4/contracts.js';
 import { CHECKPOINT_INPUT_SCHEMA, CHECKPOINT_OUTPUT_SCHEMA } from '../src/unified-server/eng4/schemas.js';
 import { applyEng4Schema } from '../src/unified-server/eng4/init.js';
 import { performCheckpoint, applyMergePatch, CheckpointPatchError, CheckpointEmptyScopeError, CheckpointIntegrityError } from '../src/unified-server/eng4/checkpoint.js';
+import { CheckpointRetiredParentError } from '../src/unified-server/eng4/reconcile.js';
 import { performResume, type ResumeDirectory } from '../src/unified-server/eng4/resume.js';
 import { requestFingerprint } from '../src/unified-server/eng4/canonical.js';
 import { readScopePointer } from '../src/unified-server/eng4/heads.js';
@@ -286,20 +287,87 @@ describe('H5 admissible parent: only the pointed head (§5.1) — conflicts in e
   });
 });
 
+describe('H5 fingerprint binds acknowledgeRetired (codex review of PR #15, finding 1)', () => {
+  it('a v3 write on a retired parent with acknowledgeRetired:true replays only with the acknowledgment; dropping it under the same key is an idempotency-mismatch, never a replay', () => {
+    const db = freshDb();
+    write(db);
+    const a = write(db, { expectedRevision: 1, state: state('a') });
+    const c = write(db, { expectedRevision: 1, state: state('c') });
+    const rev = (id: string) => (db.prepare(`SELECT revision FROM eng4_state_snapshots WHERE state_id=?`).get(id) as any).revision;
+    performCheckpoint(db, directory, TENANT, cp({ resultVersion: 3, operation: 'reconcile', expectedRevision: rev(a.stateId), expectedHeads: [a.stateId, c.stateId], expectedPointer: a.stateId, survivor: a.stateId, reason: 'fold', state: state('reconciled') }));
+    const acked = cp({ resultVersion: 3, expectedRevision: rev(c.stateId), state: state('again'), acknowledgeRetired: true, idempotencyKey: 'k-ack-1' });
+    const first = performCheckpoint(db, directory, TENANT, acked) as any;
+    expect(first.outcome).toBe('written');
+    expect(performCheckpoint(db, directory, TENANT, acked)).toMatchObject({ outcome: 'idempotent-replay', stateId: first.stateId });
+    const { acknowledgeRetired: _ack, ...dropped } = acked;
+    const withoutAck = performCheckpoint(db, directory, TENANT, dropped) as any;
+    expect(withoutAck.outcome).toBe('idempotency-mismatch');
+    expect(withoutAck.stateId).toBe(first.stateId);
+    expect(performCheckpoint(db, directory, TENANT, { ...dropped, acknowledgeRetired: false })).toMatchObject({ outcome: 'idempotency-mismatch' });
+    // Under a fresh key the unacknowledged retired-parent write is still refused (§4.5).
+    expect(() => performCheckpoint(db, directory, TENANT, { ...dropped, idempotencyKey: 'k-ack-2' })).toThrow(CheckpointRetiredParentError);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM eng4_state_snapshots`).get()).toEqual({ n: 5 });
+  });
+
+  it('fingerprint bytes: bound only when true and only for v3; v1/v2 and unacknowledged v3 requests are unchanged; reconcile does not double-bind', () => {
+    const envelope = { scopeKey: SCOPE, state: state('x'), events: [], factChanges: [], loopChanges: [], evidenceRefs: [] };
+    const base = { canonicalAgentId: 'a', scopeKey: SCOPE, expectedRevision: 2, resolvedParentStateId: 'S' };
+    for (const rv of [undefined, 1, 2, 3] as const) {
+      const plain = requestFingerprint({ ...base, envelope, resultVersion: rv });
+      expect(requestFingerprint({ ...base, envelope, resultVersion: rv, acknowledgeRetired: false })).toBe(plain);
+      expect(requestFingerprint({ ...base, envelope, resultVersion: rv, acknowledgeRetired: undefined })).toBe(plain);
+      expect(requestFingerprint({ ...base, envelope, resultVersion: rv, acknowledgeRetired: true })).not.toBe(plain);
+    }
+    // End to end: a v1/v2 request cannot carry the flag (schema); performCheckpoint binds it for v3 only,
+    // so a v2 request with the (schema-invalid) flag set produces the frozen v2 fingerprint.
+    const db = freshDb();
+    write(db);
+    const k = cp({ resultVersion: 2, expectedRevision: 1, state: state('v2'), idempotencyKey: 'k-v2-ack' });
+    const w = performCheckpoint(db, directory, TENANT, k) as any;
+    expect(performCheckpoint(db, directory, TENANT, { ...k, acknowledgeRetired: true } as any)).toMatchObject({ outcome: 'idempotent-replay', stateId: w.stateId });
+  });
+});
+
 describe('H5 per-call verification memo', () => {
-  it('one resume hashes/parses each payload once (hits > 0 on a lineage with reconciles); nothing persists across calls — an out-of-band payload change is caught by the next call', () => {
+  /** JSON.parse calls whose input is exactly one of the persisted payload bodies, keyed by content hash. */
+  const countPayloadParses = (db: any, run: () => void): Map<string, number> => {
+    const bodies = new Map<string, string>(
+      (db.prepare(`SELECT content_hash, body FROM eng4_payloads`).all() as any[]).map((r) => [Buffer.from(r.body).toString('utf8'), r.content_hash])
+    );
+    const counts = new Map<string, number>();
+    const spy = vi.spyOn(JSON, 'parse');
+    try {
+      run();
+      for (const call of spy.mock.calls) {
+        const hash = bodies.get(String(call[0]));
+        if (hash) counts.set(hash, (counts.get(hash) ?? 0) + 1);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    return counts;
+  };
+
+  it('one v3 resume parses EVERY payload at most once (codex review of PR #15, finding 2) and hits the memo on a lineage with reconciles; nothing persists across calls — an out-of-band payload change is caught by the next call', () => {
     const db = freshDb();
     const root = write(db, { factChanges: [fact('good')] });
     const F = root.changes.facts[0].factId;
     const a = write(db, { expectedRevision: 1, state: state('a') });
     const c = write(db, { expectedRevision: 1, state: state('c'), factChanges: [fact('bad', { factId: F })] });
     const rev = (id: string) => (db.prepare(`SELECT revision FROM eng4_state_snapshots WHERE state_id=?`).get(id) as any).revision;
-    performCheckpoint(db, directory, TENANT, cp({ resultVersion: 3, operation: 'reconcile', expectedRevision: rev(a.stateId), expectedHeads: [a.stateId, c.stateId], expectedPointer: a.stateId, survivor: a.stateId, reason: 'fold', rejectLineages: [c.stateId], state: state('reconciled') }));
-    resume(db, { resultVersion: 3 });
+    const r = performCheckpoint(db, directory, TENANT, cp({ resultVersion: 3, operation: 'reconcile', expectedRevision: rev(a.stateId), expectedHeads: [a.stateId, c.stateId], expectedPointer: a.stateId, survivor: a.stateId, reason: 'fold', rejectLineages: [c.stateId], state: state('reconciled') })) as any;
+    const parses = countPayloadParses(db, () => resume(db, { resultVersion: 3 }));
+    expect(parses.get(r.contentHash), 'the current head (decisions + verifiers)').toBe(1);
+    expect(parses.get(c.contentHash), 'the rejected divergent terminal').toBe(1);
+    for (const [hash, n] of parses) expect(n, hash).toBe(1);
     expect(lastMemoStats.hits).toBeGreaterThan(0);
     const missesFirst = lastMemoStats.misses;
     resume(db, { resultVersion: 3 });
     expect(lastMemoStats.misses).toBe(missesFirst); // same work each call: nothing was remembered across calls
+    // A record on the pointed head reads its parent payload once too.
+    const recParses = countPayloadParses(db, () => record(db, { factChanges: [fact('after')] }));
+    expect(recParses.get(r.contentHash)).toBe(1);
+    for (const [hash, n] of recParses) expect(n, hash).toBe(1);
     // Out-of-band payload alteration is detected on the next call (fail closed).
     db.pragma('foreign_keys = OFF');
     db.prepare(`UPDATE eng4_payloads SET body=CAST('{}' AS BLOB), byte_length=2 WHERE content_hash=?`).run(c.contentHash);
