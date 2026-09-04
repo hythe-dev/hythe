@@ -511,7 +511,7 @@ describe('H1 resume v3 — bundle shape, schema exclusivity, budget and cursor (
     attack(db);
     const bundle = resume(db, { resultVersion: 3 });
     const order = Object.keys(bundle.coverage).filter((k) => k !== 'totalTokenEstimate' && k !== 'budget');
-    expect(order).toEqual(['working', 'capsule', 'heads', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers']);
+    expect(order).toEqual(['working', 'capsule', 'heads', 'openLoops', 'messages', 'currentFacts', 'decisions', 'evidence', 'pointers', 'divergentValues', 'legacyValues']); // H4 appended the last two
     expect(bundle.coverage.heads).toMatchObject({ includedCount: 2, totalCount: 2, contentComplete: true, omittedReason: 'none', nextCursor: null });
     expect(bundle.coverage.heads.tokenEstimate).toBeGreaterThan(0);
   });
