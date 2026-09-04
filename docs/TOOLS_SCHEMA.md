@@ -1119,7 +1119,7 @@ Parameters
         2,
         3
       ],
-      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (INTERNAL, not final until the ENG-4 H-series completes): v2 plus the `operation` discriminant (`reconcile` since H3) and its fields; required for any of them."
+      "description": "Result-shape opt-in. Omit or 1: the frozen v1 result. 2: written/idempotent-replay also return `changes` — the factId/loopId each factChanges[i]/loopChanges[i] materialized to, with a created flag. Bound into the idempotency fingerprint only when 2. 3 (final as of ENG-4 H5; internal until the owner publishes v3): v2 plus the `operation` discriminant (`reconcile`, `record`, `patch`) and its fields; required for any of them."
     },
     "operation": {
       "enum": [
@@ -1548,6 +1548,11 @@ Parameters
               "required": [
                 "statePatch"
               ]
+            },
+            {
+              "required": [
+                "acknowledgeRetired"
+              ]
             }
           ]
         }
@@ -1569,8 +1574,17 @@ Parameters
           "statePatch"
         ],
         "not": {
-          "required": [
-            "state"
+          "anyOf": [
+            {
+              "required": [
+                "state"
+              ]
+            },
+            {
+              "required": [
+                "acknowledgeRetired"
+              ]
+            }
           ]
         }
       }

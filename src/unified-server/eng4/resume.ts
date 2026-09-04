@@ -52,7 +52,7 @@ import type {
   SectionCoverage,
   WorkingState,
 } from './contracts.js';
-import { readVerifiedEnvelope } from './checkpoint.js';
+import { readVerifiedEnvelope, readVerifiedPayloadMeta } from './checkpoint.js';
 import { effectiveCurrentHead, liveHeadDetails, retiredHeadCount } from './heads.js';
 import { verifyReconcileRowsScopeWide, verifyResolutionRowsOnLineage, verifyRetirementAttribution } from './reconcile.js';
 import { selectV3Values, type V3Selection } from './selection.js';
@@ -366,15 +366,25 @@ function performResumeInner(
   const decisions: ResumeBundle['decisions'] = [];
   let evidence: ContentHandle[] = [];
   if (currentRow) {
-    const payload = db.prepare(
-      `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-    ).get(tenantId, currentRow.content_hash) as any;
-    if (payload) {
-      // v3: the verified, per-call memoized parse (H5) — the same envelope
-      // the verifiers below read. v1/v2 keep their frozen unverified read.
-      const envelope: any = resultVersion === 3
-        ? readVerifiedEnvelope(db, tenantId, currentRow.content_hash, currentRow.state_id)
-        : JSON.parse(Buffer.from(payload.body).toString('utf8'));
+    let envelope: any;
+    let handle: { byteLength: number; mediaType: string } | null = null;
+    if (resultVersion === 3) {
+      // v3 (H5): the verified, per-call memoized parse — the same envelope
+      // and the same SELECT the verifiers read, so the handle metadata and
+      // the decisions cannot come from bytes changed out of band mid-call.
+      envelope = readVerifiedEnvelope(db, tenantId, currentRow.content_hash, currentRow.state_id);
+      handle = readVerifiedPayloadMeta(db, tenantId, currentRow.content_hash);
+    } else {
+      // v1/v2: the frozen unverified read.
+      const payload = db.prepare(
+        `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
+      ).get(tenantId, currentRow.content_hash) as any;
+      if (payload) {
+        envelope = JSON.parse(Buffer.from(payload.body).toString('utf8'));
+        handle = { byteLength: payload.byte_length, mediaType: payload.media_type };
+      }
+    }
+    if (envelope && handle) {
       (envelope.events ?? []).forEach((event: any, index: number) => {
         if (event?.kind === 'decision') {
           decisions.push({
@@ -389,8 +399,8 @@ function performResumeInner(
         kind: 'state-snapshot',
         uri: `engram://snapshot/${encodeURIComponent(scopeKey)}/${encodeURIComponent(currentRow.state_id)}`,
         contentHash: currentRow.content_hash,
-        byteLength: payload.byte_length,
-        mediaType: payload.media_type,
+        byteLength: handle.byteLength,
+        mediaType: handle.mediaType,
       }];
     }
   }

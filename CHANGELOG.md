@@ -17,8 +17,12 @@
   fingerprint (a retry that drops the acknowledgment is an idempotency-mismatch,
   not a replay); v1/v2 fingerprints are byte-identical. record/patch on an
   empty scope fail closed with `CheckpointEmptyScopeError` (design §5.1
-  amended). The exact v3 request/result/bundle schema is now final;
-  publishing/deploying v3 remains a separate owner decision.
+  amended); a patch carrying a prototype key (`__proto__`, `constructor`,
+  `prototype`) fails closed; a pointed head whose verified state no longer
+  validates is a typed `CheckpointParentStateError` (send a full write);
+  record/patch reject `acknowledgeRetired`. The exact v3 request/result/bundle
+  schema is now final; publishing/deploying v3 remains a separate owner
+  decision.
 - ENG-4 H4 (design §6.3–§6.5, internal increment of `resultVersion: 3`): the v3
   read model. `resume` `resultVersion: 3` now selects `currentFacts`/`openLoops`
   ONLY from verified materialized versions on the accepted lineage (newest per

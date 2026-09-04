@@ -30,12 +30,13 @@
  *   the next call).
  */
 import { describe, it, expect, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import Ajv from 'ajv';
 import Database from 'better-sqlite3';
 import type { CheckpointParams, FactChange, WorkingState } from '../src/unified-server/eng4/contracts.js';
 import { CHECKPOINT_INPUT_SCHEMA, CHECKPOINT_OUTPUT_SCHEMA } from '../src/unified-server/eng4/schemas.js';
 import { applyEng4Schema } from '../src/unified-server/eng4/init.js';
-import { performCheckpoint, applyMergePatch, CheckpointPatchError, CheckpointEmptyScopeError, CheckpointIntegrityError } from '../src/unified-server/eng4/checkpoint.js';
+import { performCheckpoint, applyMergePatch, CheckpointPatchError, CheckpointEmptyScopeError, CheckpointIntegrityError, CheckpointParentStateError } from '../src/unified-server/eng4/checkpoint.js';
 import { CheckpointRetiredParentError } from '../src/unified-server/eng4/reconcile.js';
 import { performResume, type ResumeDirectory } from '../src/unified-server/eng4/resume.js';
 import { requestFingerprint } from '../src/unified-server/eng4/canonical.js';
@@ -102,6 +103,10 @@ describe('H5 request surface (§5.1, §2.2)', () => {
     expect(validInput({ ...base, operation: 'patch' })).toBe(false);
     expect(validInput({ ...base, operation: 'patch', statePatch: { status: 'x' }, state: state('s') })).toBe(false);
     expect(validInput({ ...base, operation: 'patch', statePatch: 'not-an-object' })).toBe(false);
+    // acknowledgeRetired can never apply to record/patch (pointed head only): rejected, not ignored.
+    expect(validInput({ ...base, operation: 'record', acknowledgeRetired: true })).toBe(false);
+    expect(validInput({ ...base, operation: 'patch', statePatch: { status: 'x' }, acknowledgeRetired: false })).toBe(false);
+    expect(validInput({ ...base, operation: 'write', state: state('s'), acknowledgeRetired: true })).toBe(true);
     expect(validInput({ ...base, operation: 'write' })).toBe(false); // state required
     expect(validInput({ ...base, operation: 'write', state: state('s') })).toBe(true);
     expect(validInput({ ...base, operation: 'write', state: state('s'), statePatch: {} })).toBe(false);
@@ -225,6 +230,57 @@ describe('H5 patch — RFC 7396 merge patch on the verified parent state (§5.4)
     expect(applyMergePatch({ a: { x: 1 } }, { a: 'scalar' })).toEqual({ a: 'scalar' });
     expect(applyMergePatch('anything', { a: 1 })).toEqual({ a: 1 });
     expect(applyMergePatch({ a: 1 }, [1, 2])).toEqual([1, 2]);
+  });
+
+  it('a prototype key anywhere in the patch fails CLOSED (independent review finding 3): never silently dropped, nothing written', () => {
+    const own = (json: string) => JSON.parse(json) as Record<string, unknown>; // an OWN "__proto__" key, unlike an object literal
+    expect(() => applyMergePatch({ objective: 'o' }, own('{"__proto__":{"objective":"x"}}'))).toThrow(CheckpointPatchError);
+    expect(() => applyMergePatch({}, own('{"constructor":{"prototype":{}}}'))).toThrow(CheckpointPatchError);
+    expect(() => applyMergePatch({}, { a: own('{"prototype":1}') })).toThrow(CheckpointPatchError);
+    const db = freshDb();
+    const root = write(db);
+    const before = db.prepare(`SELECT COUNT(*) AS n FROM eng4_state_snapshots`).get() as any;
+    expect(() => patch(db, own('{"__proto__":{"objective":"x"}}'))).toThrow(CheckpointPatchError);
+    expect(() => patch(db, own('{"status":"ok","constructor":{"x":1}}'))).toThrow(CheckpointPatchError);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM eng4_state_snapshots`).get()).toEqual(before);
+    expect(pointerRow(db).state_id).toBe(root.stateId);
+    expect(Object.getPrototypeOf(applyMergePatch({}, { a: 1 }))).toBe(Object.prototype); // no global pollution either
+  });
+
+  it('a pointed head whose verified state no longer validates is an ADMISSION failure (typed, tells the caller to write), not an integrity error (independent review finding 4)', () => {
+    const db = freshDb();
+    const root = write(db);
+    // Simulate schema drift out of band: a consistent payload whose state lacks a now-required key.
+    const row = db.prepare(`SELECT p.body FROM eng4_state_snapshots s JOIN eng4_payloads p ON p.tenant_id=s.tenant_id AND p.content_hash=s.content_hash WHERE s.state_id=?`).get(root.stateId) as any;
+    const env = JSON.parse(Buffer.from(row.body).toString('utf8'));
+    delete env.state.guardrails;
+    const bytes = Buffer.from(JSON.stringify(env), 'utf8');
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    db.pragma('foreign_keys = OFF');
+    const src = db.prepare(`SELECT * FROM eng4_payloads WHERE content_hash=?`).get(root.contentHash) as Record<string, unknown>;
+    const copy = { ...src, content_hash: hash, body: bytes, byte_length: bytes.length };
+    db.prepare(`INSERT INTO eng4_payloads (${Object.keys(copy).join(', ')}) VALUES (${Object.keys(copy).map(() => '?').join(', ')})`).run(...Object.values(copy));
+    db.exec(`DROP TRIGGER trg_eng4_snapshots_immutable`);
+    db.prepare(`UPDATE eng4_state_snapshots SET content_hash=? WHERE state_id=?`).run(hash, root.stateId);
+    db.exec(ddlFor('trg_eng4_snapshots_immutable'));
+    db.pragma('foreign_keys = ON');
+    expect(() => record(db, { factChanges: [fact('f')] })).toThrow(CheckpointParentStateError);
+    expect(() => patch(db, { status: 'x' })).toThrow(/send a full write/);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM eng4_state_snapshots`).get()).toEqual({ n: 1 });
+    // The way out the message names: a full v3 write on the pointed head.
+    expect(write(db, { resultVersion: 3, expectedRevision: 1, state: state('repaired') }).outcome).toBe('written');
+  });
+
+  it('direct callers behind the schema get typed failures, not TypeErrors (independent review finding 6): statePatch null/array, missing state on write/reconcile', () => {
+    const db = freshDb();
+    write(db);
+    expect(() => performCheckpoint(db, directory, TENANT, derived(db, 'patch', { statePatch: null as any }))).toThrow(CheckpointPatchError);
+    expect(() => performCheckpoint(db, directory, TENANT, derived(db, 'patch', { statePatch: [1] as any }))).toThrow(CheckpointPatchError);
+    expect(() => performCheckpoint(db, directory, TENANT, derived(db, 'patch', {}))).toThrow(CheckpointPatchError);
+    const { state: _s, ...noState } = cp({ resultVersion: 3, expectedRevision: 1 });
+    expect(() => performCheckpoint(db, directory, TENANT, noState as any)).toThrow(/requires a full working state/);
+    expect(() => performCheckpoint(db, directory, TENANT, { ...noState, state: null } as any)).toThrow(/requires a full working state/);
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM eng4_state_snapshots`).get()).toEqual({ n: 1 });
   });
 
   it('idempotent replay; a different patch under the same key is a fingerprint mismatch; the same patch with permuted keys replays', () => {
@@ -368,6 +424,48 @@ describe('H5 per-call verification memo', () => {
     const recParses = countPayloadParses(db, () => record(db, { factChanges: [fact('after')] }));
     expect(recParses.get(r.contentHash)).toBe(1);
     for (const [hash, n] of recParses) expect(n, hash).toBe(1);
+  });
+
+  it('a payload changed out of band DURING one v3 resume never reaches a consumer (independent review finding 1): every verified fact comes from the first SELECT; the bundle reflects the verified bytes; the next call fails closed', () => {
+    const db = freshDb();
+    write(db, { factChanges: [fact('good')] });
+    const a = write(db, { expectedRevision: 1, state: state('a') });
+    const c = write(db, { expectedRevision: 1, state: state('c') });
+    const rev = (id: string) => (db.prepare(`SELECT revision FROM eng4_state_snapshots WHERE state_id=?`).get(id) as any).revision;
+    const r = performCheckpoint(db, directory, TENANT, cp({ resultVersion: 3, operation: 'reconcile', expectedRevision: rev(a.stateId), expectedHeads: [a.stateId, c.stateId], expectedPointer: a.stateId, survivor: a.stateId, reason: 'fold', state: state('reconciled'), events: [{ kind: 'decision', summary: 'real' }] })) as any;
+    const original = db.prepare(`SELECT body, byte_length FROM eng4_payloads WHERE content_hash=?`).get(r.contentHash) as any;
+    const modified = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(original.body).toString('utf8')), events: [{ kind: 'decision', summary: 'modified out of band' }] }), 'utf8');
+    // Stand-in for an external writer committing between two statements of the same (non-transactional) resume:
+    // right after the FIRST statement that returns the reconcile payload, its row is replaced (consistent length, stale hash).
+    const realPrepare = db.prepare.bind(db);
+    const replace = realPrepare(`UPDATE eng4_payloads SET body=?, byte_length=? WHERE content_hash=?`);
+    let fired = 0;
+    (db as any).prepare = (sql: string) => {
+      const stmt = realPrepare(sql);
+      if (/FROM eng4_payloads/.test(sql)) {
+        const get = stmt.get.bind(stmt);
+        (stmt as any).get = (...args: any[]) => {
+          const row = get(...args);
+          if (args[1] === r.contentHash && fired++ === 0) {
+            db.pragma('foreign_keys = OFF');
+            replace.run(modified, modified.length, r.contentHash);
+            db.pragma('foreign_keys = ON');
+          }
+          return row;
+        };
+      }
+      return stmt;
+    };
+    try {
+      const bundle = resume(db, { resultVersion: 3 });
+      expect(fired).toBeGreaterThan(0);
+      expect(bundle.decisions.map((d: any) => d.summary)).toEqual(['real']);
+      expect(bundle.evidence[0]).toMatchObject({ contentHash: r.contentHash, byteLength: original.byte_length });
+      expect(bundle.working.status).toBe('reconciled');
+    } finally {
+      (db as any).prepare = realPrepare;
+    }
+    expect(() => resume(db, { resultVersion: 3 })).toThrow(CheckpointIntegrityError);
     // Out-of-band payload alteration is detected on the next call (fail closed).
     db.pragma('foreign_keys = OFF');
     db.prepare(`UPDATE eng4_payloads SET body=CAST('{}' AS BLOB), byte_length=2 WHERE content_hash=?`).run(c.contentHash);

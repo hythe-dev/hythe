@@ -100,13 +100,35 @@ export class CheckpointPatchError extends Error {
   }
 }
 
-/** RFC 7396 JSON Merge Patch. Arrays and scalars replace wholesale; null deletes. */
+/**
+ * H5 (independent review of PR #15, finding 4): the pointed head's verified
+ * payload carries a state that no longer validates as a working state (schema
+ * drift). The bytes are intact — this is an admission failure, not corruption:
+ * send a full `write` to re-establish a valid state.
+ */
+export class CheckpointParentStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CheckpointParentStateError';
+  }
+}
+
+/** Keys a merge patch may never carry: they would set the prototype of the derived object, not a field. */
+const PROTOTYPE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * RFC 7396 JSON Merge Patch. Arrays and scalars replace wholesale; null
+ * deletes. Fails CLOSED (CheckpointPatchError) on a prototype key anywhere in
+ * the patch — `{"__proto__": {...}}` would otherwise be silently dropped
+ * (independent review of PR #15, finding 3).
+ */
 export function applyMergePatch(target: unknown, patch: unknown): unknown {
   if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return patch;
   const out: Record<string, unknown> = (target !== null && typeof target === 'object' && !Array.isArray(target))
     ? { ...(target as Record<string, unknown>) }
     : {};
   for (const [k, v] of Object.entries(patch as Record<string, unknown>)) {
+    if (PROTOTYPE_KEYS.has(k)) throw new CheckpointPatchError(`eng4: statePatch carries the prototype key "${k}"`);
     if (v === null) delete out[k];
     else out[k] = applyMergePatch(out[k], v);
   }
@@ -373,11 +395,19 @@ export function verifyPayloadIntegrity(
   loadVerifiedPayload(db, tenantId, contentHash);
 }
 
-/** SELECT + hash/size check of one payload; records "verified" in the per-call memo. */
-function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string): Buffer {
+/** Verified handle metadata of a payload, read in the SAME statement as the verified bytes. */
+export interface VerifiedPayloadMeta { byteLength: number; mediaType: string }
+
+/**
+ * ONE SELECT + hash/size check of a payload; records "verified" and the
+ * handle metadata in the per-call memo. Every verified fact about a payload
+ * comes from this single statement, so a later out-of-band change within the
+ * same call cannot reach any consumer (independent review of PR #15, finding 1).
+ */
+function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, contentHash: string): { body: Buffer; meta: VerifiedPayloadMeta } {
   const row = db.prepare(
-    `SELECT body, byte_length FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
-  ).get(tenantId, contentHash) as { body: Buffer; byte_length: number } | undefined;
+    `SELECT body, byte_length, media_type FROM eng4_payloads WHERE tenant_id = ? AND content_hash = ?`
+  ).get(tenantId, contentHash) as { body: Buffer; byte_length: number; media_type: string } | undefined;
   if (!row) {
     throw new CheckpointIntegrityError(`eng4: payload missing for content hash ${contentHash}`);
   }
@@ -387,8 +417,17 @@ function loadVerifiedPayload(db: DatabaseType.Database, tenantId: string, conten
       `eng4: persisted payload failed hash/size verification for ${contentHash}`
     );
   }
+  const meta: VerifiedPayloadMeta = { byteLength: row.byte_length, mediaType: String(row.media_type) };
   memoSet(`verified|${tenantId}|${contentHash}`, true);
-  return row.body;
+  memoSet(`meta|${tenantId}|${contentHash}`, meta);
+  return { body: row.body, meta };
+}
+
+/** Handle metadata (byteLength, mediaType) of a verified payload — from the verified read, never a separate SELECT. */
+export function readVerifiedPayloadMeta(db: DatabaseType.Database, tenantId: string, contentHash: string): VerifiedPayloadMeta {
+  const cached = memoGet<VerifiedPayloadMeta>(`meta|${tenantId}|${contentHash}`);
+  if (cached) return cached;
+  return loadVerifiedPayload(db, tenantId, contentHash).meta;
 }
 
 /** The persisted checkpoint envelope as parsed from its verified bytes. Treat as read-only. */
@@ -421,7 +460,7 @@ export function readVerifiedEnvelope(
   const memoKey = `envelope|${tenantId}|${contentHash}`;
   const cached = memoGet<PersistedEnvelope>(memoKey);
   if (cached) return cached;
-  const body = loadVerifiedPayload(db, tenantId, contentHash);
+  const { body } = loadVerifiedPayload(db, tenantId, contentHash);
   let envelope: PersistedEnvelope;
   try {
     envelope = JSON.parse(body.toString('utf-8')) as PersistedEnvelope;
@@ -485,8 +524,19 @@ export function performCheckpoint(
   // reconcile's envelope additionally carries the reconciliation record,
   // which is derived INSIDE the transaction (§4.2 step 4), so its final bytes
   // and contentHash are computed there; the base envelope is validated here.
+  // Explicit guards behind the input schema (independent review of PR #15,
+  // finding 6): a direct caller gets a typed failure, never a TypeError.
+  if (!derivesState && (params.state === null || typeof params.state !== 'object')) {
+    throw new Error(`eng4: ${operation} requires a full working state`);
+  }
+  if (operation === 'patch' && (params.statePatch === null || typeof params.statePatch !== 'object' || Array.isArray(params.statePatch))) {
+    throw new CheckpointPatchError('eng4: patch requires statePatch to be an object');
+  }
   canonicalEnvelopeBytes(baseEnvelope);
-  if (operation === 'patch') canonicalize(params.statePatch ?? null);
+  if (operation === 'patch') {
+    canonicalize(params.statePatch);
+    applyMergePatch({}, params.statePatch); // prototype keys fail closed before the transaction opens
+  }
   const normalized = operation === 'reconcile' ? normalizeReconcileRequest(params) : undefined;
 
   const run = db.transaction((): CheckpointResult => {
@@ -613,8 +663,12 @@ export function performCheckpoint(
       const parentRow = db.prepare(`SELECT content_hash FROM eng4_state_snapshots WHERE tenant_id = ? AND state_id = ?`)
         .get(tenantId, resolvedParentStateId) as { content_hash: string };
       const parentState = readVerifiedEnvelope(db, tenantId, String(parentRow.content_hash), resolvedParentStateId).state;
-      if (!validWorkingState(parentState)) throw new CheckpointIntegrityError(`eng4: parent payload ${parentRow.content_hash} does not carry a valid working state`);
-      derivedState = operation === 'record' ? parentState : applyMergePatch(parentState, params.statePatch ?? {});
+      if (!validWorkingState(parentState)) {
+        throw new CheckpointParentStateError(
+          `eng4: the pointed head ${resolvedParentStateId} carries a state that does not validate as a working state (${new Ajv().errorsText(validWorkingState.errors)}) — send a full write to re-establish one`
+        );
+      }
+      derivedState = operation === 'record' ? parentState : applyMergePatch(parentState, params.statePatch);
       if (!validWorkingState(derivedState)) {
         throw new CheckpointPatchError(`eng4: statePatch does not yield a complete valid working state — ${new Ajv().errorsText(validWorkingState.errors)}`);
       }
