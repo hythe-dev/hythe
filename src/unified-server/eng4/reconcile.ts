@@ -233,8 +233,9 @@ export const terminalKey = (t: { kind: string; id: string; stateId: string }) =>
  * accepted head — the chains of every live head other than `acceptedHead`
  * and of every retired snapshot not on its lineage, from their fork points —
  * plus the verified resolution keys on that lineage. Shares the exact
- * enumeration a reconcile uses, so what resume shows as divergent is what a
- * reconcile would demand a resolution for.
+ * enumeration a reconcile uses: the materialized terminals resume lists and
+ * the opaque ones it counts are together what a reconcile would demand a
+ * resolution for.
  */
 export function divergentTerminalsFor(
   db: DatabaseType.Database,
@@ -677,8 +678,8 @@ function comparableAtNewest(db: DatabaseType.Database, tenantId: string, scopeKe
 export function verifyReconcileRowsScopeWide(db: DatabaseType.Database, tenantId: string, scopeKey: string): { reconcilesVerified: number } {
   let n = 0;
   const rows = db.prepare(
-    `SELECT state_id, content_hash FROM eng4_state_snapshots WHERE tenant_id = ? AND scope_key = ? ORDER BY revision ASC`
-  ).all(tenantId, scopeKey) as Array<{ state_id: string; content_hash: string }>;
+    `SELECT state_id, content_hash, author, recorded_at FROM eng4_state_snapshots WHERE tenant_id = ? AND scope_key = ? ORDER BY revision ASC`
+  ).all(tenantId, scopeKey) as Array<{ state_id: string; content_hash: string; author: string; recorded_at: string }>;
   for (const s of rows) {
     const rec = readReconciliation(db, tenantId, s.content_hash);
     if (!rec) continue;
@@ -689,6 +690,12 @@ export function verifyReconcileRowsScopeWide(db: DatabaseType.Database, tenantId
     }
     if (canonicalize(retirements.map((r) => r.state_id)) !== canonicalize(expected)) {
       throw new CheckpointIntegrityError(`eng4: retirement rows attributed to reconcile ${s.state_id} differ from its recorded retired set`);
+    }
+    // Actor, time and reason are bound off-lineage too (independent review of PR #14, finding 5).
+    for (const r of retirements) {
+      if (r.retired_by !== s.author || r.retired_at !== s.recorded_at || r.reason !== rec.reason) {
+        throw new CheckpointIntegrityError(`eng4: retirement of ${r.state_id} attributed to reconcile ${s.state_id} carries an actor, time or reason that differs from the reconcile`);
+      }
     }
     n++;
   }

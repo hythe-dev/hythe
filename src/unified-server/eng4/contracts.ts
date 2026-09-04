@@ -287,6 +287,13 @@ export interface SectionCoverage {
   omittedReason: 'budget' | 'cursor' | 'not-requested' | 'none' | 'undesignated' | 'unversioned';
   nextCursor: string | null;
   tokenEstimate: number;
+  /**
+   * schemaVersion=3 ONLY, currentFacts/openLoops: how many of totalCount are
+   * SUPPRESSED ids (never delivered on any page; see legacyValues). Fixed
+   * size, so the count is visible on every page regardless of budget/cursor
+   * (independent review of PR #14, finding 2).
+   */
+  suppressedCount?: number;
 }
 
 export type ResumeSectionName =
@@ -376,8 +383,10 @@ export interface AsOfHeader {
   liveHeadCount?: number;
   /** Live heads other than the effective current head. */
   divergentHeadCount?: number;
-  /** Always 0 until H3 introduces retirements. */
+  /** Retired snapshots in the scope (H3). */
   retiredHeadCount?: number;
+  /** H4: divergent terminals with no truthful value (unversioned); not listed in divergentValues, a reconcile must reject them. */
+  opaqueDivergentCount?: number;
 }
 
 export type HeadSelection = 'empty-scope' | 'max-revision' | 'pointer' | 'invalid-designation';

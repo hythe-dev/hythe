@@ -147,7 +147,7 @@ export function performResume(
   const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0, complete: true };
   // v3 fixed-size asOf fields for a scope with no storage at all.
   const emptyHeadFields = resultVersion === 3
-    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0 }
+    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0, opaqueDivergentCount: 0 }
     : {};
 
   if (!resolved.scopeKey) {
@@ -168,7 +168,9 @@ export function performResume(
       evidence: [],
       pointers: [],
       coverage: {
-        ...coverageOf(order.map((s) => [s, emptyCoverage('none')])),
+        ...coverageOf(order.map((s) => [s, resultVersion === 3 && (s === 'currentFacts' || s === 'openLoops')
+          ? { ...emptyCoverage('none'), suppressedCount: 0 }
+          : emptyCoverage('none')])),
         totalTokenEstimate: 0,
         budget: params.budget,
       },
@@ -414,15 +416,17 @@ export function performResume(
     const items = sectionItems[section];
     if (beforeCursor && section === cursor!.s) beforeCursor = false;
     const hiddenHere = suppressed[section] ?? 0;
+    // v3 currentFacts/openLoops always carry the fixed-size suppressedCount.
+    const sup = selection && (section === 'currentFacts' || section === 'openLoops') ? { suppressedCount: hiddenHere } : {};
     if (!requested.has(section)) {
       included[section] = [];
-      coverageEntries.push([section, { ...emptyCoverage('not-requested', items.length + hiddenHere), contentComplete: false }]);
+      coverageEntries.push([section, { ...emptyCoverage('not-requested', items.length + hiddenHere), contentComplete: false, ...sup }]);
       continue;
     }
     if (beforeCursor) {
       // Delivered on an earlier page — accounted, not repeated.
       included[section] = [];
-      coverageEntries.push([section, { ...emptyCoverage('cursor', items.length + hiddenHere), contentComplete: false }]);
+      coverageEntries.push([section, { ...emptyCoverage('cursor', items.length + hiddenHere), contentComplete: false, ...sup }]);
       continue;
     }
     if (truncated) {
@@ -431,6 +435,7 @@ export function performResume(
         ...emptyCoverage('budget', items.length + hiddenHere),
         contentComplete: items.length === 0 && hiddenHere === 0,
         omittedReason: items.length === 0 ? (hiddenHere === 0 ? 'none' : (selection as V3Selection).suppressedReason) : 'budget',
+        ...sup,
       }]);
       continue;
     }
@@ -454,15 +459,18 @@ export function performResume(
     const hidden = suppressed[section] ?? 0;
     const complete = startOffset === 0 && includedCount === items.length;
     const delivered = complete || startOffset + includedCount >= items.length;
+    // Once every deliverable item has been delivered (this page or a cursor
+    // page), the only thing still missing is the suppressed set — say so.
     coverageEntries.push([section, {
       includedCount,
       totalCount: items.length + hidden,
       contentComplete: complete && hidden === 0,
-      omittedReason: complete
-        ? (hidden === 0 ? 'none' : (selection as V3Selection).suppressedReason)
-        : (startOffset > 0 && delivered ? 'cursor' : 'budget'),
+      omittedReason: delivered
+        ? (hidden > 0 ? (selection as V3Selection).suppressedReason : (complete ? 'none' : 'cursor'))
+        : 'budget',
       nextCursor: delivered ? null : encodeCursor({ s: section, o: startOffset + includedCount }),
       tokenEstimate: sectionTokens,
+      ...sup,
     }]);
   }
 
@@ -489,6 +497,7 @@ export function performResume(
         liveHeadCount: heads.length,
         divergentHeadCount: heads.length - (current ? 1 : 0),
         retiredHeadCount: retiredHeadCount(db, tenantId, scopeKey),
+        opaqueDivergentCount: selection ? selection.opaqueDivergentCount : 0,
       }
     : {};
 

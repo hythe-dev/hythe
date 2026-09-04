@@ -117,7 +117,7 @@ const attack = (db: any) => {
 };
 
 const V1_ASOF_KEYS = ['assembledAt', 'conflicts', 'revision', 'stale', 'stateAgeSec', 'stateId'];
-const V3_ASOF_KEYS = [...V1_ASOF_KEYS, 'divergentHeadCount', 'liveHeadCount', 'pointer', 'retiredHeadCount', 'selection'].sort();
+const V3_ASOF_KEYS = [...V1_ASOF_KEYS, 'divergentHeadCount', 'liveHeadCount', 'opaqueDivergentCount', 'pointer', 'retiredHeadCount', 'selection'].sort(); // opaqueDivergentCount added by H4
 
 // ---------------------------------------------------------------------------
 
@@ -500,7 +500,7 @@ describe('H1 resume v3 — bundle shape, schema exclusivity, budget and cursor (
     check(); // legacy
   });
 
-  it('v3 asOf carries exactly the six frozen fields plus the five fixed-size head fields', () => {
+  it('v3 asOf carries exactly the six frozen fields plus the fixed-size head fields', () => {
     const db = freshDb();
     attack(db);
     expect(Object.keys(resume(db, { resultVersion: 3 }).asOf).sort()).toEqual(V3_ASOF_KEYS);

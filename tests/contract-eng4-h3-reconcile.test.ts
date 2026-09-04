@@ -731,9 +731,10 @@ describe('H3 codex-hythe review 0952b074 — re-resolution after a survivor swit
 
   it('FINDING 4: an altered retirement actor, time or reason fails replay and v3 resume parity', () => {
     for (const [sql, pattern] of [
-      [`UPDATE eng4_head_retirements SET retired_by='someone-else'`, /names actor/],
-      [`UPDATE eng4_head_retirements SET retired_at='1970-01-01T00:00:00Z'`, /is timed/],
-      [`UPDATE eng4_head_retirements SET reason='rewritten'`, /reason that differs/],
+      // Two fail-closed layers may fire: the scope-wide check (H4) or the on-lineage parity (H3).
+      [`UPDATE eng4_head_retirements SET retired_by='someone-else'`, /names actor|actor, time or reason that differs/],
+      [`UPDATE eng4_head_retirements SET retired_at='1970-01-01T00:00:00Z'`, /is timed|actor, time or reason that differs/],
+      [`UPDATE eng4_head_retirements SET reason='rewritten'`, /reason that differs|actor, time or reason that differs/],
     ] as const) {
       const db = freshDb();
       const { a, c } = attack(db);

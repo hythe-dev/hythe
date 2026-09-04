@@ -456,9 +456,11 @@ const SCOPE_POINTER = {
  */
 const SECTION_COVERAGE_V3 = {
   ...SECTION_COVERAGE,
+  required: [...SECTION_COVERAGE.required, 'suppressedCount'],
   properties: {
     ...SECTION_COVERAGE.properties,
     omittedReason: { enum: ['budget', 'cursor', 'not-requested', 'none', 'undesignated', 'unversioned'] },
+    suppressedCount: { type: 'integer', minimum: 0, maximum: { $data: '1/totalCount' } },
   },
   allOf: [
     SECTION_COVERAGE.allOf[0],
@@ -579,7 +581,7 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
       ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf,
       required: [
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.required,
-        'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount',
+        'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount', 'opaqueDivergentCount',
       ],
       properties: {
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.properties,
@@ -588,6 +590,7 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
         liveHeadCount: { type: 'integer', minimum: 0 },
         divergentHeadCount: { type: 'integer', minimum: 0 },
         retiredHeadCount: { type: 'integer', minimum: 0 },
+        opaqueDivergentCount: { type: 'integer', minimum: 0 },
       },
     },
     heads: { type: 'array', items: HEAD_ITEM },

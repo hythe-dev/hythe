@@ -447,3 +447,139 @@ describe('H4 bundle shape, ordering, budget (§2.7, §9.3)', () => {
     expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
   });
 });
+
+describe('H4 independent review round 1 — coverage key parity, paged suppression, flags and metadata', () => {
+  it('FINDING 1: an out-of-band scope_key change on a coverage row fails the v3 resume instead of un-covering the tuple and falling back to an older value', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('v1')] });
+    const F = root.changes.facts[0].factId;
+    const u = write(db, { expectedRevision: 1, factChanges: [fact('v2', { factId: F })] });
+    expect(v3(db).currentFacts[0].assertion.subject).toBe('v2');
+    bypass(db, () => db.prepare(`UPDATE eng4_version_coverage SET scope_key='p:elsewhere' WHERE state_id=?`).run(u.stateId));
+    expect(() => v3(db)).toThrow(/carries scope 'p:elsewhere'/);
+    expect(() => v3(db)).toThrow(CheckpointIntegrityError);
+    expect(resume(db).currentFacts[0].assertion.subject).toBe('v2'); // v1 untouched
+  });
+
+  it('FINDING 2: suppression stays visible across pages — suppressedCount on every page, and the suppression reason once every deliverable item is out', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: Array.from({ length: 12 }, (_, i) => fact(`f${i}`)) });
+    // One more fact whose only change is pre-ledger → suppressed.
+    const extra = write(db, { expectedRevision: root.revision, factChanges: [fact('legacy-only')] });
+    const S = extra.changes.facts[0].factId;
+    makePreLedger(db, extra.stateId);
+    const full = v3(db, { budget: 50000 });
+    expect(full.coverage.currentFacts).toMatchObject({ includedCount: 12, totalCount: 13, suppressedCount: 1, contentComplete: false, omittedReason: 'unversioned', nextCursor: null });
+    expect(full.legacyValues).toEqual([expect.objectContaining({ id: S })]);
+    const budget = 520; // enough for working + heads, not for all twelve facts
+    const p1 = v3(db, { budget });
+    expect(p1.coverage.currentFacts).toMatchObject({ totalCount: 13, suppressedCount: 1, omittedReason: 'budget', contentComplete: false });
+    expect(p1.coverage.currentFacts.includedCount).toBeLessThan(12);
+    expect(p1.coverage.currentFacts.nextCursor).toEqual(expect.any(String));
+    let cursor = p1.coverage.currentFacts.nextCursor; let last: any = p1; let delivered = p1.currentFacts.length;
+    while (cursor) { last = v3(db, { budget, cursor }); delivered += last.currentFacts.length; cursor = last.coverage.currentFacts.nextCursor; }
+    expect(delivered).toBe(12);
+    // The final page has delivered everything deliverable: the reason is the suppression, cursor null, count still 1.
+    expect(last.coverage.currentFacts).toMatchObject({ totalCount: 13, suppressedCount: 1, omittedReason: 'unversioned', contentComplete: false, nextCursor: null });
+    // A later page (section already delivered) still carries the count.
+    const later = v3(db, { budget, cursor: Buffer.from(JSON.stringify({ s: 'legacyValues', o: 0 }), 'utf8').toString('base64url') });
+    expect(later.coverage.currentFacts).toMatchObject({ omittedReason: 'cursor', suppressedCount: 1, totalCount: 13 });
+    for (const b of [full, p1, last, later]) expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
+    expect(validV3({ ...full, coverage: { ...full.coverage, currentFacts: { ...full.coverage.currentFacts, suppressedCount: 99 } } })).toBe(false); // ≤ totalCount
+  });
+
+  it('FINDING 3: isV1CurrentValue tolerates ref order and duplicates (the in-place refs table sorts and dedupes)', () => {
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('good')] });
+    const F = root.changes.facts[0].factId;
+    write(db, { expectedRevision: 1, state: state('a') });
+    write(db, { expectedRevision: 1, state: state('c'), factChanges: [fact('bad', { factId: F, evidenceRefs: ['z', 'a'], sourceRefs: ['s', 's'] })] });
+    const b = v3(db);
+    expect(b.divergentValues[0]).toMatchObject({ isV1CurrentValue: true, value: expect.objectContaining({ evidenceRefs: ['z', 'a'], sourceRefs: ['s', 's'] }) });
+    expect(resume(db).currentFacts[0].evidenceRefs).toEqual(['a', 'z']);
+  });
+
+  it('FINDING 4: loop openedAt is the in-place creation time even when the creation is pre-ledger', () => {
+    const db = freshDb();
+    const root = write(db, { loopChanges: [{ status: 'open', nextAction: 'n', owner: 'o' }] });
+    const L = root.changes.loops[0].loopId;
+    const openedAt = (db.prepare(`SELECT opened_at FROM eng4_open_loops WHERE loop_id=?`).get(L) as any).opened_at;
+    const u = write(db, { expectedRevision: 1, loopChanges: [{ loopId: L, status: 'blocked', nextAction: 'x', owner: 'o' }] });
+    makePreLedger(db, root.stateId);
+    const b = v3(db);
+    const uRecordedAt = (db.prepare(`SELECT recorded_at FROM eng4_state_snapshots WHERE state_id=?`).get(u.stateId) as any).recorded_at;
+    expect(b.openLoops).toEqual([expect.objectContaining({ loopId: L, status: 'blocked', openedAt, updatedAt: uRecordedAt, provenance: expect.objectContaining({ stateId: u.stateId }) })]);
+  });
+
+  it('FINDING 5: an altered actor, time or reason on an OFF-lineage reconcile\'s retirement row fails the v3 resume', () => {
+    for (const sql of [`UPDATE eng4_head_retirements SET retired_by='intruder'`, `UPDATE eng4_head_retirements SET retired_at='1970-01-01T00:00:00Z'`, `UPDATE eng4_head_retirements SET reason='rewritten'`]) {
+      const db = freshDb();
+      const { a, c, F } = fork(db);
+      const r1 = reconcile(db, { expectedHeads: [a.stateId, c.stateId], survivor: a.stateId, rejectLineages: [c.stateId] });
+      const e = write(db, { expectedRevision: a.revision, state: state('e') });
+      reconcile(db, { expectedHeads: [e.stateId, r1.stateId], survivor: e.stateId, rejectLineages: [r1.stateId], resolutions: [{ kind: 'fact', id: F, divergentStateId: c.stateId, decision: 'reject' }] });
+      bypass(db, () => db.prepare(`${sql} WHERE state_id=?`).run(c.stateId)); // C's retirement belongs to R1, now off-lineage
+      expect(() => v3(db), sql).toThrow(/actor, time or reason that differs/);
+    }
+  });
+
+  it('FINDING 6: opaque divergent terminals are counted on asOf (not listed), so a pending mandatory rejection is visible', () => {
+    const db = freshDb();
+    const root = write(db, { loopChanges: [{ status: 'open', nextAction: 'n', owner: 'orig' }] });
+    const L = root.changes.loops[0].loopId;
+    write(db, { expectedRevision: 1, state: state('a') });
+    const c = write(db, { expectedRevision: 1, state: state('c'), loopChanges: [{ loopId: L, status: 'blocked', nextAction: 'x' }] });
+    makePreLedger(db, root.stateId); // C's tuple becomes unversioned (opaque)
+    const b = v3(db);
+    expect(b.asOf.opaqueDivergentCount).toBe(1);
+    expect(b.divergentValues).toEqual([]);
+    expect(b.legacyValues).toEqual([expect.objectContaining({ kind: 'loop', id: L })]); // in-place row shows C's write
+    expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
+    void c;
+  });
+
+  it('more cases: suppressed id with divergent versions; divergent value equal to the accepted one; superseded on a divergent branch; closed loop in legacyValues; empty scope', () => {
+    // Suppressed id that also has a divergent version: the accepted side is unknowable, the divergent side is listed.
+    const db = freshDb();
+    const root = write(db, { factChanges: [fact('good')] });
+    const F = root.changes.facts[0].factId;
+    write(db, { expectedRevision: 1, state: state('a') });
+    const c = write(db, { expectedRevision: 1, state: state('c'), factChanges: [fact('bad', { factId: F })] });
+    makePreLedger(db, root.stateId);
+    let b = v3(db);
+    expect(b.currentFacts).toEqual([]);
+    expect(b.coverage.currentFacts).toMatchObject({ suppressedCount: 1, omittedReason: 'unversioned' });
+    expect(b.divergentValues).toEqual([expect.objectContaining({ id: F, stateId: c.stateId })]);
+    expect(b.legacyValues).toEqual([expect.objectContaining({ id: F })]);
+    // Equal value on a divergent branch still needs a resolution and is listed (causal, not value-based).
+    const db2 = freshDb();
+    const r2 = write(db2, { factChanges: [fact('same')] });
+    const G = r2.changes.facts[0].factId;
+    write(db2, { expectedRevision: 1, state: state('a') });
+    write(db2, { expectedRevision: 1, state: state('c'), factChanges: [fact('same', { factId: G })] });
+    b = v3(db2);
+    expect(b.currentFacts[0].assertion.subject).toBe('same');
+    expect(b.divergentValues).toEqual([expect.objectContaining({ id: G, isV1CurrentValue: true, resolved: false })]);
+    // Superseded on a divergent branch: accepted value stands; the superseding write is a divergent value.
+    const db3 = freshDb();
+    const r3 = write(db3, { factChanges: [fact('keep')] });
+    const H = r3.changes.facts[0].factId;
+    write(db3, { expectedRevision: 1, state: state('a') });
+    write(db3, { expectedRevision: 1, state: state('c'), factChanges: [fact('keep', { factId: H, status: 'superseded' })] });
+    b = v3(db3);
+    expect(b.currentFacts).toEqual([expect.objectContaining({ factId: H, status: 'asserted' })]);
+    expect(b.divergentValues).toEqual([expect.objectContaining({ id: H, value: expect.objectContaining({ status: 'superseded' }) })]);
+    expect(resume(db3).currentFacts).toEqual([]); // v1: superseded in place
+    // Closed loop in legacyValues under an undesignated scope; empty scope under v3.
+    const db4 = freshDb();
+    const r4 = write(db4, { loopChanges: [{ status: 'closed', nextAction: 'done', closeOutcome: 'ok' }] });
+    dropPointer(db4);
+    b = v3(db4);
+    expect(b.legacyValues).toEqual([expect.objectContaining({ kind: 'loop', id: r4.changes.loops[0].loopId, value: expect.objectContaining({ status: 'closed' }) })]);
+    expect(validV3(b), ajv.errorsText(validV3.errors)).toBe(true);
+    const empty = v3(freshDb());
+    expect(empty.asOf).toMatchObject({ selection: 'empty-scope', opaqueDivergentCount: 0 });
+    expect(empty.coverage.currentFacts).toMatchObject({ totalCount: 0, suppressedCount: 0, contentComplete: true });
+    expect(validV3(empty), ajv.errorsText(validV3.errors)).toBe(true);
+  });
+});

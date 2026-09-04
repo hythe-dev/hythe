@@ -30,9 +30,10 @@
  *   with lineageHead, provenance, the value, whether the frozen v1 view
  *   currently shows exactly this value (isV1CurrentValue), and whether a
  *   reconcile ON the accepted lineage has resolved it. Interior versions are
- *   history; opaque (unversioned) terminals have no truthful value to show
- *   and are therefore not listed (they surface in legacyValues when the
- *   in-place row holds them, and a reconcile must reject them).
+ *   history. Opaque (unversioned) terminals have no truthful value to show:
+ *   they are not listed but are COUNTED (asOf.opaqueDivergentCount) so the
+ *   operator knows a reconcile will have to reject them; the in-place row,
+ *   if any, is in legacyValues.
  * - Loops follow the same rule (§6.3): a close written off the lineage
  *   leaves the loop OPEN in v3 and lists the close as a divergent value.
  * - Revision numbers never decide anything across lineages.
@@ -105,6 +106,8 @@ export interface V3Selection {
   suppressedReason: 'undesignated' | 'unversioned';
   divergentValues: DivergentValue[];
   legacyValues: LegacyValue[];
+  /** Divergent terminals with NO truthful value to show (unversioned coverage); a reconcile must reject them. */
+  opaqueDivergentCount: number;
 }
 
 interface FactVersionRow {
@@ -196,24 +199,32 @@ export function selectV3Values(
     return {
       currentFacts: [], openLoops: [],
       suppressedFacts: inPlaceFacts.length, suppressedLoops: inPlaceLoops.length, suppressedReason: 'undesignated',
-      divergentValues: [], legacyValues: legacyOf(),
+      divergentValues: [], legacyValues: legacyOf(), opaqueDivergentCount: 0,
     };
   }
 
-  const lineage = lineageOf(db, tenantId, scopeKey, acceptedHead);
-  const revisionOf = new Map(lineage.map((s) => [s.state_id, s.revision]));
-  const lineageIds = lineage.map((s) => s.state_id);
-
-  // Newest coverage tuple per (kind, id) on the accepted lineage.
-  const placeholders = lineageIds.map(() => '?').join(',');
-  const tuples = lineageIds.length === 0 ? [] : db.prepare(
-    `SELECT v.kind, v.change_id, v.state_id, v.ordinal, v.disposition
-       FROM eng4_version_coverage v WHERE v.tenant_id = ? AND v.scope_key = ? AND v.state_id IN (${placeholders})`
-  ).all(tenantId, scopeKey, ...lineageIds) as Array<{ kind: 'fact' | 'loop'; change_id: string; state_id: string; ordinal: number; disposition: string }>;
+  // Newest coverage tuple per (kind, id) on the accepted lineage — one
+  // deduplicating recursive CTE over the parent chain (§7 row H4), joined to
+  // coverage by (tenant, state_id): the SAME key the H2 verifier checks (and
+  // it asserts each row's scope), so selection and verification cannot
+  // disagree on what a coverage row is (independent review, finding 1).
+  const tuples = db.prepare(
+    `WITH RECURSIVE lin(state_id, revision) AS (
+       SELECT state_id, revision FROM eng4_state_snapshots WHERE tenant_id = ? AND scope_key = ? AND state_id = ?
+       UNION
+       SELECT p.state_id, p.revision
+         FROM eng4_state_snapshots c JOIN lin ON lin.state_id = c.state_id
+         JOIN eng4_state_snapshots p ON p.tenant_id = c.tenant_id AND p.scope_key = c.scope_key AND p.state_id = c.parent_state_id
+        WHERE c.tenant_id = ? AND c.scope_key = ?
+     )
+     SELECT v.kind, v.change_id, v.state_id, v.ordinal, v.disposition, lin.revision
+       FROM eng4_version_coverage v JOIN lin ON lin.state_id = v.state_id
+      WHERE v.tenant_id = ?`
+  ).all(tenantId, scopeKey, acceptedHead, tenantId, scopeKey, tenantId) as Array<{ kind: 'fact' | 'loop'; change_id: string; state_id: string; ordinal: number; disposition: string; revision: number }>;
   const newest = new Map<string, { kind: 'fact' | 'loop'; id: string; stateId: string; ordinal: number; revision: number; disposition: string }>();
   for (const t of tuples) {
     const key = `${t.kind}|${t.change_id}`;
-    const rev = revisionOf.get(t.state_id) ?? -1;
+    const rev = Number(t.revision);
     const cur = newest.get(key);
     if (!cur || rev > cur.revision || (rev === cur.revision && t.ordinal > cur.ordinal)) {
       newest.set(key, { kind: t.kind, id: t.change_id, stateId: t.state_id, ordinal: t.ordinal, revision: rev, disposition: t.disposition });
@@ -249,13 +260,16 @@ export function selectV3Values(
       selectedLoopIds.add(t.id);
       const view = loopView(v);
       const inPlace = inPlaceLoopById.get(t.id);
-      // openedAt is creation metadata: the loop's earliest version on any lineage, else the in-place row.
+      // openedAt is creation metadata, not a value a change asserts: the
+      // in-place row's opened_at when present (written once, at creation; a
+      // pre-ledger creation has no version), else the loop's earliest
+      // version, else this version (independent review, finding 4).
       const opened = db.prepare(`SELECT MIN(recorded_at) AS o FROM eng4_loop_versions WHERE tenant_id = ? AND scope_key = ? AND loop_id = ?`)
         .get(tenantId, scopeKey, t.id) as { o: string | null };
       const item: AcceptedLoop = {
         loopId: t.id, scopeKey, projectId: inPlace?.projectId ?? null, taskId: inPlace?.taskId ?? null,
         owner: view.owner, status: view.status as OpenLoop['status'],
-        openedAt: opened.o ?? inPlace?.openedAt ?? view.recordedAt, updatedAt: view.recordedAt,
+        openedAt: inPlace?.openedAt ?? opened.o ?? view.recordedAt, updatedAt: view.recordedAt,
         nextAction: view.nextAction, revision: inPlace?.revision ?? 0, provenance,
       };
       if (view.dueAt) item.dueAt = view.dueAt;
@@ -274,12 +288,20 @@ export function selectV3Values(
   const suppressedFacts = inPlaceFacts.filter((f) => !selectedFactIds.has(f.factId)).length;
   const suppressedLoops = inPlaceLoops.filter((l) => !selectedLoopIds.has(l.loopId)).length;
 
-  // Divergent terminals (the reconcile's own enumeration).
+  // Divergent terminals (the reconcile's own enumeration). Opaque terminals
+  // (unversioned coverage) have no truthful value to show and are COUNTED,
+  // not listed; a reconcile must reject them (§6.3).
   const { terminals, resolvedKeys } = divergentTerminalsFor(db, tenantId, scopeKey, acceptedHead);
   const inPlaceFactById = new Map(inPlaceFacts.map((f) => [f.factId, f]));
   const divergentValues: DivergentValue[] = [];
+  let opaqueDivergentCount = 0;
+  // For the isV1CurrentValue flag only, refs are compared as sorted sets: the
+  // in-place refs table dedupes and sorts, the version keeps request order
+  // (independent review, finding 3). The reconcile comparable is untouched.
+  const normRefs = (evidenceRefs: string[], sourceRefs: string[], contradicts: string[]) =>
+    canonicalize({ evidenceRefs: [...new Set(evidenceRefs)].sort(), sourceRefs: [...new Set(sourceRefs)].sort(), contradicts: [...new Set(contradicts)].sort() });
   for (const t of terminals.values()) {
-    if (t.comparable === null) continue; // opaque: no truthful value to show; reconcile must reject it
+    if (t.comparable === null) { opaqueDivergentCount++; continue; }
     const lineageHead = [...t.heads].sort()[0];
     let value: FactValueView | LoopValueView;
     let isV1CurrentValue = false;
@@ -289,8 +311,12 @@ export function selectV3Values(
       value = factView(v);
       const ip = inPlaceFactById.get(t.id);
       if (ip) {
-        isV1CurrentValue = comparableFact({ subject: ip.assertion.subject, predicate: ip.assertion.predicate, object: ip.assertion.object, status: ip.status, effectiveAt: ip.effectiveAt ?? null,
-          refsJson: canonicalize({ evidenceRefs: ip.evidenceRefs, sourceRefs: ip.sourceRefs, contradicts: ip.contradicts }) }) === t.comparable;
+        const vv = value as FactValueView;
+        const ipC = comparableFact({ subject: ip.assertion.subject, predicate: ip.assertion.predicate, object: ip.assertion.object, status: ip.status, effectiveAt: ip.effectiveAt ?? null,
+          refsJson: normRefs(ip.evidenceRefs, ip.sourceRefs, ip.contradicts) });
+        const vC = comparableFact({ subject: vv.assertion.subject, predicate: vv.assertion.predicate, object: vv.assertion.object, status: vv.status, effectiveAt: vv.effectiveAt ?? null,
+          refsJson: normRefs(vv.evidenceRefs, vv.sourceRefs, vv.contradicts) });
+        isV1CurrentValue = ipC === vC;
       }
     } else {
       const v = loopQ.get(tenantId, scopeKey, t.id, t.stateId, t.ordinal) as LoopVersionRow | undefined;
@@ -306,5 +332,5 @@ export function selectV3Values(
   }
   divergentValues.sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : a.stateId < b.stateId ? -1 : 1));
 
-  return { currentFacts, openLoops, suppressedFacts, suppressedLoops, suppressedReason: 'unversioned', divergentValues, legacyValues };
+  return { currentFacts, openLoops, suppressedFacts, suppressedLoops, suppressedReason: 'unversioned', divergentValues, legacyValues, opaqueDivergentCount };
 }
