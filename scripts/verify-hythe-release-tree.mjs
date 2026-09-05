@@ -328,7 +328,7 @@ export const verifyReleaseTree = (root = process.cwd()) => {
     failures.push('README release version drift');
   }
   const changelog = read('CHANGELOG.md');
-  if (!changelog.includes(`## ${expectedPackageVersion} - 2026-08-14`)) {
+  if (!changelog.includes(`## ${expectedPackageVersion} - 2026-09-05`)) {
     failures.push('CHANGELOG release version drift');
   }
   const security = read('SECURITY.md');

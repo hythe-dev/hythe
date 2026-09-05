@@ -157,7 +157,7 @@ const makeTree = (version = '9.8.7') => {
   writeFileSync(join(root, 'README.md'), `# HYTHE\n\n**Version ${version}.**\n`);
   writeFileSync(
     join(root, 'CHANGELOG.md'),
-    `# Changelog\n\n## ${version} - 2026-08-14\n\n- dual proof\n`
+    `# Changelog\n\n## ${version} - 2026-09-05\n\n- dual proof\n`
   );
   writeFileSync(
     join(root, 'SECURITY.md'),
