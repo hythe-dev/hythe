@@ -1,5 +1,21 @@
 # Security
 
+## 0.2.0 dual-proof agent authorization
+
+Version 0.2.0 preserves 0.1.7's dual-proof authorization, shared-knowledge
+boundaries and offline adjudicator. Its checkpoint / resume v3 surface adds
+integrity guarantees rather than new authority: snapshot rows are immutable by
+trigger; state is always materialized from hash- and size-verified payloads;
+each payload is read, hashed and parsed once per call and never cached across
+calls; `engram://snapshot` resources serve exactly the verified bytes; version,
+coverage, retirement and resolution rows are verified bidirectionally before
+any v3 selection; and the idempotency fingerprint binds the operation, the
+resolved parent, the normalized reconcile request or raw patch, and the
+retired-parent acknowledgement, so a retry that changes intent is refused
+rather than replayed. Express 4 → 5.2.1 clears the moderate `qs` advisories
+GHSA-x5fp-wj9c-mxmx and GHSA-4mjr-xmp4-gh2g; the production audit reports zero
+findings.
+
 ## 0.1.7 dual-proof agent authorization
 
 Version 0.1.7 preserves 0.1.6's dual-proof authorization and shared-knowledge

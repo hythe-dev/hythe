@@ -26,29 +26,23 @@ HYTHE is an MCP server that lets multiple AI coding agents — Claude Code, Code
 
 ## Status
 
-**Version 0.1.7.** This source tree and package define the reviewed 0.1.7
-release. Version 0.1.7 preserves 0.1.6's dual-proof agent authorization,
+**Version 0.2.0.** This source tree and package define the reviewed 0.2.0
+release. Version 0.2.0 preserves 0.1.7's dual-proof agent authorization,
 exact-mailbox/private-payload containment, bounded related-context discovery,
-and latency-SLO recovery. It extends the offline adjudicator with an explicit,
-hash-bound `quarantine_backing_observation` disposition for a uniquely proven
-private-shaped observation that backs an otherwise unresolved vector; ambiguous,
-cross-tenant, stale, or multiply owned evidence still fails closed. The earlier
-0.1.4 candidate is superseded and is not a publish target. All 0.1.7 rollout
-configurations pin `@hythe/mcp@0.1.7`; verify that the registry returns that
-exact version before production use. The predecessor
-`@tomcat65/engram-mcp` and `io.github.tomcat65/engram` remain available as
-compatibility history and are never unpublished.
-
-**Beyond 0.1.7 on `main` (unpublished).** `checkpoint` / `resume` gained
-`resultVersion: 3`: an explicit current-head pointer per scope, a `reconcile`
-operation that folds live heads into one survivor and resolves divergent values
-causally, append-only verified fact/loop versions, a read model that only
-promotes values proven on the accepted lineage, and `record` / `patch`
-operations on the pointed head. The dependency tree moved to Express 5. All of
-it is opt-in per call; v1 / v2 shapes and fingerprints are frozen. This tree is
-deployed on the reference production host since 2026-09-05; publishing it to
-npm is a separate step. See [CHANGELOG.md](CHANGELOG.md) and the
-[v3 guide](docs/CHECKPOINT-RESUME-V3.md).
+latency-SLO recovery and the offline adjudicator, and adds `checkpoint` /
+`resume` `resultVersion: 3`: an explicit current-head pointer per scope, a
+`reconcile` operation that folds live heads into one survivor and resolves
+divergent values causally, append-only verified fact/loop versions, a read
+model that only promotes values proven on the accepted lineage, and
+`record` / `patch` operations on the pointed head. Every v1 / v2 request and
+result shape is frozen; v3 is opt-in per call, so a 0.1.7 client keeps working
+against a 0.2.0 server. The dependency tree moved to Express 5, clearing two
+moderate `qs` advisories. This release runs on the reference production host
+since 2026-09-05. All 0.2.0 rollout configurations pin `@hythe/mcp@0.2.0`;
+verify that the registry returns that exact version before production use. The
+predecessor `@tomcat65/engram-mcp` and `io.github.tomcat65/engram` remain
+available as compatibility history and are never unpublished. See
+[CHANGELOG.md](CHANGELOG.md) and the [v3 guide](docs/CHECKPOINT-RESUME-V3.md).
 
 House rule: every claim in these docs must trace to a test or a measurement (see the evidence ledger below). Claims that don't are bugs.
 
@@ -77,7 +71,7 @@ House rule: every claim in these docs must trace to a test or a measurement (see
 - **Knowledge graph**: entities, observations, relations, supersession, current-state resolution, conflict surfacing.
 - **Related-context discovery**: exact scope anchoring plus automatic bounded vector retrieval and graph-path reranking, with currentness/evidence/provenance explanations and no implicit writes.
 - **Agent messaging**: direct, capability-based, superseding; tracked delivery lifecycle.
-- **`resume` / `checkpoint`**: budgeted one-call session rehydration with closed coverage accounting, and CAS-protected, branch-preserving structured state capture. With `resultVersion: 3` (on `main`): an explicit current-head pointer, `reconcile` to fold heads and resolve divergent values, verified fact/loop versions with provenance, and `record` / `patch` on the pointed head — see the [v3 guide](docs/CHECKPOINT-RESUME-V3.md).
+- **`resume` / `checkpoint`**: budgeted one-call session rehydration with closed coverage accounting, and CAS-protected, branch-preserving structured state capture. With `resultVersion: 3`: an explicit current-head pointer, `reconcile` to fold heads and resolve divergent values, verified fact/loop versions with provenance, and `record` / `patch` on the pointed head — see the [v3 guide](docs/CHECKPOINT-RESUME-V3.md).
 - **ACP**: the coordination protocol as a versioned spec + real worked example.
 
 ## Embedding runtime contract

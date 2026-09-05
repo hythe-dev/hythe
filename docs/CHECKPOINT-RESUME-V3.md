@@ -2,8 +2,8 @@
 
 `resultVersion: 3` is the opt-in that turns `checkpoint` / `resume` from
 "branch-preserving CAS with conflicts as heads" into a full head-selection and
-reconciliation model. It is on `main` and deployed to the reference
-production host; it is not yet in a published `@hythe/mcp` release. Every v1
+reconciliation model. It ships in `@hythe/mcp` 0.2.0 and runs on the reference
+production host. Every v1
 and v2 request and result shape is frozen and unchanged — a client that never
 sends `resultVersion: 3` sees nothing new except that `working` now follows the
 scope's current-head pointer (below).

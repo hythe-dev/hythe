@@ -1,11 +1,11 @@
 # Changelog
 
-## Unreleased — checkpoint / resume v3 (`resultVersion: 3`)
+## 0.2.0 - 2026-09-05 — checkpoint / resume v3 (`resultVersion: 3`)
 
 Deployed to the reference production host (Pavilion) on 2026-09-05 as image
-`hythe:pavilion-74a324c` (main `74a324c`). Not yet published to npm: the
-`@hythe/mcp` 0.1.7 bridge keeps working unchanged — every v1 and v2 request and
-result shape is frozen, and v3 is an opt-in per call. User guide:
+`hythe:pavilion-74a324c` and published as `@hythe/mcp@0.2.0`. Every v1 and v2
+request and result shape is frozen and unchanged, and v3 is an opt-in per
+call, so a 0.1.7 client keeps working against a 0.2.0 server. User guide:
 [docs/CHECKPOINT-RESUME-V3.md](docs/CHECKPOINT-RESUME-V3.md).
 
 ### Highlights
