@@ -215,8 +215,9 @@ silence, and stands down honestly.
 | Read-state as shared signal | `get_message_detail` (marks read), `get_ai_messages` |
 | Digest-then-archive | `archive_messages` (`markAsRead: true`) |
 | Loop-state current truth | `add_observations` (`mode: "replace-current"`) + `get_current_observation` |
-| Structured worker state | `checkpoint` (CAS, branch-preserving) |
-| Session rehydration | `resume` (budgeted, closed coverage accounting) |
+| Structured worker state | `checkpoint` (CAS, branch-preserving; v3: pointer-aware `write`, `record`, `patch`) |
+| Folding concurrent heads | `checkpoint` `operation: "reconcile"` (v3: exact head set + pointer CAS, survivor, causal resolution) |
+| Session rehydration | `resume` (budgeted, closed coverage accounting; v3: `heads`, provenance, divergent/legacy values) |
 | Identity | `register_agent` / `get_agent_status` |
 
 ## Version history

@@ -11,8 +11,8 @@ so nothing retired can linger in discovery accidentally.
 ### New canonical primitives (2)
 | Tool | Notes |
 |---|---|
-| `resume` | Read primitive. Replaces `get_agent_context` (frozen D4 transition). Frozen input/output schemas; output Ajv-validated in every build before transport; text fallback = the same validated object. |
-| `checkpoint` | Write primitive. Branch-preserving CAS + fingerprint idempotency + transactional fact/loop changes. |
+| `resume` | Read primitive. Replaces `get_agent_context` (frozen D4 transition). Frozen v1/v2 input/output schemas; output Ajv-validated in every build before transport; text fallback = the same validated object. `resultVersion: 3` returns the head-selection model (`asOf.selection`/`pointer`, `heads`, provenance-bearing `currentFacts`/`openLoops`, `divergentValues`, `legacyValues`). |
+| `checkpoint` | Write primitive. Branch-preserving CAS + fingerprint idempotency + transactional fact/loop changes. `resultVersion: 3` adds the `operation` discriminant: `reconcile` (fold heads, retire, resolve divergent values), `record` (changes without state) and `patch` (RFC 7396 merge patch) — the last two admit only the pointed head. See [docs/CHECKPOINT-RESUME-V3.md](docs/CHECKPOINT-RESUME-V3.md). |
 
 History/snapshot/message/handoff fetch is a **resource** (`engram://…` via
 `resources/list` templates + `resources/read`), deliberately never a tool.
