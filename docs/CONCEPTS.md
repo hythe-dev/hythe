@@ -59,6 +59,31 @@ History and full message/handoff bodies are **resources**
 deliberately not tools: bulk history stays off the tool surface and
 payload hashes are verified on read.
 
+### Heads, the pointer, and reconciliation (`resultVersion: 3`)
+
+Branching alone answers "was anything lost?" (no) but not "which head is
+current?". v3 makes that explicit:
+
+- Every scope has a **current-head pointer**. The first write sets it; only a
+  write whose parent *is* the pointed head advances it. A write from any other
+  parent still branches, but it never becomes current by having a higher
+  revision. `working` follows the pointer for every bundle version.
+- **Reconcile** is the one operation that folds heads back together: it names
+  the exact live-head set and the pointer (both compare-and-set), keeps one
+  survivor, retires the rest (recorded, never deleted), and resolves divergent
+  fact/loop values causally — strict by default, so nothing is dropped
+  silently.
+- Facts and loops are **versioned** per writing snapshot and change ordinal,
+  hash-verified against the snapshot payload. The v3 `resume` promotes only
+  values proven on the accepted lineage (each with provenance) and reports the
+  rest as divergent or legacy under the same closed coverage accounting.
+- **`record`** (changes without resending state) and **`patch`** (an RFC 7396
+  merge patch) are admitted only on the pointed head, so a stale branch can
+  never promote its state by logging one fact.
+
+Walkthrough and request/response examples:
+[CHECKPOINT-RESUME-V3.md](./CHECKPOINT-RESUME-V3.md).
+
 ## Discovering reusable knowledge
 
 `resume` is deterministic rehydration for one exact scope; it does not

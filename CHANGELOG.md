@@ -1,6 +1,71 @@
 # Changelog
 
-## Unreleased
+## Unreleased — checkpoint / resume v3 (`resultVersion: 3`)
+
+Deployed to the reference production host (Pavilion) on 2026-09-05 as image
+`hythe:pavilion-74a324c` (main `74a324c`). Not yet published to npm: the
+`@hythe/mcp` 0.1.7 bridge keeps working unchanged — every v1 and v2 request and
+result shape is frozen, and v3 is an opt-in per call. User guide:
+[docs/CHECKPOINT-RESUME-V3.md](docs/CHECKPOINT-RESUME-V3.md).
+
+### Highlights
+
+- **Current-head pointer** (H1). Each scope has an explicit pointer to its
+  current head, set by the first write and advanced only by a write whose parent
+  is the pointed head. Writes from any other parent still branch (frozen CAS)
+  but no longer become "current" by carrying a higher revision. `resume`
+  selects `working` through this one resolver for every bundle version; a
+  broken pointer fails closed (`working: null`) instead of being guessed around.
+- **Reconcile** (H3). `checkpoint` `operation: "reconcile"` names the exact
+  live-head set and the pointer (both compare-and-set), keeps one survivor,
+  retires every other head (recorded, never deleted), moves the pointer, and
+  resolves divergent fact/loop values causally — strict by default, with
+  `accept` bound to a same-request change, `reject`, and `rejectLineages`.
+  Extending a retired head under v3 requires `acknowledgeRetired: true`.
+- **Versioned facts and loops** (H2). Append-only version rows keyed by the
+  writing snapshot and change ordinal, an exact coverage manifest, dual writes
+  on every checkpoint, a verified all-or-nothing backfill at startup, and a
+  bidirectional parity verifier that fails closed on any drift.
+- **The v3 read model** (H4). `resume` `resultVersion: 3` returns
+  `currentFacts` / `openLoops` only from verified versions on the accepted
+  lineage, each with `provenance`; ids without a proven accepted version are
+  suppressed into a non-authoritative `legacyValues` section (accounted as
+  `unversioned` or `undesignated`); every materialized divergent terminal is
+  listed in `divergentValues`; `asOf` gains `selection`, `pointer`, live /
+  divergent / retired / opaque-divergent head counts; a budgeted `heads`
+  section lists every live head.
+- **record and patch** (H5). `operation: "record"` logs fact/loop changes
+  without resending state; `operation: "patch"` applies an RFC 7396 merge patch
+  (null deletes, arrays replace wholesale, the result must validate or nothing
+  is written). Both admit only the pointed head as parent and answer
+  `conflict` (carrying heads and pointer) otherwise — never a branch. The new
+  loop / fact ids come back in `changes`, so no `resume` round trip is needed.
+- **Integrity.** One verified payload loader per call: each payload is
+  selected, hashed and parsed exactly once per `resume` / `checkpoint`
+  (nothing cached across calls); `engram://snapshot` resources serve exactly the
+  bytes that passed verification; the idempotency fingerprint binds the
+  operation, the resolved parent, the normalized reconcile request or raw
+  patch, and the retired-parent acknowledgement.
+- **Dependencies.** Express 4 → 5.2.1, clearing two moderate `qs` advisories
+  that Express 4 / body-parser 1 pinned in place; the HTTP contract is
+  unchanged (Express 4's `req.body` default is restored in one middleware and
+  proven by a hermetic-server contract test).
+
+### Compatibility and adoption
+
+- v1 / v2 request shapes, result shapes, bundle shapes and idempotency
+  fingerprints are byte-identical to 0.1.7. A v1 / v2 request that carries any
+  v3 field fails input validation.
+- Scopes written before v3 have no pointer and no versions. Under v3 they
+  report `selection: "max-revision"`, list every live head, suppress
+  `currentFacts` / `openLoops` as `undesignated`, and answer `conflict` to
+  `record` / `patch` until the scope is reconciled once (recipe in the guide,
+  §5). v1 / v2 reads and writes on those scopes are unaffected.
+- Startup applies the additive eng4 DDL and the verified version backfill in
+  one transaction; a store whose unversioned snapshots already carry ledger,
+  coverage or version rows is refused rather than guessed at.
+
+### Detailed entries (design `docs/design/ENG4-HEAD-RECONCILIATION.md`)
 
 - Dependencies: `express` 4.22.2 → 5.2.1 (with `@types/express` 5.0.6). Express 4
   and body-parser 1 pin `qs` to the 6.15 line, which carries two moderate

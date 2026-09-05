@@ -113,6 +113,36 @@ actions — plus the message that pointed at it. That's the loop: checkpoint
 cadence, stand-down) is [SPEC.md](./SPEC.md); the concepts behind the
 store are in [CONCEPTS.md](./CONCEPTS.md).
 
+## 5b. When two agents both wrote: heads and reconcile (v3, optional)
+
+If agent B had checkpointed from the same parent as agent A, the scope would
+hold two live heads. Nothing is lost, and nothing is silently picked either:
+
+```
+resume({agentId: "agent-a", scope: {project: "hello-fleet"}, budget: 4000,
+        sections: ["working", "heads"], resultVersion: 3})
+```
+
+`asOf.selection` says how "current" was chosen and `heads` lists both heads.
+Fold them with one reconcile — restate the exact head set and pointer from
+that response, choose the survivor, and give a reason:
+
+```
+checkpoint({agentId: "agent-a", scope: {project: "hello-fleet"},
+            resultVersion: 3, operation: "reconcile",
+            expectedHeads: ["<head A>", "<head B>"], expectedPointer: "<head A>",
+            survivor: "<head A>", expectedRevision: 2, reason: "fold B's draft",
+            idempotencyKey: "hello-reconcile-1",
+            state: {objective: "prove shared state", status: "green",
+                    owner: "agent-a", nextActions: ["ship"], blockers: [], guardrails: []}})
+```
+
+From then on `record` (log a fact or loop without resending state) and
+`patch` (merge-patch the state) work on the pointed head. Full guide with the
+result shapes, resolution rules and the adoption step for older scopes:
+[CHECKPOINT-RESUME-V3.md](./CHECKPOINT-RESUME-V3.md). This surface is on
+`main` (not yet in the published 0.1.7 bridge) and is opt-in per call.
+
 ## 6. Complete agent authorization (operator rollout)
 
 Do not switch a populated deployment directly from `observe` to `required`.
