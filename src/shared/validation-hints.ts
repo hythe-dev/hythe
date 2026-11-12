@@ -23,8 +23,19 @@ function distance(a: string, b: string): number {
   return prev[b.length];
 }
 
-/** The closest allowed value when it is plausibly a typo (prefix or <= 2 edits). */
+/** Longest echoed value in an error; longer input is truncated, never scanned. */
+export const MAX_ECHO_CHARS = 64;
+
+/**
+ * The closest allowed value when it is plausibly a typo (prefix or <= 2 edits).
+ * Input much longer than every allowed value cannot be a typo of one, so it
+ * is rejected before any scan: the work stays bounded by the allowed set, not
+ * by caller input (codex-hythe review 1148db41: an 8M-character messageType
+ * took ~528 ms here before this guard).
+ */
 export function closest(value: string, allowed: readonly string[]): string | null {
+  const longest = allowed.reduce((n, a) => Math.max(n, a.length), 0);
+  if (value.length === 0 || value.length > longest + 2) return null;
   const v = value.toLowerCase();
   let best: string | null = null;
   let bestScore = Infinity;
@@ -46,17 +57,34 @@ export interface FieldError {
   expected?: string;
 }
 
-const show = (value: unknown) => (typeof value === 'string' ? `"${value}"` : JSON.stringify(value));
+/**
+ * A bounded echo of caller input: strings are cut to MAX_ECHO_CHARS with the
+ * original length noted; other types are described by type, never serialized.
+ */
+export function echo(value: unknown): { shown: string; value: unknown } {
+  if (typeof value === 'string') {
+    if (value.length <= MAX_ECHO_CHARS) return { shown: `"${value}"`, value };
+    const cut = value.slice(0, MAX_ECHO_CHARS);
+    return { shown: `"${cut}..." (${value.length} characters)`, value: `${cut}...` };
+  }
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') {
+    const text = String(value);
+    if (text.length <= MAX_ECHO_CHARS) return { shown: text, value };
+  }
+  const kind = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+  return { shown: `a value of type ${kind}`, value: `<${kind}>` };
+}
 
 export function enumError(field: string, value: unknown, allowed: readonly string[]): FieldError {
   const guess = typeof value === 'string' ? closest(value, allowed) : null;
+  const { shown, value: echoed } = echo(value);
   return {
     error: 'validation_error',
     code: 'INVALID_ENUM',
     field,
-    value,
+    value: echoed,
     allowed,
-    message: `${field} ${show(value)} is not allowed. Allowed values: ${allowed.join(', ')}.` +
+    message: `${field} ${shown} is not allowed. Allowed values: ${allowed.join(', ')}.` +
       (guess ? ` Did you mean "${guess}"?` : ''),
   };
 }

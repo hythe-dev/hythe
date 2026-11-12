@@ -108,6 +108,42 @@ describe('validation hints (field report dc041e5c K1/K2)', () => {
     });
   });
 
+  describe('bounded work and echo (codex-hythe review 1148db41)', () => {
+    it('an 8M-character enum value is neither scanned nor echoed', () => {
+      const huge = 'x'.repeat(8_000_000);
+      const start = performance.now();
+      const err = enumError('messageType', huge, ['info', 'task', 'query', 'response', 'collaboration']);
+      const elapsed = performance.now() - start;
+      const encoded = JSON.stringify(err);
+      expect(encoded.length).toBeLessThan(1024);
+      expect(err.message).toContain('(8000000 characters)');
+      expect(err.message).not.toContain('Did you mean');
+      expect(elapsed).toBeLessThan(50); // was ~528 ms before the guard
+    });
+
+    it('non-string values are described by type, never serialized', () => {
+      const big = { nested: 'y'.repeat(100_000) };
+      const err = enumError('priority', big, ['low', 'high']);
+      expect(JSON.stringify(err).length).toBeLessThan(512);
+      expect(err.message).toContain('a value of type object');
+      expect(err.value).toBe('<object>');
+      expect(enumError('priority', 42, ['low']).message).toContain('priority 42 is not allowed');
+    });
+
+    it('closest skips input longer than any allowed value can be mistyped into', () => {
+      expect(closest('informm', ['info'])).toBeNull(); // 7 > 4 + 2
+      expect(closest('infoo', ['info'])).toBe('info');
+      expect(closest('', ['info'])).toBeNull();
+    });
+
+    it('over MCP, a 1M-character messageType returns a small error', async () => {
+      const r = await call('send_ai_message', { from: A, to: B, content: 'x', messageType: 'z'.repeat(1_000_000) });
+      expect(r.isError).toBe(true);
+      expect(r.text.length).toBeLessThan(1024);
+      expect(JSON.parse(r.text)).toMatchObject({ code: 'INVALID_ENUM', field: 'messageType' });
+    });
+  });
+
   describe('helpers', () => {
     it('closest suggests only plausible typos', () => {
       expect(closest('inform', ['info', 'task'])).toBe('info');
