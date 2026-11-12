@@ -13,6 +13,7 @@ import { ENG4_TOOLS, RETAINED_LEGACY_TOOLS, READ_DISCOVERY_TOOLS, handleEng4Tool
 import { validateEng4Output } from './unified-server/eng4/register.js';
 import { adaptLegacyBeginSessionArgs } from './unified-server/eng4/schemas.js';
 import { performBeginSession, performEndSession } from './unified-server/eng4/session.js';
+import { withDivergenceNotice } from './unified-server/eng4/divergence.js';
 import {
   authMiddleware,
   rateLimitMiddleware,
@@ -3060,7 +3061,10 @@ export class NeuralMCPServer {
           );
           validateEng4Output('resume', bundle); // same frozen-schema gate as resume
           this.memoryManager.auditLog('begin_session', wrapperArgs.agentId, JSON.stringify(wrapperArgs.scope), String((wrapperArgs.scope as any).project ?? (wrapperArgs.scope as any).task ?? ''));
-          return { content: [{ type: 'text', text: JSON.stringify(bundle) }], structuredContent: bundle };
+          return withDivergenceNotice(
+            { content: [{ type: 'text' as const, text: JSON.stringify(bundle) }], structuredContent: bundle },
+            bundle as any
+          );
         }
 
         case 'end_session': {
