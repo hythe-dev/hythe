@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import cors from 'cors';
 import helmet from 'helmet';
-import { MemoryManager } from './unified-server/memory/index.js';
+import { MemoryManager, MAX_CONTENT_CHARS } from './unified-server/memory/index.js';
 import { MessageHubIntegration } from './message-hub/hub-integration.js';
 import { resolveMessageHubPort } from './message-hub/config.js';
 import { UnifiedToolSchemas } from './shared/toolSchemas.js';
@@ -3822,6 +3822,29 @@ export class NeuralMCPServer {
           }
           if (!['low', 'normal', 'high', 'urgent'].includes(priority)) {
             throw new Error('Invalid message priority');
+          }
+
+          // Declared limit (toolSchemas maxLength, field report 8aeaee56 M8).
+          // Checked before the sanitizer: an oversized message is a validation
+          // error for the caller, not a flagged write or a security alert.
+          const contentLength = MemoryManager.contentLength(content);
+          if (contentLength > MAX_CONTENT_CHARS) {
+            const field = args.content !== undefined ? 'content' : 'message';
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'validation_error',
+                  code: 'CONTENT_TOO_LONG',
+                  field,
+                  limit: MAX_CONTENT_CHARS,
+                  actual: contentLength,
+                  unit: 'characters (Unicode code points)',
+                  message: `${field} is ${contentLength} characters; the limit is ${MAX_CONTENT_CHARS}. Nothing was sent. Split the text into several messages.`,
+                }),
+              }],
+              isError: true,
+            };
           }
 
           // NE-S6c: Sanitize message content
