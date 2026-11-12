@@ -244,8 +244,9 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
         to: { type: 'string', description: 'Target AI agent ID (use "*" for broadcast)' },
         agentId: { type: 'string', description: 'DEPRECATED: Target alias for `to`' },
         from: { type: 'string', description: 'Sender agent ID (required for correct attribution)' },
-        content: { type: 'string', description: 'Message content' },
-        message: { type: 'string', description: 'DEPRECATED: Alias for `content`' },
+        // 10000 = MAX_CONTENT_CHARS (src/unified-server/memory/index.ts); a test pins them equal.
+        content: { type: 'string', minLength: 1, maxLength: 10000, description: 'Message content. At most 10000 characters (Unicode code points); longer content is rejected with a CONTENT_TOO_LONG validation error. Split long text into several messages.' },
+        message: { type: 'string', minLength: 1, maxLength: 10000, description: 'DEPRECATED: Alias for `content`. Same 10000-character limit.' },
         toCapabilities: {
           type: 'array',
           description: 'Select recipients whose capabilities include ALL provided',
