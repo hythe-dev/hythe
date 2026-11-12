@@ -21,7 +21,9 @@ if command -v jq >/dev/null 2>&1; then
 else
   CWD=$(printf '%s' "$INPUT" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 fi
-PROJECT=$(basename "${CWD:-unknown}" | tr '[:upper:]' '[:lower:]')
+# The project name is embedded in JSON below: keep it to a JSON-safe set.
+PROJECT=$(basename "${CWD:-unknown}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/-*$//')
+PROJECT=${PROJECT:-unknown}
 
 cat <<'PROTOCOL'
 ## Persistent Memory — ACTIVE PROTOCOL (HYTHE)
@@ -31,7 +33,8 @@ You have HYTHE MCP memory tools. This protocol is MANDATORY.
 ### SESSION START — do these FIRST, before the user's task:
 PROTOCOL
 
-printf '1. Call mcp__hythe__resume with agentId: "%s" to recover prior session state and recent context.\n' "$AGENT_ID"
+printf '1. Call mcp__hythe__resume to recover prior session state and recent context. Note asOf.revision in the result; your session-close checkpoint needs it. Scope {"project":"%s"} is a default from the working directory; use your usual scope if you have one:\n' "$PROJECT"
+printf 'mcp__hythe__resume {"agentId":"%s","scope":{"project":"%s"},"budget":4000}\n' "$AGENT_ID" "$PROJECT"
 printf '2. Call mcp__hythe__get_ai_messages with agentId: "%s" (defaults: unreadOnly) — other agents may have left you messages. Address or acknowledge anything urgent.\n' "$AGENT_ID"
 
 cat <<'PROTOCOL'
@@ -57,8 +60,18 @@ Call mcp__hythe__search_entities (searchType: exact for known names) when:
 - a topic appears that you have no context on
 
 ### SESSION CLOSE — before saying "done" on substantial work:
-Call mcp__hythe__checkpoint with: goal, discoveries, accomplished, next
-steps, relevant files/entities.
+PROTOCOL
+
+printf 'Call mcp__hythe__checkpoint with this shape:\n'
+printf 'mcp__hythe__checkpoint {"agentId":"%s","scope":{"project":"%s"},"expectedRevision":null,"idempotencyKey":"%s-<short-unique-suffix>","state":{"objective":"<goal>","status":"<what was accomplished>","owner":"%s","nextActions":["<next step>"],"blockers":[],"guardrails":[]},"evidenceRefs":["<relevant file, entity or observation id>"]}\n' "$AGENT_ID" "$PROJECT" "$AGENT_ID" "$AGENT_ID"
+
+cat <<'PROTOCOL'
+- expectedRevision: the asOf.revision from your latest resume (null only if
+  the scope had no state). A stale value branches; it never overwrites.
+- idempotencyKey: at least 8 characters, new for each distinct checkpoint;
+  reuse it only when retrying the same call.
+- state: all six fields are required; use [] for an empty list. Record
+  discoveries with add_observations; state has no field for them.
 PROTOCOL
 
 printf '\nProject directory hint: %s\n' "$PROJECT"
