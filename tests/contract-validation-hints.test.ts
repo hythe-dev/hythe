@@ -8,7 +8,10 @@
  * A misnamed field is now rejected before that fallback runs.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
-import { closest, enumError, formatSchemaErrors, misnamedSendField } from '../src/shared/validation-hints.js';
+import {
+  closest, enumError, formatSchemaErrors, misnamedSendField,
+  MAX_ECHO_CHARS, MAX_LISTED_ERRORS, MAX_SCHEMA_ERROR_CHARS,
+} from '../src/shared/validation-hints.js';
 
 const BASE_URL = process.env.NEURAL_URL || 'http://localhost:6174';
 const API_KEY = process.env.NEURAL_API_KEY || 'IzMklkUkoJv+Thkjp+4B9DVqYYkzHCKQCBJD5dzOW0g=';
@@ -141,6 +144,70 @@ describe('validation hints (field report dc041e5c K1/K2)', () => {
       expect(r.isError).toBe(true);
       expect(r.text.length).toBeLessThan(1024);
       expect(JSON.parse(r.text)).toMatchObject({ code: 'INVALID_ENUM', field: 'messageType' });
+    });
+  });
+
+  describe('bounded unknown-field echo (codex-hythe PR #20 review)', () => {
+    const NAME = 'x'.repeat(1_000_000);
+    const resumeArgs = () => ({ agentId: A, scope: { project: 'p' }, budget: 4000 });
+    const checkpointArgs = (key: string) => ({ agentId: A, scope: { project: 'p' }, expectedRevision: null, idempotencyKey: key, state: validState });
+
+    it('formatSchemaErrors cuts a 1M-character unknown field name and notes its length', () => {
+      const text = formatSchemaErrors([{ keyword: 'additionalProperties', dataPath: '', params: { additionalProperty: NAME } }]);
+      expect(text.length).toBeLessThan(200);
+      expect(text).toBe(`data has unknown field "${'x'.repeat(MAX_ECHO_CHARS)}"... (1000000 characters)`);
+    });
+
+    it('formatSchemaErrors escapes quotes and control characters in a field name', () => {
+      const text = formatSchemaErrors([{ keyword: 'additionalProperties', dataPath: '', params: { additionalProperty: 'a"b\nc' } }]);
+      expect(text).toBe('data has unknown field "a\\"b\\nc"');
+    });
+
+    it('formatSchemaErrors lists at most MAX_LISTED_ERRORS errors and counts the rest', () => {
+      const errors = Array.from({ length: 5000 }, (_, i) => ({ keyword: 'additionalProperties', dataPath: '', params: { additionalProperty: `f${i}_${'y'.repeat(200)}` } }));
+      const text = formatSchemaErrors(errors);
+      expect(text.length).toBeLessThanOrEqual(MAX_SCHEMA_ERROR_CHARS + 60);
+      expect(text.match(/has unknown field/g)).toHaveLength(MAX_LISTED_ERRORS);
+      expect(text).toContain(`and ${5000 - MAX_LISTED_ERRORS} more errors`);
+    });
+
+    it('formatSchemaErrors bounds a long path and caps the total text', () => {
+      const path = `.${'p'.repeat(100_000)}`;
+      const errors = Array.from({ length: MAX_LISTED_ERRORS }, () => ({ keyword: 'type', dataPath: path, message: 'm'.repeat(100_000) }));
+      const text = formatSchemaErrors(errors);
+      expect(text.length).toBeLessThanOrEqual(MAX_SCHEMA_ERROR_CHARS + 60);
+      expect(text).toContain('(100005 characters)'); // "data" + the 100001-character path
+      expect(text).toContain(`(error text cut at ${MAX_SCHEMA_ERROR_CHARS} characters)`);
+    });
+
+    it('over MCP, resume with a 1M-character unknown field returns a small error that names it', async () => {
+      const r = await call('resume', { ...resumeArgs(), [NAME]: 1 });
+      expect(r.isError).toBe(true);
+      expect(r.text.length).toBeLessThan(512);
+      expect(r.text).toContain('has unknown field "xxxx');
+      expect(r.text).toContain('(1000000 characters)');
+    });
+
+    it('over MCP, checkpoint with a 1M-character unknown field returns a small error that names it', async () => {
+      const r = await call('checkpoint', { ...checkpointArgs('k-hints-big-0001'), [NAME]: 1 });
+      expect(r.isError).toBe(true);
+      expect(r.text.length).toBeLessThan(512);
+      expect(r.text).toContain('has unknown field "xxxx');
+      expect(r.text).toContain('(1000000 characters)');
+    });
+
+    it('over MCP, many unknown fields on resume and checkpoint stay bounded', async () => {
+      const many: Record<string, number> = {};
+      for (let i = 0; i < 2000; i++) many[`u${i}_${'z'.repeat(300)}`] = i;
+      for (const r of [
+        await call('resume', { ...resumeArgs(), ...many }),
+        await call('checkpoint', { ...checkpointArgs('k-hints-many-0001'), ...many }),
+      ]) {
+        expect(r.isError).toBe(true);
+        expect(r.text.length).toBeLessThanOrEqual(MAX_SCHEMA_ERROR_CHARS + 200);
+        expect(r.text.match(/has unknown field/g)).toHaveLength(MAX_LISTED_ERRORS);
+        expect(r.text).toContain(`and ${2000 - MAX_LISTED_ERRORS} more errors`);
+      }
     });
   });
 

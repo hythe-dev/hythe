@@ -131,23 +131,54 @@ interface AjvLikeError {
   params?: Record<string, any>;
 }
 
+/** Longest data path echoed in a schema error (paths can carry caller keys). */
+export const MAX_PATH_CHARS = 128;
+/** Most schema errors listed in one message; the rest are counted. */
+export const MAX_LISTED_ERRORS = 10;
+/** Hard cap on the whole formatted schema-error text. */
+export const MAX_SCHEMA_ERROR_CHARS = 2000;
+
+/** Cut caller-derived text to `max` characters, noting the original length. */
+function bounded(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}... (${text.length} characters)`;
+}
+
+/**
+ * A field name from caller input, quoted and escaped (JSON string rules), and
+ * cut to MAX_ECHO_CHARS with the original length noted. codex-hythe PR #20
+ * review: a 1,000,000-character unknown property name was echoed in full.
+ */
+export function echoFieldName(name: unknown): string {
+  if (typeof name !== 'string') return `a field name of type ${typeof name}`;
+  if (name.length <= MAX_ECHO_CHARS) return JSON.stringify(name);
+  return `${JSON.stringify(name.slice(0, MAX_ECHO_CHARS))}... (${name.length} characters)`;
+}
+
 /**
  * Like ajv.errorsText, but enum errors name the allowed values and
- * additionalProperties errors name the unknown field.
+ * additionalProperties errors name the unknown field. Everything taken from
+ * caller input is bounded: each field name (MAX_ECHO_CHARS, escaped), each
+ * path (MAX_PATH_CHARS), the number of errors listed (MAX_LISTED_ERRORS, the
+ * rest counted), and the whole text (MAX_SCHEMA_ERROR_CHARS).
  */
 export function formatSchemaErrors(errors: readonly AjvLikeError[] | null | undefined): string {
   if (!errors || errors.length === 0) return 'no errors';
-  return errors.map((e) => {
-    const path = `data${e.dataPath ?? e.instancePath ?? ''}`;
+  const listed = errors.slice(0, MAX_LISTED_ERRORS).map((e) => {
+    const path = bounded(`data${e.dataPath ?? e.instancePath ?? ''}`, MAX_PATH_CHARS);
     if (e.keyword === 'enum' && Array.isArray(e.params?.allowedValues)) {
       return `${path} must be one of: ${e.params!.allowedValues.map((v: unknown) => JSON.stringify(v)).join(', ')}`;
     }
     if (e.keyword === 'const' && e.params && 'allowedValue' in e.params) {
       return `${path} must be ${JSON.stringify(e.params.allowedValue)}`;
     }
-    if (e.keyword === 'additionalProperties' && e.params?.additionalProperty) {
-      return `${path} has unknown field "${e.params.additionalProperty}"`;
+    if (e.keyword === 'additionalProperties' && e.params?.additionalProperty !== undefined) {
+      return `${path} has unknown field ${echoFieldName(e.params.additionalProperty)}`;
     }
-    return `${path} ${e.message ?? 'is invalid'}`;
-  }).join(', ');
+    return `${path} ${bounded(e.message ?? 'is invalid', MAX_PATH_CHARS)}`;
+  });
+  const more = errors.length - listed.length;
+  const text = listed.join(', ') + (more > 0 ? `, and ${more} more error${more === 1 ? '' : 's'}` : '');
+  return text.length <= MAX_SCHEMA_ERROR_CHARS
+    ? text
+    : `${text.slice(0, MAX_SCHEMA_ERROR_CHARS)}... (error text cut at ${MAX_SCHEMA_ERROR_CHARS} characters)`;
 }
