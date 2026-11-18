@@ -1,30 +1,30 @@
 # Sender identity and agent fencing: options and migration plan
 
 Status: PLAN ONLY. No auth-mode change, no credential, no deploy. Every
-production step below is Tomas's decision.
-Source: task 1147d702 item 3; field reports 8aeaee56 M1 (Manus, 2026-10-14)
-and 9ceed35e P3 (2026-09-20); hythe-bot-gateway review F3 (fa14d849).
-Author: claude-hythe, 2026-11-12. Code references are to hythe-dev/hythe main
+production step below is the owner's decision.
+Source: task 1147d702 item 3; field reports 8aeaee56 M1 (2026-10-14)
+and 9ceed35e P3 (2026-09-20); bot gateway review F3 (fa14d849).
+Written 2026-11-12. Code references are to hythe-dev/hythe main
 449794a.
 
-Revision 2 (2026-11-12) answers codex-hythe review d913806a: step 0 is a
+Revision 2 (2026-11-12) answers review d913806a: step 0 is a
 mandatory inventory gate that produces the impact table (no assumed-empty
 set of enforced principals); the mode rollback is treated as a security
 rollback with a stop/restore order; `enable` restores the prior state.
 
 ## 1. The problem, precisely
 
-engram-v1 runs `HYTHE_AGENT_AUTH_MODE=observe`
-(`docker/pavilion-production.compose.yml`). In observe mode:
+This section describes `HYTHE_AGENT_AUTH_MODE=observe` as a mode, wherever it
+is set. In observe mode:
 
 - A caller with the base key and **no** agent key may claim any `agentId` /
   `from` (`policy.ts` legacy path: `legacy_observed`). So any lane can send a
-  message "from muse" or write an observation as "codex-hythe" (M1).
+  message "from" a bot or write an observation as another lane (M1).
 - A caller that **does** present an agent key is pinned to its principal,
   even in observe mode (`claimed_identity_mismatch`), and its scopes are
   enforced (`binder.ts assertAgentCredentialScope`). Keys work today; the
   trouble is that nothing makes them *necessary*.
-- There is no way to silence a stood-down lane (P3: codex-desktop-ws01 kept
+- There is no way to silence a stood-down lane (P3: a stood-down lane kept
   messaging every ~5 minutes for hours). `hythe-agent-auth` has `issue`,
   `status`, `promote`, `rotate` and `revoke`, and no `disable`.
 
@@ -70,7 +70,7 @@ Limits, stated honestly:
   talking" case, which is what P3 reported.
 - Unbound read tools (search, entity detail) stay open to the base key.
 - The operator is offline-only (`BEGIN EXCLUSIVE`): each disable needs a
-  short engram-v1 stop. An online, authenticated operator endpoint is
+  short stop of the server. An online, authenticated operator endpoint is
   possible but is a larger security change and should be its own review.
 
 `enable` must restore the exact state the principal had before `disable`
@@ -89,9 +89,9 @@ is deny-only and reversible by `enable`.
 `mixed` changes behavior for exactly two kinds of caller:
 (a) keyless claims of **enforced** principals, and (b) keyless calls to
 agent-bound tools with **no** claim. Everyone else behaves as in observe.
-Do not assume (a) is empty: some principals may already be enforced (the
-bensalem-team instance has an enforced read-only identity, and nothing in
-hythe records engram-v1's principal states). Its size comes only from the
+Do not assume (a) is empty: some principals may already be enforced (an
+instance may already have an enforced read-only identity, and nothing in
+hythe records an instance's principal states). Its size comes only from the
 step 0 inventory below.
 (b) is the real compatibility risk.
 
@@ -110,33 +110,33 @@ remain.
   messages claiming the bot's id. Server enforcement is the only boundary
   that holds.
 - **Skipping straight to `required`:** locks out unprovisioned lanes
-  (`docs/PAVILION-PRODUCTION.md` says the same).
+  (the deployment notes say the same).
 
-## 4. Migration path for engram-v1 (each step: Tomas)
+## 4. Migration path for a deployment in observe mode (each step: the owner)
 
 0. **Inventory (mandatory gate, read-only). Nothing below starts until it is
-   done and its impact table is accepted by Tomas.**
+   done and its impact table is accepted by the owner.**
    - *Principals:* every row of `agent_principals` and its credentials:
      agent id, `enforcement_state`, scopes, expiry, last use. `hythe-agent-auth
      status` takes one `--agent-id` at a time and cannot list unknown ids, so
      read the tables with a read-only SQLite query against the **verified
      backup copy** made for the migration, never the live database. Proposed
      work item: `status --all`.
-   - *Callers:* every client of engram-v1, by surface: MCP bridges (each
+   - *Callers:* every client of the instance, by surface: MCP bridges (each
      lane's `HYTHE_AGENT_ID` and whether it has a key file), automation (timers,
      cron, wake/relay scripts, backups), REST callers (`/ai-message` and the
      other REST routes), WebSocket hub clients on 3004, and dashboard/operator
      tooling. For each: the identity it claims, whether it presents a key, and
      the tools it calls (agent-bound or not).
    - *Output:* an impact table, one row per caller, saying what happens to it
-     at steps 3, 4, 5 and 6. Every "breaks" row is fixed, or accepted by Tomas,
+     at steps 3, 4, 5 and 6. Every "breaks" row is fixed, or accepted by the owner,
      before that step. Not recorded anywhere in hythe today.
 1. **Telemetry gap first (code, observe-only).** The auth metrics carry only
    `{mode, proof}` (`metrics.ts recordAgentAuthInvocation`), with no tool or
    claim presence, so they cannot show who would hit `AGENT_ID_REQUIRED`
    under mixed. Add a counter (or an audit row) for "legacy call to an
    agent-bound tool with no claim", labeled by tool, in observe only. Run it
-   for about a week. Deploying it is a normal image change, which is Tomas's
+   for about a week. Deploying it is a normal image change, which is the owner's
    call.
 2. **Fix the callers step 1 finds** (pass `agentId`/`from` explicitly). This is
    client-side; no server change.
@@ -175,18 +175,18 @@ What breaks for existing lanes, by step:
 - Step 5: only keyless use of a promoted id. That is the point.
 - Step 6: every lane without a key.
 
-## 5. Minimum for hythe-bot-gateway phase 2 (writes)
+## 5. Minimum for bot gateway phase 2 (writes)
 
-Under observe mode, a message or note "from muse" is forgeable by any base-key
+Under observe mode, a message or note "from" a bot is forgeable by any base-key
 holder, whatever the gateway does. The minimum before any bot write is
 turned on:
 
-1. engram-v1 in **mixed** mode (step 4);
+1. the instance the gateway writes to in **mixed** mode (step 4);
 2. each writing bot's principal issued, canaried and **enforced** (step 5),
    with scopes limited to what the bot's phase-2 tools need: `message:send`
    for send_message and `memory:write` for add_note, on top of phase 1's
    `memory:read` and `message:read`;
-3. a negative test on the live canary: a keyless call claiming `from: "muse"`
+3. a negative test on the live canary: a keyless call claiming a bot's id as `from`
    is refused with `AGENT_CREDENTIAL_REQUIRED`;
 4. option A available, so a misbehaving bot can be fenced without
    redeploying the gateway (the gateway's own kill switch covers the gateway
