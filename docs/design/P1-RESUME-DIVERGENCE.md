@@ -1,15 +1,15 @@
 # P1: stale resume pointer — visibility (done) and low-friction reconcile (proposal)
 
 Status: part A implemented on branch `fix/resume-pointer-lag`; part B is a
-proposal only, for codex-hythe review and an owner decision.
-Source: field report 9ceed35e P1 (claude-desktop-ws01, 2026-09-20), task
-1147d702 item 2. Author: claude-hythe, 2026-11-12.
+proposal only, for review and an owner decision.
+Source: field report 9ceed35e P1 (2026-09-20), task 1147d702 item 2.
+Written 2026-11-12.
 
 ## The report
 
-On scope `bensalem-clean` the pointer sat at revision 378 while live heads
+On scope `scope-a` the pointer sat at revision 378 while live heads
 reached ~500. `resume` handed a newcomer state ~120 revisions old with no
-warning. The same pattern shows on `blender-direct-app` (codex-portal,
+warning. The same pattern shows on `scope-b` (another agent,
 2026-10-17/18: "resume still selects stale 215 with divergent 492 listed").
 The report asks for (1) the divergence to be surfaced prominently, with
 revision lag and head count, and (2) "a low-friction auto-reconcile path when

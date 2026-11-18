@@ -1,5 +1,5 @@
 /**
- * Field report 8aeaee56 M8 (Manus, 2026-10-14): send_ai_message rejected
+ * Field report 8aeaee56 M8 (2026-10-14): send_ai_message rejected
  * content over 10,000 characters, but the schema declared no maxLength and the
  * rejection was a plain "flagged by sanitizer" error that also raised a
  * security alert. The REST route allowed 100,000.

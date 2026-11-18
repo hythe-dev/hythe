@@ -1,6 +1,6 @@
 /**
  * Field report 9ceed35e P1: resume must make pointer-versus-head divergence
- * visible. On bensalem-clean the pointer sat at revision 378 while a branch
+ * visible. On scope-a the pointer sat at revision 378 while a branch
  * grew to ~500, and resume returned the old state with no warning.
  *
  * The handlers now append a plain-text notice as content[1] when a scope has
@@ -47,10 +47,10 @@ const freshDb = () => {
 };
 
 const state = (status: string): WorkingState => ({
-  objective: 'P1', status, owner: 'claude-hythe', nextActions: [], blockers: [], guardrails: [],
+  objective: 'P1', status, owner: 'agent-a', nextActions: [], blockers: [], guardrails: [],
 });
 let keySeq = 0;
-const write = (db: any, expectedRevision: number | null, status: string, agentId = 'claude-hythe') =>
+const write = (db: any, expectedRevision: number | null, status: string, agentId = 'agent-a') =>
   performCheckpoint(db, directory, TENANT, {
     agentId,
     scope: { project: 'Proj' },
@@ -60,7 +60,7 @@ const write = (db: any, expectedRevision: number | null, status: string, agentId
   } as CheckpointParams) as any;
 
 const callResume = (db: any, extra: Record<string, unknown> = {}) =>
-  handleEng4Tool('resume', { agentId: 'claude-hythe', scope: { project: 'Proj' }, budget: 4000, ...extra }, {
+  handleEng4Tool('resume', { agentId: 'agent-a', scope: { project: 'Proj' }, budget: 4000, ...extra }, {
     db, directory, tenantId: TENANT,
   }) as { content: Array<{ type: 'text'; text: string }>; structuredContent: any };
 
@@ -71,9 +71,9 @@ const callResume = (db: any, extra: Record<string, unknown> = {}) =>
 const strandedPointer = (db: any) => {
   write(db, null, 'root');
   const a = write(db, 1, 'a');
-  write(db, 1, 'c', 'codex-clean');
-  write(db, 3, 'c2', 'codex-clean');
-  const c3 = write(db, 4, 'c3', 'codex-clean');
+  write(db, 1, 'c', 'agent-b');
+  write(db, 3, 'c2', 'agent-b');
+  const c3 = write(db, 4, 'c3', 'agent-b');
   return { a, c3 };
 };
 
@@ -100,9 +100,9 @@ describe('resume divergence notice (field report 9ceed35e P1)', () => {
     expect(r.content).toHaveLength(2);
     const notice = r.content[1].text;
     expect(notice).toMatch(/^WARNING \(hythe resume\): the working state above is revision 2/);
-    expect(notice).toContain('1 other live head(s); the newest is revision 5 by codex-clean');
+    expect(notice).toContain('1 other live head(s); the newest is revision 5 by agent-b');
     expect(notice).toContain('3 revision(s) ahead');
-    expect(notice).toContain(`rev 5 codex-clean ${c3.stateId}; rev 2 claude-hythe ${a.stateId} (current)`);
+    expect(notice).toContain(`rev 5 agent-b ${c3.stateId}; rev 2 agent-a ${a.stateId} (current)`);
     expect(notice).toContain('checkpoint with expectedRevision 2');
 
     const d = summarizeDivergence(r.structuredContent)!;
@@ -137,7 +137,7 @@ describe('resume divergence notice (field report 9ceed35e P1)', () => {
   it('extending the stray branch never advances current and the lag keeps growing', () => {
     const db = freshDb();
     strandedPointer(db);
-    write(db, 5, 'c4', 'codex-clean');
+    write(db, 5, 'c4', 'agent-b');
     const r = callResume(db);
     expect(r.structuredContent.asOf.revision).toBe(2);
     expect(r.content[1].text).toContain('4 revision(s) ahead');

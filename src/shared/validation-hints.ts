@@ -1,6 +1,6 @@
 /**
  * Validation messages that tell the caller how to fix the call.
- * Field report dc041e5c (kimi-desktop-ws01, 2026-10-13):
+ * Field report dc041e5c (2026-10-13):
  *   K1: enum errors did not list the allowed values ("Invalid message type"
  *       for messageType 'inform'; Ajv's "should be equal to one of the
  *       allowed values" without the values).
@@ -30,7 +30,7 @@ export const MAX_ECHO_CHARS = 64;
  * The closest allowed value when it is plausibly a typo (prefix or <= 2 edits).
  * Input much longer than every allowed value cannot be a typo of one, so it
  * is rejected before any scan: the work stays bounded by the allowed set, not
- * by caller input (codex-hythe review 1148db41: an 8M-character messageType
+ * by caller input (review 1148db41: an 8M-character messageType
  * took ~528 ms here before this guard).
  */
 export function closest(value: string, allowed: readonly string[]): string | null {
@@ -145,7 +145,7 @@ function bounded(text: string, max: number): string {
 
 /**
  * A field name from caller input, quoted and escaped (JSON string rules), and
- * cut to MAX_ECHO_CHARS with the original length noted. codex-hythe PR #20
+ * cut to MAX_ECHO_CHARS with the original length noted. PR #20
  * review: a 1,000,000-character unknown property name was echoed in full.
  */
 export function echoFieldName(name: unknown): string {

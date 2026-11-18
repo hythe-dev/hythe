@@ -1,5 +1,5 @@
 /**
- * Field report dc041e5c (kimi-desktop-ws01, 2026-10-13):
+ * Field report dc041e5c (2026-10-13):
  *   K1: enum errors must list the allowed values.
  *   K2: wrong field names (toAgentId/fromAgentId) must name to/from.
  *
@@ -111,7 +111,7 @@ describe('validation hints (field report dc041e5c K1/K2)', () => {
     });
   });
 
-  describe('bounded work and echo (codex-hythe review 1148db41)', () => {
+  describe('bounded work and echo (review 1148db41)', () => {
     it('an 8M-character enum value is neither scanned nor echoed', () => {
       const huge = 'x'.repeat(8_000_000);
       const start = performance.now();
@@ -147,7 +147,7 @@ describe('validation hints (field report dc041e5c K1/K2)', () => {
     });
   });
 
-  describe('bounded unknown-field echo (codex-hythe PR #20 review)', () => {
+  describe('bounded unknown-field echo (PR #20 review)', () => {
     const NAME = 'x'.repeat(1_000_000);
     const resumeArgs = () => ({ agentId: A, scope: { project: 'p' }, budget: 4000 });
     const checkpointArgs = (key: string) => ({ agentId: A, scope: { project: 'p' }, expectedRevision: null, idempotencyKey: key, state: validState });

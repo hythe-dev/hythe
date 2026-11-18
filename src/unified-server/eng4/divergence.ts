@@ -1,5 +1,5 @@
 /**
- * Field report 9ceed35e P1 (2026-09-20): on scope bensalem-clean the pointer
+ * Field report 9ceed35e P1 (2026-09-20): on scope scope-a the pointer
  * sat at revision 378 while live heads reached ~500, and resume handed a
  * newcomer state ~120 revisions old with no warning. The fork WAS in the
  * bundle (asOf.conflicts lists every live head once the state has forked),
