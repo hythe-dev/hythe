@@ -410,11 +410,15 @@ Parameters
     },
     "content": {
       "type": "string",
-      "description": "Message content"
+      "minLength": 1,
+      "maxLength": 10000,
+      "description": "Message content. At most 10000 characters (Unicode code points); longer content is rejected with a CONTENT_TOO_LONG validation error. Split long text into several messages."
     },
     "message": {
       "type": "string",
-      "description": "DEPRECATED: Alias for `content`"
+      "minLength": 1,
+      "maxLength": 10000,
+      "description": "DEPRECATED: Alias for `content`. Same 10000-character limit."
     },
     "toCapabilities": {
       "type": "array",

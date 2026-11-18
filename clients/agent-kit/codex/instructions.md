@@ -15,7 +15,10 @@ inbox, or write memory; restart through the identity-bound launcher/hook.
 
 ## Session start
 1. `resume` with the exact agentId injected into this session by the trusted
-   launcher/hook (the bridge independently enforces the same value).
+   launcher/hook (the bridge independently enforces the same value), a scope
+   and a budget, e.g.
+   `{"agentId":"<agentId>","scope":{"project":"<project>"},"budget":4000}`.
+   Note asOf.revision; the closing checkpoint needs it.
 2. `get_ai_messages` — check your inbox; other agents leave tasks/answers there.
 
 ## While working — save proactively
@@ -27,7 +30,11 @@ Corrections: `kind: correction` + `canonicalFact` + `supersedes` (or
 `mode: replace-current`). Never leave a wrong fact un-superseded.
 
 ## Before saying done
-`checkpoint` with goal / discoveries / accomplished / next steps / entities.
+`checkpoint` with agentId, scope, expectedRevision (asOf.revision from your
+latest resume; null only if the scope had no state), an idempotencyKey of 8+
+characters, and state {objective, status, owner, nextActions, blockers,
+guardrails} (all six required). Record discoveries with `add_observations`;
+put files/entities in evidenceRefs.
 
 ## Search before re-deriving
 `search_entities` — `searchType: exact` for known names, `hybrid` for fuzzy.

@@ -32,6 +32,8 @@ import {
 import { performResume, type ResumeDirectory } from './resume.js';
 import { performCheckpoint } from './checkpoint.js';
 import { fetchResourceByUri } from './resource.js';
+import { withDivergenceNotice } from './divergence.js';
+import { formatSchemaErrors } from '../../shared/validation-hints.js';
 
 // $data:true is a RUNTIME requirement (coverage closedness uses $data refs).
 // Compiled once; used in every build — production included.
@@ -143,15 +145,20 @@ export function handleEng4Tool(
 ): { content: Array<{ type: 'text'; text: string }>; structuredContent: unknown } {
   if (name === 'resume') {
     if (!validate.resumeInput(args)) {
-      throw new Eng4InputValidationError(`resume: invalid params — ${ajv.errorsText(validate.resumeInput.errors)}`);
+      throw new Eng4InputValidationError(`resume: invalid params — ${formatSchemaErrors(validate.resumeInput.errors as any)}`);
     }
     const bundle = performResume(deps.db, deps.directory, deps.tenantId, args as any);
     validateEng4Output('resume', bundle); // fail closed BEFORE transport
-    return { content: [{ type: 'text', text: JSON.stringify(bundle) }], structuredContent: bundle };
+    // content[0] stays the exact bundle JSON; a forked scope gets a plain-text
+    // notice as content[1] (field report 9ceed35e P1).
+    return withDivergenceNotice(
+      { content: [{ type: 'text' as const, text: JSON.stringify(bundle) }], structuredContent: bundle },
+      bundle
+    );
   }
   if (name === 'checkpoint') {
     if (!validate.checkpointInput(args)) {
-      throw new Eng4InputValidationError(`checkpoint: invalid params — ${ajv.errorsText(validate.checkpointInput.errors)}`);
+      throw new Eng4InputValidationError(`checkpoint: invalid params — ${formatSchemaErrors(validate.checkpointInput.errors as any)}`);
     }
     const result = performCheckpoint(deps.db, deps.directory, deps.tenantId, args as any);
     validateEng4Output('checkpoint', result);

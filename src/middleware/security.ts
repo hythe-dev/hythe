@@ -10,6 +10,14 @@ import { Request, Response, NextFunction } from 'express';
 import { RateLimiterMemory, RateLimiterRedis, RateLimiterRes, IRateLimiterOptions } from 'rate-limiter-flexible';
 import { createClient, RedisClientType } from 'redis';
 import Joi from 'joi';
+import { MAX_CONTENT_CHARS, codePointLength } from '../shared/limits.js';
+
+/** Message text capped in code points, matching the tool schema's maxLength. */
+const messageText = Joi.string().custom((value: string, helpers) =>
+  codePointLength(value) > MAX_CONTENT_CHARS
+    ? helpers.message({ custom: `must be at most ${MAX_CONTENT_CHARS} characters (got ${codePointLength(value)})` })
+    : value
+);
 import crypto from 'crypto';
 import {
   recordAuthSuccess,
@@ -934,8 +942,9 @@ export const ValidationSchemas = {
     from: Joi.string().min(1).max(100).optional(),
     to: Joi.string().min(1).max(100).optional(),
     agentId: Joi.string().min(1).max(100).optional(), // legacy alias
-    content: Joi.string().max(100000).optional(),
-    message: Joi.string().max(100000).optional(), // legacy alias
+    // Same limit and unit as the MCP tool (field report 8aeaee56 M8).
+    content: messageText.optional(),
+    message: messageText.optional(), // legacy alias
     messageType: Joi.string().valid('direct', 'info', 'task', 'query', 'response', 'collaboration').optional(),
     type: Joi.string().valid('direct', 'info', 'task', 'query', 'response', 'collaboration').optional(), // legacy alias
     priority: Joi.string().valid('low', 'normal', 'high', 'urgent').optional(),

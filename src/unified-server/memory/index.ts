@@ -79,6 +79,9 @@ interface MessagePage {
   offset: number;
 }
 
+import { MAX_CONTENT_CHARS, codePointLength } from '../../shared/limits.js';
+export { MAX_CONTENT_CHARS };
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -2227,14 +2230,19 @@ export class MemoryManager {
     /\}\s*\{.*tool/i,
   ];
 
+  /** Length in Unicode code points (see shared/limits.ts). */
+  static contentLength(content: string): number {
+    return codePointLength(content);
+  }
+
   static sanitizeContent(content: string): { safe: boolean; reason?: string } {
     for (const pattern of MemoryManager.INJECTION_PATTERNS) {
       if (pattern.test(content)) {
         return { safe: false, reason: `Flagged pattern: ${pattern.toString()}` };
       }
     }
-    if (content.length > 10000) {
-      return { safe: false, reason: 'Content exceeds 10000 character limit' };
+    if (MemoryManager.contentLength(content) > MAX_CONTENT_CHARS) {
+      return { safe: false, reason: `Content exceeds ${MAX_CONTENT_CHARS} character limit` };
     }
     return { safe: true };
   }

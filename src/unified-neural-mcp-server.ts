@@ -5,7 +5,8 @@ import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import cors from 'cors';
 import helmet from 'helmet';
-import { MemoryManager } from './unified-server/memory/index.js';
+import { MemoryManager, MAX_CONTENT_CHARS } from './unified-server/memory/index.js';
+import { enumError, misnamedSendField } from './shared/validation-hints.js';
 import { MessageHubIntegration } from './message-hub/hub-integration.js';
 import { resolveMessageHubPort } from './message-hub/config.js';
 import { UnifiedToolSchemas } from './shared/toolSchemas.js';
@@ -13,6 +14,7 @@ import { ENG4_TOOLS, RETAINED_LEGACY_TOOLS, READ_DISCOVERY_TOOLS, handleEng4Tool
 import { validateEng4Output } from './unified-server/eng4/register.js';
 import { adaptLegacyBeginSessionArgs } from './unified-server/eng4/schemas.js';
 import { performBeginSession, performEndSession } from './unified-server/eng4/session.js';
+import { withDivergenceNotice } from './unified-server/eng4/divergence.js';
 import {
   authMiddleware,
   rateLimitMiddleware,
@@ -43,6 +45,10 @@ import {
   performRelatedContextDiscovery,
   RELATED_CONTEXT_LIMITS,
 } from './unified-server/memory/related-context.js';
+
+/** send_ai_message enums, shared by validation and its error messages. */
+const MESSAGE_TYPES = ['info', 'task', 'query', 'response', 'collaboration'] as const;
+const MESSAGE_PRIORITIES = ['low', 'normal', 'high', 'urgent'] as const;
 
 const packageMetadata = createRequire(import.meta.url)('../package.json') as { version?: unknown };
 if (typeof packageMetadata.version !== 'string' || packageMetadata.version.length === 0) {
@@ -670,12 +676,13 @@ export class NeuralMCPServer {
         ]);
         const messageType = requestedMessageType ?? type ?? 'direct';
         if (typeof messageType !== 'string' || !allowedMessageTypes.has(messageType)) {
-          res.status(400).json({ error: 'Invalid message type' });
+          const allowed = [...allowedMessageTypes];
+          res.status(400).json({ error: 'Invalid message type', allowed, message: enumError('messageType', messageType, allowed).message });
           return;
         }
         const messagePriority = priority ?? 'normal';
         if (!['low', 'normal', 'high', 'urgent'].includes(messagePriority)) {
-          res.status(400).json({ error: 'Invalid message priority' });
+          res.status(400).json({ error: 'Invalid message priority', allowed: MESSAGE_PRIORITIES, message: enumError('priority', messagePriority, MESSAGE_PRIORITIES).message });
           return;
         }
 
@@ -3060,7 +3067,10 @@ export class NeuralMCPServer {
           );
           validateEng4Output('resume', bundle); // same frozen-schema gate as resume
           this.memoryManager.auditLog('begin_session', wrapperArgs.agentId, JSON.stringify(wrapperArgs.scope), String((wrapperArgs.scope as any).project ?? (wrapperArgs.scope as any).task ?? ''));
-          return { content: [{ type: 'text', text: JSON.stringify(bundle) }], structuredContent: bundle };
+          return withDivergenceNotice(
+            { content: [{ type: 'text' as const, text: JSON.stringify(bundle) }], structuredContent: bundle },
+            bundle as any
+          );
         }
 
         case 'end_session': {
@@ -3793,6 +3803,13 @@ export class NeuralMCPServer {
 
         // === AI AGENT COMMUNICATION ===
         case 'send_ai_message': {
+          // Field report dc041e5c K2: a misnamed to/from must fail with the
+          // right name BEFORE the sender fallback below, which would otherwise
+          // attribute the message to this server's own identity.
+          const misnamed = misnamedSendField(args);
+          if (misnamed) {
+            return { content: [{ type: 'text', text: JSON.stringify(misnamed) }], isError: true };
+          }
           // Avoid conflating sender and target: support `to`/`from` and aliases
           const explicitTarget = args.to || args.agentId; // agentId kept for backward compatibility
           const requestedSenderAgentId = args.from || this.agentId;
@@ -3813,11 +3830,35 @@ export class NeuralMCPServer {
           if (typeof content !== 'string' || !content) {
             throw new Error('Missing required field: `content` (or `message` alias)');
           }
-          if (!['info', 'task', 'query', 'response', 'collaboration'].includes(messageType)) {
-            throw new Error('Invalid message type');
+          // Field report dc041e5c K1: name the allowed values.
+          if (!MESSAGE_TYPES.includes(messageType)) {
+            return { content: [{ type: 'text', text: JSON.stringify(enumError('messageType', messageType, MESSAGE_TYPES)) }], isError: true };
           }
-          if (!['low', 'normal', 'high', 'urgent'].includes(priority)) {
-            throw new Error('Invalid message priority');
+          if (!MESSAGE_PRIORITIES.includes(priority)) {
+            return { content: [{ type: 'text', text: JSON.stringify(enumError('priority', priority, MESSAGE_PRIORITIES)) }], isError: true };
+          }
+
+          // Declared limit (toolSchemas maxLength, field report 8aeaee56 M8).
+          // Checked before the sanitizer: an oversized message is a validation
+          // error for the caller, not a flagged write or a security alert.
+          const contentLength = MemoryManager.contentLength(content);
+          if (contentLength > MAX_CONTENT_CHARS) {
+            const field = args.content !== undefined ? 'content' : 'message';
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'validation_error',
+                  code: 'CONTENT_TOO_LONG',
+                  field,
+                  limit: MAX_CONTENT_CHARS,
+                  actual: contentLength,
+                  unit: 'characters (Unicode code points)',
+                  message: `${field} is ${contentLength} characters; the limit is ${MAX_CONTENT_CHARS}. Nothing was sent. Split the text into several messages.`,
+                }),
+              }],
+              isError: true,
+            };
           }
 
           // NE-S6c: Sanitize message content
