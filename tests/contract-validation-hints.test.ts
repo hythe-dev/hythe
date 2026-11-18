@@ -14,7 +14,7 @@ import {
 } from '../src/shared/validation-hints.js';
 
 const BASE_URL = process.env.NEURAL_URL || 'http://localhost:6174';
-const API_KEY = process.env.NEURAL_API_KEY || 'IzMklkUkoJv+Thkjp+4B9DVqYYkzHCKQCBJD5dzOW0g=';
+const API_KEY = process.env.NEURAL_API_KEY ?? 'test-placeholder-not-a-real-key';
 const A = `_hints_a_${Date.now()}`;
 const B = `_hints_b_${Date.now()}`;
 

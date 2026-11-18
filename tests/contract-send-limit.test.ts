@@ -16,7 +16,7 @@ import { MAX_CONTENT_CHARS, codePointLength } from '../src/shared/limits.js';
 import { MemoryManager } from '../src/unified-server/memory/index.js';
 
 const BASE_URL = process.env.NEURAL_URL || 'http://localhost:6174';
-const API_KEY = process.env.NEURAL_API_KEY || 'IzMklkUkoJv+Thkjp+4B9DVqYYkzHCKQCBJD5dzOW0g=';
+const API_KEY = process.env.NEURAL_API_KEY ?? 'test-placeholder-not-a-real-key';
 const SENDER = `_send_limit_sender_${Date.now()}`;
 const RECIPIENT = `_send_limit_recipient_${Date.now()}`;
 
