@@ -378,11 +378,20 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   },
   get_agent_status: {
     name: 'get_agent_status',
-    description: 'Get comprehensive status and health information for AI agents',
+    description: 'Get comprehensive status and health information for AI agents. Registration is not addressability: an agent can send and receive messages without ever registering, so it may be missing from this list. To check a recipient before send_ai_message, pass resolve:"<name>" — it reports the exact mailbox the message goes to and a status: registered, registered-inactive, addressable (unregistered but has sent or received mail), alias (no mail; only matches a registered agent by name, which would NOT receive it), unknown (valid but unused) or invalid. Mail is delivered to the exact address; aliases never redirect it.',
     inputSchema: {
       type: 'object',
       properties: {
-        agentId: { type: 'string', description: 'Specific agent ID, or omit for all agents' },
+        agentId: { type: 'string', description: 'Specific agent ID, or omit for all agents. The single-agent response includes a recipient block (same as resolve).' },
+        resolve: {
+          type: 'string',
+          description: 'Recipient lookup: the name you intend to send to. Returns {recipient:{deliversTo, status, explanation, registration, mailbox:{received, sent, lastActivityAt}, relatedRegistrations}} and nothing else. Counts only; no message contents.',
+        },
+        includeAddressable: {
+          type: 'boolean',
+          description: 'When listing all agents, also return unregisteredAddressable: mailboxes that have sent or received messages but never registered (most recent first, up to limit), with totalUnregisteredAddressable.',
+          default: false,
+        },
         groupByCanonical: {
           type: 'boolean',
           description: 'Include canonical-agent rollups and aliases in addition to raw registrations',
