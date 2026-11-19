@@ -137,12 +137,90 @@ describe('MemoryManager.getMessagesPage since (stored timestamps in mixed forms)
     expect(ids('2026-11-19')).toEqual(['m5']);
   });
 
-  it('invalid since throws before any read (nothing marked read or delivered)', () => {
-    expect(() => manager.getMessagesPage(to, { since: 'yesterday', markAsRead: true, unreadOnly: false }))
-      .toThrow(InvalidSinceError);
-    const unread = manager.getMessagesPage(to, { unreadOnly: true, limit: 20 });
-    expect(unread.totalMatching).toBe(5);
+  it('invalid since throws before any read (nothing marked read or delivered)', async () => {
+    // A fresh recipient whose rows were never fetched: delivered_at and
+    // read_at are both still NULL, so a stray UPDATE would show.
+    const fresh = 'since-fresh-recipient';
+    for (const label of ['f1', 'f2']) await manager.storeMessage('since-sender', fresh, label);
+    const state = () => manager.getDb()
+      .prepare('SELECT id, delivered_at, read_at FROM ai_messages WHERE to_agent = ? ORDER BY id')
+      .all(fresh);
+    const before = state();
+    expect(before).toHaveLength(2);
+    for (const row of before) {
+      expect(row.delivered_at).toBeNull();
+      expect(row.read_at).toBeNull();
+    }
+    for (const bad of ['yesterday', '1700000000', '2026-02-30']) {
+      expect(() => manager.getMessagesPage(fresh, { since: bad, markAsRead: true, unreadOnly: false }))
+        .toThrow(InvalidSinceError);
+    }
+    expect(state()).toEqual(before);
   });
+});
+
+describe('since precision: both sides truncated to milliseconds (ai_messages and legacy path)', () => {
+  let manager: any;
+  const to = 'since-precision-recipient';
+  // Stored values with finer-than-millisecond fractions, plus one value
+  // SQLite cannot parse. Current inserts are whole seconds; these model
+  // imported or legacy rows.
+  const rows: Array<[string, string]> = [
+    ['p1', '2026-11-18 23:00:00.123999'],
+    ['p2', '2026-11-18 23:00:00.123499'],
+    ['p3', '2026-11-18 23:59:59.9999'],
+    ['u1', '2026-11-18 23:00:00 UTC'],
+  ];
+
+  const current = (since?: string) =>
+    manager.getMessagesPage(to, { since, unreadOnly: false, limit: 20, compact: false })
+      .messages.map((m: any) => m.content).sort();
+  const legacy = (since?: string) =>
+    manager.getLegacyMessagesPage(to, { since, limit: 20 })
+      .messages.map((m: any) => m.content).sort();
+
+  beforeAll(async () => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    const { MemoryManager } = await import('../src/unified-server/memory/index.js');
+    manager = new MemoryManager(':memory:');
+    const insertLegacy = manager.getDb().prepare(
+      `INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by, tags)
+       VALUES (?, 'default', 'ai_message', ?, 'since-sender', '[]')`,
+    );
+    for (const [label, createdAt] of rows) {
+      const id = await manager.storeMessage('since-sender', to, label);
+      manager.getDb().prepare('UPDATE ai_messages SET created_at = ? WHERE id = ?').run(createdAt, id);
+      insertLegacy.run(`legacy-${label}`, JSON.stringify({ from: 'since-sender', to, content: label, timestamp: createdAt }));
+    }
+  });
+
+  afterAll(async () => { await manager.close(); });
+
+  for (const [name, ids] of [['ai_messages', () => current], ['legacy shared_memory', () => legacy]] as const) {
+    describe(name, () => {
+      it('without since every row is returned, the unparseable one included', () => {
+        expect(ids()()).toEqual(['p1', 'p2', 'p3', 'u1']);
+      });
+
+      it('stored .123999 is NOT moved onto a .124 cutoff (strftime alone rounds it to .124)', () => {
+        expect(ids()('2026-11-18T23:00:00.124Z')).toEqual(['p3']);
+      });
+
+      it('both sides truncate: .123 and .123999 cutoffs keep .123499 and .123999', () => {
+        expect(ids()('2026-11-18T23:00:00.123Z')).toEqual(['p1', 'p2', 'p3']);
+        expect(ids()('2026-11-18T23:00:00.123999Z')).toEqual(['p1', 'p2', 'p3']);
+      });
+
+      it('no second rollover: stored 23:59:59.9999 stays before the next second', () => {
+        expect(ids()('2026-11-18T23:59:59.999Z')).toEqual(['p3']);
+        expect(ids()('2026-11-19T00:00:00Z')).toEqual([]);
+      });
+
+      it('a stored value SQLite cannot parse is left out of every since result', () => {
+        expect(ids()('2026-01-01')).toEqual(['p1', 'p2', 'p3']);
+      });
+    });
+  }
 });
 
 describe('get_ai_messages since over MCP and HTTP (hermetic server)', () => {

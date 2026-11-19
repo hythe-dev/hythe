@@ -17,9 +17,33 @@ import { echo } from './validation-hints.js';
 /** strftime format both sides are normalized to: "YYYY-MM-DD HH:MM:SS.SSS" (UTC). */
 export const SINCE_SQL_FORMAT = '%Y-%m-%d %H:%M:%f';
 
-/** Wrap a SQL expression holding a stored timestamp so it compares with a normalized `since`. */
+/**
+ * Wrap a SQL expression holding a stored timestamp so it compares with a
+ * normalized `since` (review of PR #22).
+ *
+ * Precision rule, both sides: TRUNCATE to milliseconds. parseSince truncates
+ * the caller's fraction; here the stored fraction is cut to three digits as
+ * text BEFORE SQLite parses it. strftime alone is not usable for that: on
+ * SQLite 3.45 it turns .123999 into .124 but .1235 into .123 and 59.9999 into
+ * 59.999, so no single rule could match it on the caller side.
+ * Characters 1-20 of "YYYY-MM-DD HH:MM:SS." are fixed width; the zone (Z,
+ * +-HH:MM) is whatever follows the fraction digits (ltrim of the digits).
+ *
+ * A stored value SQLite cannot parse (not a date, or a form such as
+ * "2026-11-18 23:00:00 UTC") normalizes to NULL, and NULL >= ? is never
+ * true, so such a row is left OUT of every `since` result (it still appears
+ * without `since`). ai_messages rows are written by CURRENT_TIMESTAMP and
+ * legacy payloads by toISOString(), so none are expected; the behaviour is
+ * deliberate and pinned by a test.
+ */
 export function normalizedTimestampSql(expression: string): string {
-  return `strftime('${SINCE_SQL_FORMAT}', ${expression})`;
+  const rest = `substr(${expression}, 21)`;
+  const zone = `ltrim(${rest}, '0123456789')`;
+  const truncated =
+    `CASE WHEN substr(${expression}, 20, 1) = '.' ` +
+    `THEN substr(${expression}, 1, 20) || substr(substr(${rest}, 1, length(${rest}) - length(${zone})) || '000', 1, 3) || ${zone} ` +
+    `ELSE ${expression} END`;
+  return `strftime('${SINCE_SQL_FORMAT}', ${truncated})`;
 }
 
 export interface SinceError {
@@ -85,7 +109,7 @@ export function parseSince(value: unknown): SinceResult {
   const [, y, mo, d, h = '00', mi = '00', s = '00', frac = '', zone] = m;
   const year = Number(y), month = Number(mo), day = Number(d);
   const hour = Number(h), minute = Number(mi), second = Number(s);
-  // Milliseconds are the stored precision; extra digits are truncated.
+  // Milliseconds; extra digits are truncated (the stored side is truncated the same way).
   const ms = Number((frac + '000').slice(0, 3));
   if (month < 1 || month > 12) return invalid(value, 'month out of range');
   if (hour > 23 || minute > 59 || second > 59) return invalid(value, 'time out of range');
