@@ -87,12 +87,15 @@ npx -y @hythe/mcp@0.2.0 init --agent-id agent-b
 
 Each client lane needs a stable, distinct identity. The bridge rejects a
 `send_ai_message.from` that differs from its configured `HYTHE_AGENT_ID`
-instead of forwarding it. Then, from harness A:
+instead of forwarding it. A checkpoint scope must name an existing entity,
+so create the project first. Then, from harness A:
 
 ```
 register_agent({agentId: "agent-a", name: "A", capabilities: ["builder"]})
+create_entities({entities: [{name: "hello-fleet", entityType: "project",
+                             observations: ["quickstart demo project"]}]})
 checkpoint({agentId: "agent-a", scope: {project: "hello-fleet"},
-            expectedRevision: null, idempotencyKey: "hello-1",
+            expectedRevision: null, idempotencyKey: "hello-01",
             state: {objective: "prove shared state", status: "green",
                     owner: "agent-a", nextActions: ["agent-b resumes"],
                     blockers: [], guardrails: []}})
@@ -112,6 +115,48 @@ actions — plus the message that pointed at it. That's the loop: checkpoint
 → message → resume. The coordination discipline built on top of it (ETAs,
 cadence, stand-down) is [SPEC.md](./SPEC.md); the concepts behind the
 store are in [CONCEPTS.md](./CONCEPTS.md).
+
+### Track work as open loops, not prose
+
+`state.nextActions` and `state.blockers` are **prose**: `resume` shows them
+inside `working`, but they never become tracked items. The `openLoops`
+section lists only loops created with `loopChanges`, so a scope whose
+pending work lives only in `nextActions` correctly reports `openLoops: []`.
+That is not lost data.
+
+To track a piece of work, open a loop in the same checkpoint. With
+`resultVersion: 2` the result returns the new `loopId` right away:
+
+```
+checkpoint({agentId: "agent-a", scope: {project: "hello-fleet"},
+            expectedRevision: 1, idempotencyKey: "hello-02", resultVersion: 2,
+            state: {objective: "prove shared state", status: "green",
+                    owner: "agent-a", nextActions: ["agent-b reviews"],
+                    blockers: [], guardrails: []},
+            loopChanges: [{status: "open", owner: "agent-b",
+                           nextAction: "review the hello-fleet checkpoint"}]})
+// result.changes.loops[0] -> {loopId: "<id>", created: true}
+```
+
+Later, update or close it by `loopId`. Closing requires `closeOutcome`:
+
+```
+checkpoint({agentId: "agent-b", scope: {project: "hello-fleet"},
+            expectedRevision: 2, idempotencyKey: "hello-03", resultVersion: 2,
+            state: {objective: "prove shared state", status: "green",
+                    owner: "agent-b", nextActions: [], blockers: [], guardrails: []},
+            loopChanges: [{loopId: "<id>", status: "closed",
+                           nextAction: "none", closeOutcome: "reviewed, looks good"}]})
+```
+
+`resume(...).openLoops` lists the loop with its `loopId`, `owner`,
+`status: "open"` and `nextAction`. After the close it is still listed, with
+`status: "closed"` and a `closeEvent` (`closedAt`, `closedBy`, `outcome`), so
+the outcome stays visible; filter on `status` for what is still open. Use
+`nextActions` for a short human-readable summary, and loops for anything
+someone must pick up, hand off or close. A loop can also be opened without resending state through
+`checkpoint({resultVersion: 3, operation: "record", ...})`; see
+[CHECKPOINT-RESUME-V3.md](./CHECKPOINT-RESUME-V3.md#33-record--changes-without-resending-state).
 
 ## 5b. When two agents both wrote: heads and reconcile (v3, optional)
 
