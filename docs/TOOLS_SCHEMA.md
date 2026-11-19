@@ -724,16 +724,16 @@ Parameters
     },
     "resolve": {
       "type": "string",
-      "description": "Recipient lookup: the name you intend to send to. Returns {recipient:{deliversTo, status, explanation, registration, mailbox:{received, sent, lastActivityAt}, relatedRegistrations}} and nothing else. Counts only; no message contents."
+      "description": "Recipient lookup: the name you intend to send to. Returns {recipient:{deliversTo, status, explanation, registration, mailbox:{received, sent, lastActivityAt}, relatedRegistrations}} and nothing else. Counts only; no message contents. Mailbox counts are all-time (archived included) and visible to any caller with agent:self in the tenant."
     },
     "compact": {
       "type": "boolean",
-      "description": "Opt-in small response: listing rows keep only agentId, canonicalAgentId, status, lastSeen (canonical rows add sessionCount); a single agent keeps agentId, canonicalAgentId, status, lastSeen, expiresAt and recipient {deliversTo, status}. JSON is not pretty-printed. Default false (full response, unchanged).",
+      "description": "Opt-in small response, marked compact:true: listing rows keep only agentId, canonicalAgentId, status, lastSeen (canonical rows add sessionCount); a single agent keeps agentId, canonicalAgentId, status, lastSeen, expiresAt and recipient {deliversTo, status}. JSON is not pretty-printed. With resolve, the recipient fields are unchanged and only pretty-printing is dropped. Default false (full response, unchanged).",
       "default": false
     },
     "name": {
       "type": "string",
-      "description": "Listing filter: case-insensitive prefix of the agent id, display name or canonical id. Applied before paging and the canonical rollup (totals then count matches; matchedRegistrations is reported). Also filters unregisteredAddressable by address prefix."
+      "description": "Listing filter: case-insensitive prefix of the agent id, display name or canonical id, applied before paging and the canonical rollup. totalRegistrations stays the count of ALL registrations; matchedRegistrations, totalCanonicalAgents, nextOffset and totalUnregisteredAddressable reflect the filter, and the response echoes nameFilter. A canonical group can show a partial sessionCount when only some of its rows match. Listing only: combining name with resolve or agentId is a validation error."
     },
     "includeAddressable": {
       "type": "boolean",

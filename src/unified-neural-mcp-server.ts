@@ -4538,26 +4538,9 @@ export class NeuralMCPServer {
             expiresAt: (m) => registrationExpiresAt(m),
           };
 
-          if (args.resolve !== undefined) {
-            // Recipient lookup: where does a message to this name go? Covers
-            // registered agents, unregistered-but-addressable mailboxes and
-            // presentation aliases (recipient-lookup.ts).
-            if (typeof args.resolve !== 'string' || args.resolve.length === 0) {
-              return {
-                content: [{ type: 'text', text: JSON.stringify({
-                  error: 'validation_error', field: 'resolve',
-                  message: 'resolve must be a non-empty string: the name you intend to send to.',
-                }) }],
-                isError: true,
-              };
-            }
-            return {
-              content: [{ type: 'text', text: JSON.stringify({ recipient: resolveRecipient(recipientDeps, args.resolve) }, null, 2) }],
-            };
-          }
-
           // Opt-in compact rows and a name-prefix filter (field feedback: a
-          // full listing was ~19k tokens). Defaults are unchanged.
+          // full listing was ~19k tokens). Defaults are unchanged. Validated
+          // first, so no mode (resolve, agentId, listing) ignores a bad value.
           if (args.compact !== undefined && typeof args.compact !== 'boolean') {
             return {
               content: [{ type: 'text', text: JSON.stringify({
@@ -4578,6 +4561,33 @@ export class NeuralMCPServer {
           const compactStatus = args.compact === true;
           const namePrefix = typeof args.name === 'string' ? args.name.trim().toLowerCase() : undefined;
           const statusJson = (data: unknown) => compactStatus ? JSON.stringify(data) : JSON.stringify(data, null, 2);
+          if (namePrefix !== undefined && (args.resolve !== undefined || targetAgentId)) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                error: 'validation_error', field: 'name',
+                message: 'name filters the agent listing; it cannot be combined with resolve or agentId.',
+              }) }],
+              isError: true,
+            };
+          }
+
+          if (args.resolve !== undefined) {
+            // Recipient lookup: where does a message to this name go? Covers
+            // registered agents, unregistered-but-addressable mailboxes and
+            // presentation aliases (recipient-lookup.ts).
+            if (typeof args.resolve !== 'string' || args.resolve.length === 0) {
+              return {
+                content: [{ type: 'text', text: JSON.stringify({
+                  error: 'validation_error', field: 'resolve',
+                  message: 'resolve must be a non-empty string: the name you intend to send to.',
+                }) }],
+                isError: true,
+              };
+            }
+            return {
+              content: [{ type: 'text', text: statusJson({ recipient: resolveRecipient(recipientDeps, args.resolve) }) }],
+            };
+          }
 
           if (targetAgentId) {
             const row = db.prepare(
@@ -4618,6 +4628,7 @@ export class NeuralMCPServer {
                 lastSeen: full.lastSeen,
                 ...(full.expiresAt ? { expiresAt: full.expiresAt } : {}),
                 recipient: { deliversTo: full.recipient.deliversTo, status: full.recipient.status },
+                compact: true,
               };
             }
           } else {
@@ -4721,12 +4732,13 @@ export class NeuralMCPServer {
 
             statusData = {
               totalRegistrations,
-              totalCanonicalAgents: canonicalMap.size || undefined,
+              // With a name filter, report 0 rather than dropping the key.
+              totalCanonicalAgents: namePrefix !== undefined ? canonicalMap.size : (canonicalMap.size || undefined),
               returnedRegistrations: agents.length,
               returnedCanonicalAgents: groupByCanonical ? canonicalReturned.length : undefined,
               offset: statusOffset,
               nextOffset,
-              ...(namePrefix !== undefined ? { name: args.name.trim(), matchedRegistrations: rows.length } : {}),
+              ...(namePrefix !== undefined ? { nameFilter: args.name.trim(), matchedRegistrations: rows.length } : {}),
               ...(compactStatus ? { compact: true } : {}),
               agents: compactStatus
                 ? agents.map((a: any) => ({ agentId: a.agentId, canonicalAgentId: a.canonicalAgentId, status: a.status, lastSeen: a.lastSeen }))

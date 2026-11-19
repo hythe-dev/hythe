@@ -92,7 +92,10 @@ same result twice, as the MCP spec allows: a serialized JSON string in
 `structuredContent`. They are identical. Read **one** of them, preferably
 `structuredContent`; do not print the whole result envelope, or every bundle
 appears twice. Clients that cannot see `structuredContent` should parse
-`content[0].text`.
+`content[0].text`. If `content` has **more than one item**, the extra items
+are notices that are not repeated in `structuredContent` as text, for example
+the warning `resume` and `begin_session` add when the scope has divergent
+heads (the data itself is in `asOf.conflicts` / `heads`). Read those too.
 
 ### Keeping agent listings small
 
@@ -101,6 +104,13 @@ large on a busy server. To find someone, use `get_agent_status({resolve:
 "<name>"})` (where a message to that name goes) or filter the listing with
 `name` (a case-insensitive prefix) and `compact: true` (four fields per
 row). The default response is unchanged.
+
+Recipient lookups expose mailbox metadata: `resolve`, the single-agent
+`recipient` block and `includeAddressable` report, for any address in the
+tenant, all-time received/sent message counts and the last activity time
+(never contents, senders or subjects). Any caller with the `agent:self` scope
+can read them. This is an accepted trade-off for reliable recipient
+discovery; tenants are isolated as everywhere else.
 
 ## Discovering reusable knowledge
 
