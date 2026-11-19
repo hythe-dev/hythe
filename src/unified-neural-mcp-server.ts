@@ -2259,6 +2259,49 @@ export class NeuralMCPServer {
             };
           };
 
+          // Field feedback P1 item 4: how a row's NAME relates to the query.
+          // The lookup index stores derived variants of every entity name
+          // (first two/three segments, initials, corporate suffixes) at the
+          // same weight as the name itself, so an exact search for
+          // "ascend-website" also anchors "ascend-website-redesign" and could
+          // rank it above the entity actually named "ascend-website".
+          // matchKind makes the relationship explicit and orders results by it:
+          //   exact     the name (observation: entityName; relation: from/to)
+          //             equals the trimmed query byte for byte
+          //   exact-ci  equal after case/separator normalization
+          //             (canonicalEntityKey), or a declared alias is
+          //   prefix    the normalized name starts with the normalized query
+          //             followed by a separator ("ascend-website-redesign")
+          //   related   anything else (derived variants such as initials,
+          //             handles in prose, semantic matches)
+          const MATCH_KIND_RANK: Record<string, number> = { exact: 3, 'exact-ci': 2, prefix: 1, related: 0 };
+          const trimmedQuery = String(query ?? '').trim();
+          const queryKey = this.memoryManager.canonicalEntityKey(trimmedQuery);
+          const nameMatchKind = (value: unknown): 'exact' | 'exact-ci' | 'prefix' | 'related' => {
+            if (typeof value !== 'string' || !value.trim() || !queryKey) return 'related';
+            if (value.trim() === trimmedQuery) return 'exact';
+            const key = this.memoryManager.canonicalEntityKey(value);
+            if (key === queryKey) return 'exact-ci';
+            if (key.startsWith(`${queryKey}-`)) return 'prefix';
+            return 'related';
+          };
+          const bestMatchKind = (kinds: string[]): 'exact' | 'exact-ci' | 'prefix' | 'related' =>
+            kinds.reduce((best, kind) => (MATCH_KIND_RANK[kind] > MATCH_KIND_RANK[best] ? kind : best), 'related') as any;
+          const matchKindFor = (result: any, storageType: string | undefined): 'exact' | 'exact-ci' | 'prefix' | 'related' => {
+            const payload = getContentPayload(result);
+            if (storageType === 'relation') {
+              return bestMatchKind([nameMatchKind(payload?.from), nameMatchKind(payload?.to)]);
+            }
+            const primary = nameMatchKind(getEntityName(result));
+            if (primary !== 'related' || storageType !== 'entity' || !Array.isArray(payload?.aliases)) return primary;
+            // A declared alias is an identity claim, never more than exact-ci:
+            // the entity literally named the query always ranks above it.
+            const aliasKind = bestMatchKind(payload.aliases.map((alias: unknown) => nameMatchKind(alias)));
+            return aliasKind === 'exact' ? 'exact-ci' : aliasKind;
+          };
+          const compareByMatchKind = (a: any, b: any): number =>
+            (MATCH_KIND_RANK[b.matchKind] ?? 0) - (MATCH_KIND_RANK[a.matchKind] ?? 0);
+
           const scoreAndDecorate = (results: any[]) => results.map((result: any) => {
             const payload = getContentPayload(result);
             const lowerQuery = query.toLowerCase();
@@ -2287,11 +2330,13 @@ export class NeuralMCPServer {
                           contentMatch ? 0.75 :
                           weightedSemSim !== null ? 0.5 + 0.4 * weightedSemSim : // 0.5..0.9 band, type-weighted
                           0.6;
+            const storageMemoryType = getStorageMemoryType(result);
             const entry: any = {
               ...result,
               searchScore: score,
+              matchKind: matchKindFor(result, storageMemoryType),
               searchType: searchType,
-              storageMemoryType: getStorageMemoryType(result),
+              storageMemoryType,
               entityType: getDomainType(result),
               canonicalEntityName: getEntityName(result),
               memorySource: result.source?.startsWith('sqlite-vec:') ? 'sqlite-vec' :
@@ -2311,7 +2356,7 @@ export class NeuralMCPServer {
               entry.totalChunks = result.totalChunks;
             }
             return entry;
-          }).sort((a: any, b: any) => b.searchScore - a.searchScore);
+          }).sort((a: any, b: any) => compareByMatchKind(a, b) || b.searchScore - a.searchScore);
 
           const resultTimestamp = (result: any): number => {
             const value = result?.timestamp || result?.createdAt || result?.content?.timestamp;
@@ -2611,6 +2656,7 @@ export class NeuralMCPServer {
                 id: result.id,
                 type: result.type,
                 searchScore: result.searchScore,
+                matchKind: result.matchKind,
                 sources: result.sources,
                 matchedLookupKinds: result.matchedLookupKinds,
                 matchOrigins: result.matchOrigins,

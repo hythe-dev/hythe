@@ -421,7 +421,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   },
   search_entities: {
     name: 'search_entities',
-    description: 'Advanced federated search across graph, vectors, and cache. AGENT TIP: for a KNOWN entity/project name, pass searchType=exact — it is fast, precise, and name-anchored; hybrid/semantic is a bounded, lower-precision supplement best for fuzzy/exploratory queries (entity & observation hits are ranked above ai_message chatter). Returns compact summaries by default (use get_entity_detail for full content). Supports pagination, relevance/recency ordering, and entity/memory-type scoping.',
+    description: 'Advanced federated search across graph, vectors, and cache. AGENT TIP: for a KNOWN entity/project name, pass searchType=exact — it is fast, precise, and name-anchored; hybrid/semantic is a bounded, lower-precision supplement best for fuzzy/exploratory queries (entity & observation hits are ranked above ai_message chatter). Every result carries matchKind (exact | exact-ci | prefix | related: how its name, or the entityName of an observation, relates to the query) and relevance order is matchKind first, then searchScore, so the entity named exactly as the query comes before entities that only share its prefix ("ascend-website" before "ascend-website-redesign"). An exact search is name-ANCHORED, not an identity lookup: it can also return prefix and related rows; for exact identity keep matchKind exact/exact-ci, or pass canonicalEntityKey. Returns compact summaries by default (use get_entity_detail for full content). Supports pagination, relevance/recency ordering, and entity/memory-type scoping.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -436,7 +436,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
         sortBy: {
           type: 'string',
           enum: ['relevance', 'recency'],
-          description: 'Result ordering. Relevance preserves the default ranking; recency sorts newest first before pagination.',
+          description: 'Result ordering. Relevance orders by matchKind (exact, exact-ci, prefix, related), then searchScore; recency sorts newest first before pagination.',
           default: 'relevance'
         },
         canonicalEntityKey: {
