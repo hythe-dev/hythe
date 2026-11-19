@@ -49,7 +49,7 @@ const transformerRuntimeContract = {
   dependency: '@xenova/transformers',
   dependencyVersion: '2.17.2',
   moduleSpecifier: 'file:///opt/hythe-transformers/node_modules/@xenova/transformers/src/transformers.js',
-  overrides: { protobufjs: '7.6.5', sharp: '0.35.3' },
+  overrides: { protobufjs: '7.6.5', sharp: '0.35.5' },
 };
 
 export const verifyReleaseTree = (root = process.cwd()) => {
