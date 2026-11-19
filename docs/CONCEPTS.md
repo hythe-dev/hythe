@@ -84,6 +84,24 @@ current?". v3 makes that explicit:
 Walkthrough and request/response examples:
 [CHECKPOINT-RESUME-V3.md](./CHECKPOINT-RESUME-V3.md).
 
+### Reading tool results: use `structuredContent`
+
+`resume` and `checkpoint` (and `begin_session` / `end_session`) return the
+same result twice, as the MCP spec allows: a serialized JSON string in
+`content[0].text` for older clients, and the parsed object in
+`structuredContent`. They are identical. Read **one** of them, preferably
+`structuredContent`; do not print the whole result envelope, or every bundle
+appears twice. Clients that cannot see `structuredContent` should parse
+`content[0].text`.
+
+### Keeping agent listings small
+
+`get_agent_status` with no arguments returns full registration rows and is
+large on a busy server. To find someone, use `get_agent_status({resolve:
+"<name>"})` (where a message to that name goes) or filter the listing with
+`name` (a case-insensitive prefix) and `compact: true` (four fields per
+row). The default response is unchanged.
+
 ## Discovering reusable knowledge
 
 `resume` is deterministic rehydration for one exact scope; it does not

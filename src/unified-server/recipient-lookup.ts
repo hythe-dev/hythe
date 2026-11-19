@@ -226,11 +226,13 @@ export function resolveRecipient(deps: RecipientLookupDeps, query: unknown): Rec
 /**
  * Mailbox addresses that have sent or received messages but have no
  * registration row, most recently active first. Bounded by `limit`.
+ * `prefix` (lower-case) keeps only addresses starting with it, ignoring case.
  */
 export function listUnregisteredAddressable(
   db: Database.Database,
   tenantId: string,
   limit: number,
+  prefix?: string,
 ): { total: number; addresses: Array<{ agentId: string; lastActivityAt: string | null; registered: false }> } {
   const base = `
     WITH addresses AS (
@@ -241,9 +243,12 @@ export function listUnregisteredAddressable(
       SELECT agent_id, MAX(last) AS last FROM addresses GROUP BY agent_id
     )
     SELECT agent_id, last FROM merged
-     WHERE agent_id NOT IN (SELECT agent_id FROM agent_registrations WHERE tenant_id = ?)`;
-  const total = (db.prepare(`SELECT COUNT(*) AS c FROM (${base})`).get(tenantId, tenantId, tenantId) as { c: number }).c;
-  const rows = db.prepare(`${base} ORDER BY last DESC, agent_id LIMIT ?`).all(tenantId, tenantId, tenantId, limit) as any[];
+     WHERE agent_id NOT IN (SELECT agent_id FROM agent_registrations WHERE tenant_id = ?)
+       AND (? IS NULL OR lower(substr(agent_id, 1, length(?))) = ?)`;
+  const p = prefix ?? null;
+  const params = [tenantId, tenantId, tenantId, p, p, p];
+  const total = (db.prepare(`SELECT COUNT(*) AS c FROM (${base})`).get(...params) as { c: number }).c;
+  const rows = db.prepare(`${base} ORDER BY last DESC, agent_id LIMIT ?`).all(...params, limit) as any[];
   return {
     total,
     addresses: rows.map((r) => ({ agentId: r.agent_id, lastActivityAt: r.last ?? null, registered: false as const })),

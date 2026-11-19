@@ -726,6 +726,15 @@ Parameters
       "type": "string",
       "description": "Recipient lookup: the name you intend to send to. Returns {recipient:{deliversTo, status, explanation, registration, mailbox:{received, sent, lastActivityAt}, relatedRegistrations}} and nothing else. Counts only; no message contents."
     },
+    "compact": {
+      "type": "boolean",
+      "description": "Opt-in small response: listing rows keep only agentId, canonicalAgentId, status, lastSeen (canonical rows add sessionCount); a single agent keeps agentId, canonicalAgentId, status, lastSeen, expiresAt and recipient {deliversTo, status}. JSON is not pretty-printed. Default false (full response, unchanged).",
+      "default": false
+    },
+    "name": {
+      "type": "string",
+      "description": "Listing filter: case-insensitive prefix of the agent id, display name or canonical id. Applied before paging and the canonical rollup (totals then count matches; matchedRegistrations is reported). Also filters unregisteredAddressable by address prefix."
+    },
     "includeAddressable": {
       "type": "boolean",
       "description": "When listing all agents, also return unregisteredAddressable: mailboxes that have sent or received messages but never registered (most recent first, up to limit), with totalUnregisteredAddressable.",
