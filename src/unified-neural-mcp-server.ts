@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import { MemoryManager, MAX_CONTENT_CHARS } from './unified-server/memory/index.js';
 import { enumError, misnamedSendField } from './shared/validation-hints.js';
 import { parseSince } from './shared/message-since.js';
+import { listUnregisteredAddressable, resolveRecipient, type RecipientLookupDeps } from './unified-server/recipient-lookup.js';
 import { MessageHubIntegration } from './message-hub/hub-integration.js';
 import { resolveMessageHubPort } from './message-hub/config.js';
 import { UnifiedToolSchemas } from './shared/toolSchemas.js';
@@ -4526,6 +4527,34 @@ export class NeuralMCPServer {
 
           let statusData;
           const db = this.memoryManager.getDb();
+          const recipientDeps: RecipientLookupDeps = {
+            db,
+            tenantId,
+            mailboxAddress: (n) => this.memoryManager.resolveMailboxAddress(n, tenantId),
+            presentationAliases: (n) => this.memoryManager.getAgentAliases(n, tenantId),
+            preferredAgentId: (n) => this.memoryManager.resolvePreferredAgentId(n, tenantId),
+            inferCanonicalAgentId: (id, n, m) => this.memoryManager.inferCanonicalAgentId(id, n, m),
+            effectiveStatus: (st, m) => effectiveRegistrationStatus(st, m),
+            expiresAt: (m) => registrationExpiresAt(m),
+          };
+
+          if (args.resolve !== undefined) {
+            // Recipient lookup: where does a message to this name go? Covers
+            // registered agents, unregistered-but-addressable mailboxes and
+            // presentation aliases (recipient-lookup.ts).
+            if (typeof args.resolve !== 'string' || args.resolve.length === 0) {
+              return {
+                content: [{ type: 'text', text: JSON.stringify({
+                  error: 'validation_error', field: 'resolve',
+                  message: 'resolve must be a non-empty string: the name you intend to send to.',
+                }) }],
+                isError: true,
+              };
+            }
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ recipient: resolveRecipient(recipientDeps, args.resolve) }, null, 2) }],
+            };
+          }
 
           if (targetAgentId) {
             const row = db.prepare(
@@ -4552,7 +4581,10 @@ export class NeuralMCPServer {
               ttlSeconds: metadata.ttlSeconds,
               lifecycleStatus: metadata.lifecycleStatus || metadata.status,
               capabilities: row ? parseRegistrationJson(row.capabilities_json, []) : [],
-              aliases: this.memoryManager.getAgentAliases(targetAgentId, tenantId)
+              aliases: this.memoryManager.getAgentAliases(targetAgentId, tenantId),
+              // Additive: addressability is separate from registration, so an
+              // unregistered agent that sends and receives is not just 'unknown'.
+              recipient: resolveRecipient(recipientDeps, targetAgentId),
             };
           } else {
             // All rows feed the canonical rollup (deduped, naturally bounded by
@@ -4638,6 +4670,12 @@ export class NeuralMCPServer {
               : [];
             const canonicalReturned = allCanonical.slice(0, statusLimit);
 
+            // Opt-in: mailboxes that send/receive but never registered (for
+            // example an agent that only uses send_ai_message/get_ai_messages).
+            const unregistered = args.includeAddressable === true
+              ? listUnregisteredAddressable(db, tenantId, statusLimit)
+              : undefined;
+
             statusData = {
               totalRegistrations,
               totalCanonicalAgents: canonicalMap.size || undefined,
@@ -4646,7 +4684,11 @@ export class NeuralMCPServer {
               offset: statusOffset,
               nextOffset,
               agents,
-              canonicalAgents: groupByCanonical ? canonicalReturned : undefined
+              canonicalAgents: groupByCanonical ? canonicalReturned : undefined,
+              ...(unregistered ? {
+                totalUnregisteredAddressable: unregistered.total,
+                unregisteredAddressable: unregistered.addresses,
+              } : {}),
             };
           }
 
