@@ -4538,6 +4538,39 @@ export class NeuralMCPServer {
             expiresAt: (m) => registrationExpiresAt(m),
           };
 
+          // Opt-in compact rows and a name-prefix filter (field feedback: a
+          // full listing was ~19k tokens). Defaults are unchanged. Validated
+          // first, so no mode (resolve, agentId, listing) ignores a bad value.
+          if (args.compact !== undefined && typeof args.compact !== 'boolean') {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                error: 'validation_error', field: 'compact', message: 'compact must be a boolean.',
+              }) }],
+              isError: true,
+            };
+          }
+          if (args.name !== undefined && (typeof args.name !== 'string' || args.name.trim().length === 0)) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                error: 'validation_error', field: 'name',
+                message: 'name must be a non-empty string: a case-insensitive prefix of the agent id, display name or canonical id.',
+              }) }],
+              isError: true,
+            };
+          }
+          const compactStatus = args.compact === true;
+          const namePrefix = typeof args.name === 'string' ? args.name.trim().toLowerCase() : undefined;
+          const statusJson = (data: unknown) => compactStatus ? JSON.stringify(data) : JSON.stringify(data, null, 2);
+          if (namePrefix !== undefined && (args.resolve !== undefined || targetAgentId)) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                error: 'validation_error', field: 'name',
+                message: 'name filters the agent listing; it cannot be combined with resolve or agentId.',
+              }) }],
+              isError: true,
+            };
+          }
+
           if (args.resolve !== undefined) {
             // Recipient lookup: where does a message to this name go? Covers
             // registered agents, unregistered-but-addressable mailboxes and
@@ -4552,7 +4585,7 @@ export class NeuralMCPServer {
               };
             }
             return {
-              content: [{ type: 'text', text: JSON.stringify({ recipient: resolveRecipient(recipientDeps, args.resolve) }, null, 2) }],
+              content: [{ type: 'text', text: statusJson({ recipient: resolveRecipient(recipientDeps, args.resolve) }) }],
             };
           }
 
@@ -4586,6 +4619,18 @@ export class NeuralMCPServer {
               // unregistered agent that sends and receives is not just 'unknown'.
               recipient: resolveRecipient(recipientDeps, targetAgentId),
             };
+            if (compactStatus) {
+              const full: any = statusData;
+              statusData = {
+                agentId: full.agentId,
+                canonicalAgentId: full.canonicalAgentId,
+                status: full.status,
+                lastSeen: full.lastSeen,
+                ...(full.expiresAt ? { expiresAt: full.expiresAt } : {}),
+                recipient: { deliversTo: full.recipient.deliversTo, status: full.recipient.status },
+                compact: true,
+              };
+            }
           } else {
             // All rows feed the canonical rollup (deduped, naturally bounded by
             // distinct logical agents). The RAW agents list is the unbounded part
@@ -4597,12 +4642,21 @@ export class NeuralMCPServer {
             ).get(tenantId) as { c: number };
             const totalRegistrations = totalRow?.c ?? 0;
 
-            const rows = db.prepare(
+            const allRows = db.prepare(
               `SELECT agent_id, name, capabilities_json, metadata_json, status, created_at, updated_at
                FROM agent_registrations
                WHERE tenant_id = ?
                ORDER BY updated_at DESC`
             ).all(tenantId) as any[];
+            // name: case-insensitive prefix of agent id, display name or
+            // canonical id. Applied before paging and before the rollup.
+            const rows = namePrefix === undefined ? allRows : allRows.filter((row) => {
+              const canonical = this.memoryManager.inferCanonicalAgentId(
+                row.agent_id, row.name, parseRegistrationJson(row.metadata_json, {}),
+              );
+              return [row.agent_id, row.name, canonical]
+                .some((v) => typeof v === 'string' && v.toLowerCase().startsWith(namePrefix));
+            });
 
             const pagedRows = rows.slice(statusOffset, statusOffset + statusLimit);
             const agents = pagedRows.map(row => {
@@ -4673,18 +4727,27 @@ export class NeuralMCPServer {
             // Opt-in: mailboxes that send/receive but never registered (for
             // example an agent that only uses send_ai_message/get_ai_messages).
             const unregistered = args.includeAddressable === true
-              ? listUnregisteredAddressable(db, tenantId, statusLimit)
+              ? listUnregisteredAddressable(db, tenantId, statusLimit, namePrefix)
               : undefined;
 
             statusData = {
               totalRegistrations,
-              totalCanonicalAgents: canonicalMap.size || undefined,
+              // With a name filter, report 0 rather than dropping the key.
+              totalCanonicalAgents: namePrefix !== undefined ? canonicalMap.size : (canonicalMap.size || undefined),
               returnedRegistrations: agents.length,
               returnedCanonicalAgents: groupByCanonical ? canonicalReturned.length : undefined,
               offset: statusOffset,
               nextOffset,
-              agents,
-              canonicalAgents: groupByCanonical ? canonicalReturned : undefined,
+              ...(namePrefix !== undefined ? { nameFilter: args.name.trim(), matchedRegistrations: rows.length } : {}),
+              ...(compactStatus ? { compact: true } : {}),
+              agents: compactStatus
+                ? agents.map((a: any) => ({ agentId: a.agentId, canonicalAgentId: a.canonicalAgentId, status: a.status, lastSeen: a.lastSeen }))
+                : agents,
+              canonicalAgents: groupByCanonical
+                ? (compactStatus
+                  ? canonicalReturned.map((c: any) => ({ agentId: c.agentId, status: c.status, lastSeen: c.lastSeen, sessionCount: c.sessionCount }))
+                  : canonicalReturned)
+                : undefined,
               ...(unregistered ? {
                 totalUnregisteredAddressable: unregistered.total,
                 unregisteredAddressable: unregistered.addresses,
@@ -4696,7 +4759,7 @@ export class NeuralMCPServer {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(statusData, null, 2),
+                text: statusJson(statusData),
               },
             ],
           };
