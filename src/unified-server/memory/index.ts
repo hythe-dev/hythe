@@ -80,6 +80,7 @@ interface MessagePage {
 }
 
 import { MAX_CONTENT_CHARS, codePointLength } from '../../shared/limits.js';
+import { normalizedTimestampSql, sinceForQuery } from '../../shared/message-since.js';
 export { MAX_CONTENT_CHARS };
 
 export class MemoryManager {
@@ -2981,6 +2982,8 @@ export class MemoryManager {
       : 0;
     const tenantId = options.tenantId || 'default';
     const compact = options.compact !== false; // default true
+    // Throws InvalidSinceError before any read (v3 plan P1).
+    const since = sinceForQuery(options.since);
     const recipientAliases = this.getMailboxAliases(agentId, tenantId);
     const senderAliases = options.from ? this.getMailboxAliases(options.from, tenantId) : [];
 
@@ -3016,9 +3019,9 @@ export class MemoryManager {
         where += ' AND message_type = ?';
         params.push(options.messageType);
       }
-      if (options.since) {
-        where += ' AND created_at >= ?';
-        params.push(options.since);
+      if (since !== undefined) {
+        where += ` AND ${normalizedTimestampSql('created_at')} >= ?`;
+        params.push(since);
       }
       if (options.unreadOnly) {
         where += ' AND read_at IS NULL';
@@ -3091,6 +3094,7 @@ export class MemoryManager {
       ? Math.max(0, Math.floor(options.offset!))
       : 0;
     const tenantId = options.tenantId || 'default';
+    const since = sinceForQuery(options.since);
     const recipientAliases = this.getMailboxAliases(agentId, tenantId);
     const senderAliases = options.from ? this.getMailboxAliases(options.from, tenantId) : [];
 
@@ -3127,9 +3131,9 @@ export class MemoryManager {
         where += ` AND ${messageTypeExpression} = ?`;
         params.push(options.messageType);
       }
-      if (options.since) {
-        where += ` AND ${timestampExpression} >= ?`;
-        params.push(options.since);
+      if (since !== undefined) {
+        where += ` AND ${normalizedTimestampSql(timestampExpression)} >= ?`;
+        params.push(since);
       }
       if (options.from) {
         const senderPlaceholders = senderAliases.map(() => '?').join(',');

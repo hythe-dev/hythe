@@ -7,6 +7,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { MemoryManager, MAX_CONTENT_CHARS } from './unified-server/memory/index.js';
 import { enumError, misnamedSendField } from './shared/validation-hints.js';
+import { parseSince } from './shared/message-since.js';
 import { MessageHubIntegration } from './message-hub/hub-integration.js';
 import { resolveMessageHubPort } from './message-hub/config.js';
 import { UnifiedToolSchemas } from './shared/toolSchemas.js';
@@ -763,6 +764,13 @@ export class NeuralMCPServer {
         if (from && this.memoryManager.resolveMailboxAddress(from, msgReqContext.tenantId) !== from) {
           res.status(400).json({ error: 'Sender filter identity is invalid' });
           return;
+        }
+        if (since !== undefined && since !== '') {
+          const parsedSince = parseSince(since);
+          if (!parsedSince.ok) {
+            res.status(400).json(parsedSince.error);
+            return;
+          }
         }
         const rawMessages = this.memoryManager.getMessages(agentId, {
           messageType,
@@ -4003,6 +4011,16 @@ export class NeuralMCPServer {
           if (from && this.memoryManager.resolveMailboxAddress(from, tenantId) !== from) {
             throw new Error('Sender filter identity is invalid');
           }
+          // v3 plan P1: since is parsed (ISO T/Z, offsets, space form), never
+          // compared as raw text; invalid input is a validation error.
+          let sinceUtc: string | undefined;
+          if (since !== undefined && since !== null && since !== '') {
+            const parsedSince = parseSince(since);
+            if (!parsedSince.ok) {
+              return { content: [{ type: 'text', text: JSON.stringify(parsedSince.error) }], isError: true };
+            }
+            sinceUtc = parsedSince.utc;
+          }
           const compact = args.compact !== false; // default true
           const unreadOnly = args.unreadOnly !== false; // default true
           // Server-side hard cap: 20 messages max, floor of 1
@@ -4082,6 +4100,7 @@ export class NeuralMCPServer {
                   filters: {
                     messageType: messageType || 'all',
                     since: since || 'beginning',
+                    ...(sinceUtc ? { sinceUtc } : {}),
                     unreadOnly,
                     includeSuperseded: includeSuperseded === true,
                     from: from || undefined,
