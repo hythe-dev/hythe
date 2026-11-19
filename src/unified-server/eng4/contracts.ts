@@ -387,6 +387,10 @@ export interface AsOfHeader {
   retiredHeadCount?: number;
   /** H4: UNRESOLVED divergent terminals with no truthful value (unversioned) — rejections a reconcile still owes; they are also listed in divergentValues with value null. */
   opaqueDivergentCount?: number;
+  /** v3 (field feedback P1 item 5): one fixed-size sentence on why this head is current and what the other live heads are. */
+  selectionReason?: string;
+  /** v3: true when more than one head is live or the pointer is invalid; checkpoint operation:"reconcile" resolves it. */
+  reconcileNeeded?: boolean;
 }
 
 export type HeadSelection = 'empty-scope' | 'max-revision' | 'pointer' | 'invalid-designation';
@@ -412,6 +416,8 @@ export interface HeadItem {
   author: string;
   recordedAt: string;
   isCurrent: boolean;
+  /** Field feedback P1 item 5: 'current' for the effective current head, 'divergent' for every other live head (a branch, whatever its revision). */
+  role: 'current' | 'divergent';
   parentRetired: boolean;
 }
 

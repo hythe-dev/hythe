@@ -83,6 +83,25 @@ when their name extends the scope's (`scope-root-child` for `scope-root`), and
 their `supersedes` cannot hide the scope's own decisions. Record decisions on
 the scope entity, or find others with `search_entities`.
 
+### Reading head conflicts
+
+A scope can have more than one **live head**: a checkpoint written against a
+stale `expectedRevision` becomes a branch instead of overwriting. Which head
+is current is decided by the scope **pointer**, not by revision number, so a
+branch can have a higher revision than the current head.
+
+- In every bundle version, `asOf.stateId`/`asOf.revision` is the current
+  head. When more than one head is live, `asOf.conflicts` lists **all** of
+  them, the current one included.
+- `resultVersion:3` labels them. Each item in `heads` has `role`:
+  `current` or `divergent`. `asOf.selectionReason` says in one sentence why
+  the current head was chosen and what the others are, and
+  `asOf.reconcileNeeded` is true when more than one head is live or the
+  pointer is invalid.
+- A divergent head is never adopted automatically. Keep writing against the
+  current revision; to merge or retire the branches, use
+  `checkpoint` with `operation:"reconcile"` (`resultVersion:3`).
+
 History and full message/handoff bodies are **resources**
 (`engram://snapshot/…`, `engram://message/…`, `engram://handoff/…`),
 deliberately not tools: bulk history stays off the tool surface and

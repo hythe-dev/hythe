@@ -459,10 +459,14 @@ export const RESUME_OUTPUT_SCHEMA_V2 = {
 const HEAD_ITEM = {
   type: 'object',
   additionalProperties: false,
-  required: ['stateId', 'revision', 'author', 'recordedAt', 'isCurrent', 'parentRetired'],
+  required: ['stateId', 'revision', 'author', 'recordedAt', 'isCurrent', 'role', 'parentRetired'],
   properties: {
     ...STATE_HEAD.properties,
     isCurrent: { type: 'boolean' },
+    role: {
+      enum: ['current', 'divergent'],
+      description: 'current: the effective current head (asOf.stateId). divergent: any other live head, a branch from a stale parent, never current whatever its revision.',
+    },
     parentRetired: { type: 'boolean' },
   },
 } as const;
@@ -624,6 +628,7 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
       required: [
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.required,
         'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount', 'opaqueDivergentCount',
+        'selectionReason', 'reconcileNeeded',
       ],
       properties: {
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.properties,
@@ -633,6 +638,8 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
         divergentHeadCount: { type: 'integer', minimum: 0 },
         retiredHeadCount: { type: 'integer', minimum: 0 },
         opaqueDivergentCount: { type: 'integer', minimum: 0 },
+        selectionReason: { type: 'string', description: 'Why asOf.stateId is current and what the other live heads are (fixed-size, counts only).' },
+        reconcileNeeded: { type: 'boolean', description: 'True when more than one head is live or the pointer is invalid; resolve with checkpoint operation:"reconcile".' },
       },
     },
     heads: { type: 'array', items: HEAD_ITEM },

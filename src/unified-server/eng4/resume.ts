@@ -43,6 +43,7 @@ import type {
   CurrentFact,
   HeadItem,
   InboxItem,
+  HeadSelection,
   OpenLoop,
   ResumeBundle,
   ResumeCapsule,
@@ -142,6 +143,31 @@ function emptyCoverage(omittedReason: SectionCoverage['omittedReason'], totalCou
   };
 }
 
+/**
+ * Field feedback P1 item 5: one fixed-size sentence saying WHY asOf names the
+ * current head and what the other live heads are. Counts only (the heads
+ * section lists them), so asOf stays fixed-size.
+ */
+export function describeSelection(selection: HeadSelection, currentRevision: number | null, divergent: number): string {
+  const others = divergent === 1 ? '1 other live head is' : `${divergent} other live heads are`;
+  const branches =
+    ` ${others} a branch written from a stale parent: NOT current, even when its revision is higher.` +
+    ' Merge or retire with checkpoint operation:"reconcile" (resultVersion 3).';
+  switch (selection) {
+    case 'empty-scope':
+      return 'No snapshot in this scope yet.';
+    case 'pointer':
+      return `Current is the head the scope pointer designates (revision ${currentRevision}).` +
+        (divergent > 0 ? branches : ' It is the only live head.');
+    case 'max-revision':
+      return `Legacy scope without a pointer: current is the highest live revision (${currentRevision}).` +
+        (divergent > 0 ? branches : ' It is the only live head.');
+    case 'invalid-designation':
+      return 'The scope pointer names a snapshot that is not a live head, so no head is current (fail closed).' +
+        ' Repair with checkpoint operation:"reconcile" (resultVersion 3).';
+  }
+}
+
 export function performResume(
   db: DatabaseType.Database,
   directory: ResumeDirectory,
@@ -171,7 +197,7 @@ function performResumeInner(
   const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0, complete: true };
   // v3 fixed-size asOf fields for a scope with no storage at all.
   const emptyHeadFields = resultVersion === 3
-    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0, opaqueDivergentCount: 0 }
+    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0, opaqueDivergentCount: 0, selectionReason: describeSelection('empty-scope', null, 0), reconcileNeeded: false }
     : {};
 
   if (!resolved.scopeKey) {
@@ -258,6 +284,7 @@ function performResumeInner(
     ? liveHeadDetails(db, tenantId, scopeKey).map((h) => ({
         stateId: h.stateId, revision: h.revision, author: h.author, recordedAt: h.recordedAt,
         isCurrent: current !== null && h.stateId === current.stateId,
+        role: current !== null && h.stateId === current.stateId ? 'current' as const : 'divergent' as const,
         parentRetired: h.parentRetired,
       }))
     : [];
@@ -572,6 +599,8 @@ function performResumeInner(
         divergentHeadCount: heads.length - (current ? 1 : 0),
         retiredHeadCount: retiredHeadCount(db, tenantId, scopeKey),
         opaqueDivergentCount: selection ? selection.opaqueDivergentCount : 0,
+        selectionReason: describeSelection(effective.selection, current ? current.revision : null, heads.length - (current ? 1 : 0)),
+        reconcileNeeded: effective.selection === 'invalid-designation' || heads.length > 1,
       }
     : {};
 
