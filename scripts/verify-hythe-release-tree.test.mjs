@@ -34,7 +34,7 @@ const makeTree = (version = '9.8.7') => {
     devDependencies: { '@xenova/transformers': '2.17.2' },
     peerDependencies: { '@xenova/transformers': '2.17.2' },
     peerDependenciesMeta: { '@xenova/transformers': { optional: true } },
-    overrides: { protobufjs: '7.6.5', sharp: '0.35.3' },
+    overrides: { protobufjs: '7.6.5', sharp: '0.35.5' },
     scripts: {
       prepack: 'npm run build && node scripts/verify-hythe-release-tree.mjs',
       'migrate:private-message-residue': 'node dist/migrations/007-private-message-residue.mjs',
@@ -66,7 +66,7 @@ const makeTree = (version = '9.8.7') => {
     version,
     private: true,
     dependencies: { '@xenova/transformers': '2.17.2' },
-    overrides: { protobufjs: '7.6.5', sharp: '0.35.3' },
+    overrides: { protobufjs: '7.6.5', sharp: '0.35.5' },
   });
   writeJson(root, 'docker/transformers-runtime/package-lock.json', {
     name: '@hythe/transformers-runtime',
@@ -78,7 +78,7 @@ const makeTree = (version = '9.8.7') => {
         dependencies: { '@xenova/transformers': '2.17.2' },
       },
       'node_modules/protobufjs': { version: '7.6.5' },
-      'node_modules/sharp': { version: '0.35.3' },
+      'node_modules/sharp': { version: '0.35.5' },
     },
   });
   writeFileSync(join(root, 'docker/transformers-runtime/.npmignore'), 'node_modules/\n');
