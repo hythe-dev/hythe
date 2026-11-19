@@ -526,7 +526,7 @@ Parameters
     },
     "since": {
       "type": "string",
-      "description": "ADVANCED ONLY — ISO timestamp for time-range queries. Do NOT use for routine inbox checks; use unreadOnly instead. A stale timestamp will cause missed messages."
+      "description": "ADVANCED ONLY — ISO 8601 timestamp for time-range queries: messages created at or after it. Accepts 2026-11-18T23:00:00Z, offsets (2026-11-18T17:00:00-06:00) and the space form (2026-11-18 23:00:00); no zone means UTC; millisecond precision. Invalid values are rejected. Do NOT use for routine inbox checks; use unreadOnly instead. A stale timestamp will cause missed messages."
     },
     "unreadOnly": {
       "type": "boolean",
