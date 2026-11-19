@@ -75,6 +75,12 @@ export interface ResumeDirectory extends EntityDirectory {
    * append must not hide a capsule (data-audit HIGH 1, 2026-09-03).
    */
   getCapsuleObservations(entityId: string, tenantId: string): { capsules: CapsuleObservation[]; candidatesConsidered: number };
+  /**
+   * resume v2/v3 (field feedback P1 item 2): unsuperseded observations with
+   * metadata.kind === 'decision' on the entity, newest first. Optional so
+   * narrow test directories need not implement it (absent = none).
+   */
+  getDecisionObservations?(entityId: string, tenantId: string): { decisions: CapsuleObservation[]; candidatesConsidered: number };
 }
 
 const SECTION_ORDER: readonly ResumeSectionNameV1[] = [
@@ -392,6 +398,7 @@ function performResumeInner(
             summary: String(event.summary ?? ''),
             recordedAt: typeof event.at === 'string' ? event.at : currentRow.recorded_at,
             evidenceRefs: (envelope.evidenceRefs ?? []).map(String),
+            ...(resultVersion >= 2 ? { source: 'checkpoint' as const } : {}),
           });
         }
       });
@@ -402,6 +409,26 @@ function performResumeInner(
         byteLength: handle.byteLength,
         mediaType: handle.mediaType,
       }];
+    }
+  }
+
+  // Field feedback P1 item 2: add_observations(kind:"decision") on the scope
+  // entity never reached resume, which only read checkpoint events. v2/v3
+  // list them AFTER the checkpoint decisions, labelled source:"observation";
+  // the v1 bundle is frozen and unchanged. Same budget/cursor accounting as
+  // every other decisions item.
+  if (resultVersion >= 2 && scopeEntityId && directory.getDecisionObservations) {
+    for (const d of directory.getDecisionObservations(scopeEntityId, tenantId).decisions) {
+      const summary = d.contents.length > 0 ? d.contents.join('\n') : (d.canonicalFact ?? '');
+      decisions.push({
+        id: `observation:${d.observationId}`,
+        summary,
+        recordedAt: d.recordedAt,
+        evidenceRefs: [],
+        source: 'observation',
+        observationId: d.observationId,
+        author: d.author,
+      });
     }
   }
 

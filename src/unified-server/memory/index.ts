@@ -4821,19 +4821,42 @@ export class MemoryManager {
     entityId: string,
     tenantId: string
   ): { capsules: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
+    const { items, candidatesConsidered } = this.getUnsupersededObservationsOfKind(entityId, tenantId, 'capsule');
+    return { capsules: items, candidatesConsidered };
+  }
+
+  /**
+   * Decisions recorded as observations (add_observations kind:"decision") on
+   * an entity, newest first, superseded ones excluded: the same selection as
+   * capsules (field feedback P1 item 2). resume v2/v3 lists them next to the
+   * checkpoint-event decisions, labelled source:"observation".
+   */
+  getDecisionObservations(
+    entityId: string,
+    tenantId: string
+  ): { decisions: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
+    const { items, candidatesConsidered } = this.getUnsupersededObservationsOfKind(entityId, tenantId, 'decision');
+    return { decisions: items, candidatesConsidered };
+  }
+
+  private getUnsupersededObservationsOfKind(
+    entityId: string,
+    tenantId: string,
+    kind: string
+  ): { items: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
     const entityRow = this.db.prepare(
       `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
     ).get(entityId, tenantId) as { content: string } | undefined;
-    if (!entityRow) return { capsules: [], candidatesConsidered: 0 };
+    if (!entityRow) return { items: [], candidatesConsidered: 0 };
     let entityName: string | null = null;
     try {
       const content = JSON.parse(entityRow.content || '{}');
-      if (this.isConfidentialMessageSearchItem('entity', content)) return { capsules: [], candidatesConsidered: 0 };
+      if (this.isConfidentialMessageSearchItem('entity', content)) return { items: [], candidatesConsidered: 0 };
       entityName = typeof content?.name === 'string' ? content.name : null;
     } catch {
-      return { capsules: [], candidatesConsidered: 0 };
+      return { items: [], candidatesConsidered: 0 };
     }
-    if (!entityName) return { capsules: [], candidatesConsidered: 0 };
+    if (!entityName) return { items: [], candidatesConsidered: 0 };
     const canonicalKey = this.normalizeEntityLookup(entityName);
 
     // FULL indexed scan, paged (review b2641137 blocker 2): a bounded window
@@ -4876,8 +4899,8 @@ export class MemoryManager {
       for (const id of supersedes) if (typeof id === 'string' && id.trim()) supersededIds.add(id.trim());
     }
 
-    const capsules = parsed
-      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !supersededIds.has(row.id))
+    const items = parsed
+      .filter(({ row, content }) => content?.metadata?.kind === kind && !supersededIds.has(row.id))
       .map(({ row, content }) => ({
         observationId: String(row.id),
         entityId,
@@ -4886,7 +4909,7 @@ export class MemoryManager {
         canonicalFact: typeof content?.metadata?.canonicalFact === 'string' ? content.metadata.canonicalFact : null,
         contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
       }));
-    return { capsules, candidatesConsidered: parsed.length };
+    return { items, candidatesConsidered: parsed.length };
   }
 
   findEntitiesByNameOrAlias(entityName: string, tenantId: string): any[] {

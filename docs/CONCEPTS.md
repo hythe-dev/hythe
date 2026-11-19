@@ -54,6 +54,26 @@ The two session primitives treat agent working state as data:
   masquerade as a complete one). Reading never consumes anything;
   handoff acknowledgement is explicit.
 
+### Two kinds of decision
+
+A decision can be recorded in two places, and they mean different things:
+
+- **Checkpoint decision**: an `events` item with `kind:"decision"` on a
+  `checkpoint`. It is part of that snapshot, so it describes the current
+  working state and is replaced when the next checkpoint omits it.
+- **Observation decision**: `add_observations` with `kind:"decision"` on the
+  scope entity (the project or task). It is durable knowledge that stays
+  current until another observation supersedes it (`metadata.supersedes`).
+
+`resume` with `resultVersion` 2 or 3 lists both in `decisions`:
+checkpoint decisions first (`source:"checkpoint"`), then the unsuperseded
+observation decisions on the scope entity, newest first
+(`source:"observation"`, with `observationId` and `author`). They share the
+section's budget and cursor. The frozen v1 bundle lists checkpoint decisions
+only, without `source`. Decision observations on other entities are not
+included; record them on the scope entity, or find them with
+`search_entities`.
+
 History and full message/handoff bodies are **resources**
 (`engram://snapshot/…`, `engram://message/…`, `engram://handoff/…`),
 deliberately not tools: bulk history stays off the tool surface and
