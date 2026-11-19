@@ -28,6 +28,10 @@ export const SINCE_SQL_FORMAT = '%Y-%m-%d %H:%M:%f';
  * 59.999, so no single rule could match it on the caller side.
  * Characters 1-20 of "YYYY-MM-DD HH:MM:SS." are fixed width; the zone (Z,
  * +-HH:MM) is whatever follows the fraction digits (ltrim of the digits).
+ * The rewrite only applies when the dot is followed by at least one digit; an
+ * empty or malformed fraction ("...00.Z", a trailing bare dot, "...00.+02:00")
+ * is passed through unchanged, so SQLite rejects it (NULL) instead of the
+ * padding repairing it into ".000".
  *
  * A stored value SQLite cannot parse (not a date, or a form such as
  * "2026-11-18 23:00:00 UTC") normalizes to NULL, and NULL >= ? is never
@@ -40,7 +44,7 @@ export function normalizedTimestampSql(expression: string): string {
   const rest = `substr(${expression}, 21)`;
   const zone = `ltrim(${rest}, '0123456789')`;
   const truncated =
-    `CASE WHEN substr(${expression}, 20, 1) = '.' ` +
+    `CASE WHEN substr(${expression}, 20, 1) = '.' AND substr(${expression}, 21, 1) GLOB '[0-9]' ` +
     `THEN substr(${expression}, 1, 20) || substr(substr(${rest}, 1, length(${rest}) - length(${zone})) || '000', 1, 3) || ${zone} ` +
     `ELSE ${expression} END`;
   return `strftime('${SINCE_SQL_FORMAT}', ${truncated})`;

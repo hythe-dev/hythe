@@ -169,7 +169,12 @@ describe('since precision: both sides truncated to milliseconds (ai_messages and
     ['p1', '2026-11-18 23:00:00.123999'],
     ['p2', '2026-11-18 23:00:00.123499'],
     ['p3', '2026-11-18 23:59:59.9999'],
+    ['p4', '2026-11-18 23:00:00.999999'],
     ['u1', '2026-11-18 23:00:00 UTC'],
+    // Empty or malformed fractions: SQLite rejects them, so must the helper.
+    ['u2', '2026-11-18T23:00:00.Z'],
+    ['u3', '2026-11-18 23:00:00.'],
+    ['u4', '2026-11-18T23:00:00.+02:00'],
   ];
 
   const current = (since?: string) =>
@@ -199,16 +204,16 @@ describe('since precision: both sides truncated to milliseconds (ai_messages and
   for (const [name, ids] of [['ai_messages', () => current], ['legacy shared_memory', () => legacy]] as const) {
     describe(name, () => {
       it('without since every row is returned, the unparseable one included', () => {
-        expect(ids()()).toEqual(['p1', 'p2', 'p3', 'u1']);
+        expect(ids()()).toEqual(['p1', 'p2', 'p3', 'p4', 'u1', 'u2', 'u3', 'u4']);
       });
 
       it('stored .123999 is NOT moved onto a .124 cutoff (strftime alone rounds it to .124)', () => {
-        expect(ids()('2026-11-18T23:00:00.124Z')).toEqual(['p3']);
+        expect(ids()('2026-11-18T23:00:00.124Z')).toEqual(['p3', 'p4']);
       });
 
       it('both sides truncate: .123 and .123999 cutoffs keep .123499 and .123999', () => {
-        expect(ids()('2026-11-18T23:00:00.123Z')).toEqual(['p1', 'p2', 'p3']);
-        expect(ids()('2026-11-18T23:00:00.123999Z')).toEqual(['p1', 'p2', 'p3']);
+        expect(ids()('2026-11-18T23:00:00.123Z')).toEqual(['p1', 'p2', 'p3', 'p4']);
+        expect(ids()('2026-11-18T23:00:00.123999Z')).toEqual(['p1', 'p2', 'p3', 'p4']);
       });
 
       it('no second rollover: stored 23:59:59.9999 stays before the next second', () => {
@@ -216,8 +221,18 @@ describe('since precision: both sides truncated to milliseconds (ai_messages and
         expect(ids()('2026-11-19T00:00:00Z')).toEqual([]);
       });
 
+      it('no second rollover: stored 23:00:00.999999 stays before a 23:00:01 cutoff (strftime alone rounds it to 23:00:01.000)', () => {
+        expect(ids()('2026-11-18T23:00:01Z')).toEqual(['p3']);
+        expect(ids()('2026-11-18T23:00:00.999Z')).toEqual(['p3', 'p4']);
+        expect(ids()('2026-11-18T23:00:00.999999Z')).toEqual(['p3', 'p4']);
+      });
+
       it('a stored value SQLite cannot parse is left out of every since result', () => {
-        expect(ids()('2026-01-01')).toEqual(['p1', 'p2', 'p3']);
+        expect(ids()('2026-01-01')).toEqual(['p1', 'p2', 'p3', 'p4']);
+      });
+
+      it('an empty or malformed stored fraction is not padded into .000 (left out like any unparseable value)', () => {
+        expect(ids()('2026-11-18T23:00:00Z')).toEqual(['p1', 'p2', 'p3', 'p4']);
       });
     });
   }
