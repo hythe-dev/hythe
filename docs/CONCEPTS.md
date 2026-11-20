@@ -102,11 +102,16 @@ newest observation decisions are listed; `observationDecisions` reports
 budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
 without `source`.
 
-Only observations whose `entityName` is the scope entity's name or one of its
-declared aliases count. Decisions on other entities are not included, even
-when their name extends the scope's (`scope-root-child` for `scope-root`), and
-their `supersedes` cannot hide the scope's own decisions. Record decisions on
-the scope entity, or find others with `search_entities`.
+Only observations whose `entityName` refers to the scope entity count, by
+the same rule the exact entity resolver uses: the entity's name or one of its
+declared aliases, compared case- and punctuation-insensitively, with company
+suffixes (`-llc`, `-inc`, `-corp`, `-co`, `-company`) and a trailing `-vN`
+treated as the same name. So for an entity `acme-llc`, observations stored
+under `Acme LLC`, `acme` or one of its aliases all count. Decisions on other
+entities are not included, even when their name extends the scope's
+(`scope-root-child` for `scope-root`), and their `supersedes` cannot hide the
+scope's own decisions. Record decisions on the scope entity, or find others
+with `search_entities`.
 
 The `capsule` block (`resultVersion` 2 or 3) uses the same ownership rule: a
 sibling entity's `kind:"capsule"` observation is never the scope's
@@ -122,7 +127,8 @@ is current is decided by the scope **pointer**, not by revision number, so a
 branch can have a higher revision than the current head.
 
 - In every bundle version, `asOf.stateId`/`asOf.revision` is the head
-  shown as working state. When more than one head is live, `asOf.conflicts`
+  shown as working state, when there is one (see below). When more than one
+  head is live, `asOf.conflicts`
   lists **all** of them, that one included.
 - `resultVersion:3` labels them. With a valid pointer, each item in `heads`
   has `role` `current` (the pointed head) or `divergent` (a branch retained

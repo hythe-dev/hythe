@@ -459,8 +459,10 @@ export interface ResumeCapsule {
   conflicts: CapsuleObservation[];
   /**
    * Every visible observation OWNED by the scope entity that was examined (FULL
-   * indexed scan, not a window). Owned: its entityName is the entity's name or
-   * a declared alias; prefix siblings found by the lookup index are excluded.
+   * indexed scan, not a window). Owned: its entityName refers to the entity by
+   * the exact resolver's rule (name or declared alias, normalized, company
+   * suffix / -vN variants); prefix siblings found by the lookup index are
+   * excluded.
    */
   candidatesConsidered: number;
   /**

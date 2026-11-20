@@ -4699,6 +4699,23 @@ export class MemoryManager {
     return Array.from(values);
   }
 
+  /**
+   * THE name-matching rule for "does this name refer to this entity?", shared
+   * by the exact entity resolver (resolveEntityCandidatesExact) and resume's
+   * observation ownership (getScopeObservationSelections), so the two can
+   * never disagree. A name matches when any of its query variants (normalized
+   * form, company-suffix forms, -vN stripped) equals a query variant of the
+   * entity's canonical name or of one of its declared aliases. Prefixes are
+   * never variants: "scope-root-child" does not match "scope-root".
+   * Pass ownerValues (= entityNameAndAliasLookupValues(content)) when matching
+   * many names against one entity.
+   */
+  private entityPayloadMatchesName(content: any, name: unknown, ownerValues?: Set<string>): boolean {
+    if (typeof name !== 'string' || !name.trim()) return false;
+    const owners = ownerValues ?? new Set(this.entityNameAndAliasLookupValues(content));
+    return this.entityQueryVariants(name).some((variant) => owners.has(variant));
+  }
+
   private entityNameAndAliasLookupValues(content: any): string[] {
     const values = new Set<string>();
     const add = (value: any) => {
@@ -4768,8 +4785,7 @@ export class MemoryManager {
         // the unindexed fallback applies.
         const canonicalVariants = new Set(this.entityQueryVariants(content?.name || ''));
         const isCanonical = [...queryVariants].some((v) => canonicalVariants.has(v));
-        const isNameOrAlias = isCanonical ||
-          this.entityNameAndAliasLookupValues(content).some((v) => queryVariants.has(v));
+        const isNameOrAlias = isCanonical || this.entityPayloadMatchesName(content, entityName);
         if (!isNameOrAlias) continue;
         candidates.push({
           id: String(row.id),
@@ -4855,13 +4871,16 @@ export class MemoryManager {
    * ONE full indexed scan of an entity's observations serving both resume
    * selections (capsules and decisions), so a v2/v3 resume pays the scan once.
    *
-   * The scan selects through graph_lookup_keys, whose keys include derived
-   * name variants (prefixes), so it can also return observations on OTHER
+   * The scan selects through graph_lookup_keys for every query variant of
+   * the entity's name and declared aliases. Those keys include derived name
+   * variants (prefixes), so it can also return observations on OTHER
    * entities ("scope-root-child" rows for "scope-root"). Those are retrieval
-   * candidates, not proof of ownership:
-   *  - decisions keep only rows whose entityName normalizes to the entity's
-   *    name or one of its declared aliases, and compute supersession from
-   *    those rows only (a sibling's supersedes cannot hide the scope's own
+   * candidates, not proof of ownership. A row is OWNED when its entityName
+   * refers to this entity by the exact resolver's rule
+   * (entityPayloadMatchesName): the name or a declared alias, compared after
+   * normalization and company-suffix / -vN variants, never by prefix.
+   *  - decisions keep only owned rows and compute supersession from owned
+   *    rows only (a sibling's supersedes cannot hide the scope's own
    *    decision). At most `decisionLimit` are returned; totalCount counts all.
    *  - capsules apply the same ownership rule (issue #31): a sibling's
    *    capsule is never the scope's current capsule or a conflict, and a
@@ -4884,19 +4903,20 @@ export class MemoryManager {
       `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
     ).get(entityId, tenantId) as { content: string } | undefined;
     if (!entityRow) return empty;
-    let entityName: string | null = null;
-    let aliases: string[] = [];
+    let entityContent: any;
     try {
-      const content = JSON.parse(entityRow.content || '{}');
-      if (this.isConfidentialMessageSearchItem('entity', content)) return empty;
-      entityName = typeof content?.name === 'string' ? content.name : null;
-      aliases = Array.isArray(content?.aliases) ? content.aliases.filter((a: unknown) => typeof a === 'string') : [];
+      entityContent = JSON.parse(entityRow.content || '{}');
     } catch {
       return empty;
     }
-    if (!entityName) return empty;
-    const canonicalKey = this.normalizeEntityLookup(entityName);
-    const ownerKeys = new Set([canonicalKey, ...aliases.map((a) => this.normalizeEntityLookup(a))].filter(Boolean));
+    if (this.isConfidentialMessageSearchItem('entity', entityContent)) return empty;
+    if (typeof entityContent?.name !== 'string' || !this.normalizeEntityLookup(entityContent.name)) return empty;
+    // Ownership uses the resolver's rule (entityPayloadMatchesName). The scan
+    // queries every owner variant, so observations stored under an alias or a
+    // suffix/-vN variant of the name are found, not only those whose index
+    // keys happen to include the canonical key.
+    const ownerValues = new Set(this.entityNameAndAliasLookupValues(entityContent));
+    const scanKeys = Array.from(ownerValues);
 
     // FULL indexed scan, paged (review b2641137 blocker 2): a bounded window
     // would silently drop a still-current capsule behind N newer unrelated
@@ -4905,21 +4925,23 @@ export class MemoryManager {
     const PAGE = 500;
     const page = this.db.prepare(`
       SELECT sm.id, sm.content, sm.created_by, sm.created_at
-      FROM graph_lookup_keys glk
-      JOIN shared_memory sm
-        ON sm.id = glk.memory_id AND sm.tenant_id = glk.tenant_id
-      WHERE glk.tenant_id = ?
-        AND glk.lookup_key = ?
-        AND glk.memory_type = 'observation'
-        AND glk.key_kind = 'entity_name'
+      FROM shared_memory sm
+      WHERE sm.tenant_id = ?
         AND sm.memory_type = 'observation'
+        AND sm.id IN (
+          SELECT glk.memory_id FROM graph_lookup_keys glk
+          WHERE glk.tenant_id = ?
+            AND glk.lookup_key IN (${scanKeys.map(() => '?').join(', ')})
+            AND glk.memory_type = 'observation'
+            AND glk.key_kind = 'entity_name'
+        )
       ORDER BY sm.created_at DESC, sm.rowid DESC
       LIMIT ? OFFSET ?
     `);
     const rows: Array<{ id: string; content: string; created_by: string; created_at: string }> = [];
     const seen = new Set<string>();
     for (let offset = 0; ; offset += PAGE) {
-      const batch = page.all(tenantId, canonicalKey, PAGE, offset) as typeof rows;
+      const batch = page.all(tenantId, tenantId, ...scanKeys, PAGE, offset) as typeof rows;
       for (const r of batch) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
       if (batch.length < PAGE) break;
     }
@@ -4950,7 +4972,7 @@ export class MemoryManager {
     });
 
     const owned = parsed.filter(({ content }) =>
-      typeof content?.entityName === 'string' && ownerKeys.has(this.normalizeEntityLookup(content.entityName)));
+      this.entityPayloadMatchesName(entityContent, content?.entityName, ownerValues));
     const ownedSuperseded = supersededBy(owned);
     const capsules = owned
       .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !ownedSuperseded.has(row.id))
