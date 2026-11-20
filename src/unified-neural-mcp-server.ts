@@ -42,6 +42,7 @@ import {
   createAgentCredentialMiddleware,
   resolveAgentAuthMode,
 } from './agent-auth/index.js';
+import { messageAttribution, readMessageAttribution } from './agent-auth/attribution.js';
 import type { AgentAuthMode } from './agent-auth/index.js';
 import {
   performRelatedContextDiscovery,
@@ -711,6 +712,7 @@ export class NeuralMCPServer {
               requestedFrom: requestedSender,
               requestedTo: to,
             },
+            attribution: messageAttribution(reqContext, from, senderAgentId),
           },
           reqContext.tenantId,
           reqContext
@@ -799,6 +801,7 @@ export class NeuralMCPServer {
           },
           timestamp: msg.created_at,
           from: msg.from_agent,
+          ...readMessageAttribution(meta, msg.from_agent),
         };
         });
 
@@ -3981,6 +3984,9 @@ export class NeuralMCPServer {
 
           // De-duplicate recipients
           recipients = Array.from(new Set(recipients.filter(Boolean)));
+          // Labelling only (field feedback P1 item 6): how the server knew the
+          // sender. Recorded on every row, broadcast and capability sends too.
+          const attribution = messageAttribution(context, args.from, senderAgentId);
 
           const results: { to: string; messageId: string; deliveryStatus: 'queued' | 'delivered'; clientsNotified: number }[] = [];
 
@@ -3998,7 +4004,8 @@ export class NeuralMCPServer {
                 original: {
                   requestedFrom: requestedSenderAgentId,
                   requestedTo: explicitTarget || null,
-                }
+                },
+                attribution,
               }
             };
 
@@ -4120,6 +4127,7 @@ export class NeuralMCPServer {
               relevance: 0.6,
               source: msg.from_agent,
               timestamp: msg.created_at,
+              ...readMessageAttribution(msgMeta, msg.from_agent),
             };
             if (compact) {
               // Summary only — agent uses get_message_detail for full content
@@ -4209,6 +4217,7 @@ export class NeuralMCPServer {
                 deliveryStatus: this.messageDeliveryStatus(msg, msg.metadata ? JSON.parse(msg.metadata) : {}),
                 readAt: msg.read_at,
                 summary: msg.summary,
+                ...readMessageAttribution(msg.metadata ? JSON.parse(msg.metadata) : {}, msg.from_agent),
                 metadata: msg.metadata ? JSON.parse(msg.metadata) : {},
               }, null, 2),
             }],

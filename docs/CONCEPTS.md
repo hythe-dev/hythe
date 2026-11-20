@@ -37,6 +37,31 @@ properties make them a coordination signal rather than a mailbox:
 Delivery is *tracked*, not guaranteed — the lifecycle states are honest
 about what the server knows.
 
+### Who sent it: `authoredBy` and `attributionSource`
+
+Every message item (`get_ai_messages`, `get_message_detail`, and the REST
+mailbox) carries two top-level labels saying how the server knew the sender:
+
+| attributionSource | Meaning |
+|---|---|
+| `credential` | `from` is proven by the sender's per-agent credential. |
+| `asserted` | The caller supplied `from` without a per-agent credential; the server took its word for it. |
+| `server-default` | No `from` at all; the server's own id was used. |
+| `unknown` | Stored before these labels existed. |
+
+`authoredBy` is the stored sender id. Every row of a broadcast or
+capability send is labelled. This is labelling only: it does not change who
+may send, and it never exposes credential or key identifiers.
+
+On a **shared connection** (several agents behind one bridge or one base
+key, none with its own agent key), every sender reads `asserted`, so the
+label cannot tell those co-located agents apart: a message saying
+`authoredBy: "codex"` may have been sent by any agent on that connection.
+Likewise a lane whose bridge pins its agent id (`HYTHE_AGENT_ID`) but
+presents no per-agent key reads `asserted`. The fix is a per-agent
+credential for each agent (`HYTHE_AGENT_KEY_FILE` on the bridge); its sends
+then read `credential`.
+
 ## resume / checkpoint
 
 The two session primitives treat agent working state as data:

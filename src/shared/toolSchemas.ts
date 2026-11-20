@@ -237,7 +237,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   },
   send_ai_message: {
     name: 'send_ai_message',
-    description: 'Send messages to AI agents (direct, capability-based, or broadcast)',
+    description: 'Send messages to AI agents (direct, capability-based, or broadcast). Each stored row records attributionSource: credential when a per-agent credential proves the sender, asserted when `from` is supplied without one, server-default when `from` is omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -283,7 +283,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   },
   get_ai_messages: {
     name: 'get_ai_messages',
-    description: 'Retrieve messages for the calling agent\'s exact inbox with filtering and real offset pagination. Identity-bound client bridges require agentId to match the configured lane identity. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale.',
+    description: 'Retrieve messages for the calling agent\'s exact inbox with filtering and real offset pagination. Identity-bound client bridges require agentId to match the configured lane identity. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale. Each message item carries authoredBy and attributionSource (credential: proven by a per-agent credential; asserted: from supplied without one, so agents sharing a connection are indistinguishable; server-default: no from; unknown: stored before labels existed).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -592,7 +592,7 @@ export const UnifiedToolSchemas: Record<string, ToolDefinition> = {
   // Message Hygiene: Single message detail retrieval
   get_message_detail: {
     name: 'get_message_detail',
-    description: 'Retrieve the full content of a single message by ID. Use after scanning compact message list from get_ai_messages.',
+    description: 'Retrieve the full content of a single message by ID. Use after scanning compact message list from get_ai_messages. Carries authoredBy and attributionSource (credential | asserted | server-default | unknown): how the server knew the sender.',
     inputSchema: {
       type: 'object',
       properties: {
