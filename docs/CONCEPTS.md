@@ -102,16 +102,24 @@ newest observation decisions are listed; `observationDecisions` reports
 budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
 without `source`.
 
-Only observations whose `entityName` refers to the scope entity count, by
-the same rule the exact entity resolver uses: the entity's name or one of its
-declared aliases, compared case- and punctuation-insensitively, with company
-suffixes (`-llc`, `-inc`, `-corp`, `-co`, `-company`) and a trailing `-vN`
-treated as the same name. So for an entity `acme-llc`, observations stored
-under `Acme LLC`, `acme` or one of its aliases all count. Decisions on other
-entities are not included, even when their name extends the scope's
-(`scope-root-child` for `scope-root`), and their `supersedes` cannot hide the
-scope's own decisions. Record decisions on the scope entity, or find others
-with `search_entities`.
+Only observations whose `entityName` names the scope entity, and only that
+entity, count:
+
+- an exact match (case- and punctuation-insensitive) of the entity's name
+  or one of its declared aliases that no other entity shares; or
+- a variant that the exact entity resolver resolves to this entity and
+  only this entity: a company suffix (`-llc`, `-inc`, `-corp`, `-co`,
+  `-company`) added or removed, or a trailing `-vN` removed.
+
+So for an entity `acme-llc`, observations stored under `Acme LLC` or one of
+its aliases always count, and those stored under `acme` count only while no
+other entity (such as `acme-inc`) also answers to `acme`. A name the resolver
+maps to more than one entity is ambiguous and counts for none of them.
+Decisions on other entities are not included, even when their name extends
+the scope's (`scope-root-child` for `scope-root`) or differs only by suffix or
+version (`x-v3` for `x-v2`), and their `supersedes` cannot hide the scope's
+own decisions. Record decisions on the scope entity, or find others with
+`search_entities`.
 
 The `capsule` block (`resultVersion` 2 or 3) uses the same ownership rule: a
 sibling entity's `kind:"capsule"` observation is never the scope's

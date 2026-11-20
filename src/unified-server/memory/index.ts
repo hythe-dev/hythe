@@ -4699,23 +4699,6 @@ export class MemoryManager {
     return Array.from(values);
   }
 
-  /**
-   * THE name-matching rule for "does this name refer to this entity?", shared
-   * by the exact entity resolver (resolveEntityCandidatesExact) and resume's
-   * observation ownership (getScopeObservationSelections), so the two can
-   * never disagree. A name matches when any of its query variants (normalized
-   * form, company-suffix forms, -vN stripped) equals a query variant of the
-   * entity's canonical name or of one of its declared aliases. Prefixes are
-   * never variants: "scope-root-child" does not match "scope-root".
-   * Pass ownerValues (= entityNameAndAliasLookupValues(content)) when matching
-   * many names against one entity.
-   */
-  private entityPayloadMatchesName(content: any, name: unknown, ownerValues?: Set<string>): boolean {
-    if (typeof name !== 'string' || !name.trim()) return false;
-    const owners = ownerValues ?? new Set(this.entityNameAndAliasLookupValues(content));
-    return this.entityQueryVariants(name).some((variant) => owners.has(variant));
-  }
-
   private entityNameAndAliasLookupValues(content: any): string[] {
     const values = new Set<string>();
     const add = (value: any) => {
@@ -4785,7 +4768,8 @@ export class MemoryManager {
         // the unindexed fallback applies.
         const canonicalVariants = new Set(this.entityQueryVariants(content?.name || ''));
         const isCanonical = [...queryVariants].some((v) => canonicalVariants.has(v));
-        const isNameOrAlias = isCanonical || this.entityPayloadMatchesName(content, entityName);
+        const isNameOrAlias = isCanonical ||
+          this.entityNameAndAliasLookupValues(content).some((v) => queryVariants.has(v));
         if (!isNameOrAlias) continue;
         candidates.push({
           id: String(row.id),
@@ -4876,9 +4860,11 @@ export class MemoryManager {
    * variants (prefixes), so it can also return observations on OTHER
    * entities ("scope-root-child" rows for "scope-root"). Those are retrieval
    * candidates, not proof of ownership. A row is OWNED when its entityName
-   * refers to this entity by the exact resolver's rule
-   * (entityPayloadMatchesName): the name or a declared alias, compared after
-   * normalization and company-suffix / -vN variants, never by prefix.
+   * refers to this entity and only this entity: an exact (normalized) match
+   * of its name or a declared alias that no other entity shares, or else a
+   * company-suffix / -vN variant that the exact resolver resolves to this
+   * entity alone. Never by prefix. A name that also refers to another
+   * entity is ambiguous and owned by none.
    *  - decisions keep only owned rows and compute supersession from owned
    *    rows only (a sibling's supersedes cannot hide the scope's own
    *    decision). At most `decisionLimit` are returned; totalCount counts all.
@@ -4911,12 +4897,12 @@ export class MemoryManager {
     }
     if (this.isConfidentialMessageSearchItem('entity', entityContent)) return empty;
     if (typeof entityContent?.name !== 'string' || !this.normalizeEntityLookup(entityContent.name)) return empty;
-    // Ownership uses the resolver's rule (entityPayloadMatchesName). The scan
-    // queries every owner variant, so observations stored under an alias or a
-    // suffix/-vN variant of the name are found, not only those whose index
-    // keys happen to include the canonical key.
-    const ownerValues = new Set(this.entityNameAndAliasLookupValues(entityContent));
-    const scanKeys = Array.from(ownerValues);
+    // The scan queries every owner variant (name and aliases), so observations
+    // stored under an alias or a suffix/-vN variant of the name are found, not
+    // only those whose index keys happen to include the canonical key. The
+    // keys are bound as ONE JSON parameter: an entity may declare thousands of
+    // aliases, and one placeholder per key would exceed SQLite's variable cap.
+    const scanKeysJson = JSON.stringify(this.entityNameAndAliasLookupValues(entityContent));
 
     // FULL indexed scan, paged (review b2641137 blocker 2): a bounded window
     // would silently drop a still-current capsule behind N newer unrelated
@@ -4931,18 +4917,19 @@ export class MemoryManager {
         AND sm.id IN (
           SELECT glk.memory_id FROM graph_lookup_keys glk
           WHERE glk.tenant_id = ?
-            AND glk.lookup_key IN (${scanKeys.map(() => '?').join(', ')})
+            AND glk.lookup_key IN (SELECT value FROM json_each(?))
             AND glk.memory_type = 'observation'
             AND glk.key_kind = 'entity_name'
         )
       ORDER BY sm.created_at DESC, sm.rowid DESC
       LIMIT ? OFFSET ?
     `);
+    // sm.id IN (subquery) yields each stored row at most once, and the ORDER BY
+    // is total, so pages neither repeat nor skip rows.
     const rows: Array<{ id: string; content: string; created_by: string; created_at: string }> = [];
-    const seen = new Set<string>();
     for (let offset = 0; ; offset += PAGE) {
-      const batch = page.all(tenantId, tenantId, ...scanKeys, PAGE, offset) as typeof rows;
-      for (const r of batch) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+      const batch = page.all(tenantId, tenantId, scanKeysJson, PAGE, offset) as typeof rows;
+      rows.push(...batch);
       if (batch.length < PAGE) break;
     }
 
@@ -4971,8 +4958,51 @@ export class MemoryManager {
       contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
     });
 
-    const owned = parsed.filter(({ content }) =>
-      this.entityPayloadMatchesName(entityContent, content?.entityName, ownerValues));
+    // OWNED is decided in two tiers, per distinct entityName (memoized: one
+    // resolution per name, not per row):
+    //  1. EXACT: the name normalizes exactly to the canonical name or a
+    //     declared alias of one or more resolver candidates. It belongs to
+    //     those entities only, and is owned when that is exactly this entity.
+    //     So x-v2 keeps rows written as "x-v2" even when x-v3 also exists
+    //     (the resolver alone would call "x-v2" ambiguous, since both share x).
+    //  2. VARIANT: otherwise the exact resolver (resolveEntityCandidatesExact)
+    //     must resolve the name to this entity and ONLY this entity
+    //     (resolveRef's fail-closed rule). A variant shared with a sibling
+    //     ("x" when x-v2 and x-v3 both exist, "acme" for acme-llc and
+    //     acme-inc) is ambiguous and counts for neither scope.
+    // Prefixes are never variants, so "scope-root-child" is never owned by
+    // "scope-root".
+    const exactKeysOf = (id: string): Set<string> => {
+      const row = this.db.prepare(
+        `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
+      ).get(id, tenantId) as { content: string } | undefined;
+      try {
+        const content = JSON.parse(row?.content || '{}');
+        const names = [content?.name, ...(Array.isArray(content?.aliases) ? content.aliases : [])];
+        return new Set(names.filter((n): n is string => typeof n === 'string').map((n) => this.normalizeEntityLookup(n)).filter(Boolean));
+      } catch {
+        return new Set();
+      }
+    };
+    const exactKeysById = new Map<string, Set<string>>([[entityId, exactKeysOf(entityId)]]);
+    const ownsName = new Map<string, boolean>();
+    const isOwned = (name: unknown): boolean => {
+      if (typeof name !== 'string' || !name.trim()) return false;
+      let owned = ownsName.get(name);
+      if (owned === undefined) {
+        const ids = [...new Set(this.resolveEntityCandidatesExact(name, tenantId).map((c) => c.id))];
+        const key = this.normalizeEntityLookup(name);
+        const exactIds = ids.filter((id) => {
+          if (!exactKeysById.has(id)) exactKeysById.set(id, exactKeysOf(id));
+          return exactKeysById.get(id)!.has(key);
+        });
+        const deciding = exactIds.length > 0 ? exactIds : ids;
+        owned = deciding.length === 1 && deciding[0] === entityId;
+        ownsName.set(name, owned);
+      }
+      return owned;
+    };
+    const owned = parsed.filter(({ content }) => isOwned(content?.entityName));
     const ownedSuperseded = supersededBy(owned);
     const capsules = owned
       .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !ownedSuperseded.has(row.id))
