@@ -388,7 +388,7 @@ Parameters
 ```
 
 ### send_ai_message
-Send messages to AI agents (direct, capability-based, or broadcast)
+Send messages to AI agents (direct, capability-based, or broadcast). Each stored row records attributionSource: credential when a per-agent credential proves the sender, asserted when `from` is supplied without one, server-default when `from` is omitted.
 
 Parameters
 
@@ -484,7 +484,7 @@ Parameters
 ```
 
 ### get_ai_messages
-Retrieve messages for the calling agent's exact inbox with filtering and real offset pagination. Identity-bound client bridges require agentId to match the configured lane identity. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale.
+Retrieve messages for the calling agent's exact inbox with filtering and real offset pagination. Identity-bound client bridges require agentId to match the configured lane identity. The response reports the true total matching the filters plus hasMore/nextOffset. IMPORTANT: For routine inbox checks, just pass agentId — the defaults (unreadOnly: true, compact: true, limit: 5, offset: 0) return the latest unread messages. Do NOT use the since filter for inbox checks; it often causes missed messages when the timestamp is stale. Each message item carries authoredBy and attributionSource (credential: proven by a per-agent credential; asserted: from supplied without one, so agents sharing a connection are indistinguishable; server-default: no from; unknown: stored before labels existed).
 
 Parameters
 
@@ -1783,7 +1783,7 @@ Parameters
 ```
 
 ### get_message_detail
-Retrieve the full content of a single message by ID. Use after scanning compact message list from get_ai_messages.
+Retrieve the full content of a single message by ID. Use after scanning compact message list from get_ai_messages. Carries authoredBy and attributionSource (credential | asserted | server-default | unknown): how the server knew the sender.
 
 Parameters
 
