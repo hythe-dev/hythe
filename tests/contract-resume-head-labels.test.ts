@@ -169,7 +169,8 @@ describe('resume v3 head labels (role, selectionReason, reconcileNeeded, cleanup
     db.prepare(`UPDATE eng4_scope_current SET state_id=? WHERE tenant_id=? AND scope_key=?`).run(root.stateId, TENANT, SCOPE);
     const broken = resume(db, 3);
     expect(broken.asOf.selection).toBe('invalid-designation');
-    expect(broken.asOf).toMatchObject({ reconcileNeeded: true, cleanupAvailable: false });
+    expect(broken.asOf).toMatchObject({ reconcileNeeded: true, cleanupAvailable: false, stateId: null, revision: null });
+    expect(broken.working).toBeNull();
     expect(broken.asOf.selectionReason).toMatch(/no head is designated \(fail closed\)/);
     expect(broken.heads.every((h: any) => h.role === 'undesignated')).toBe(true);
     expect(validV3(broken), ajv.errorsText(validV3.errors)).toBe(true);

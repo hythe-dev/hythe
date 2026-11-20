@@ -96,12 +96,17 @@ branch can have a higher revision than the current head.
 - `resultVersion:3` labels them. With a valid pointer, each item in `heads`
   has `role` `current` (the pointed head) or `divergent` (a branch retained
   from a stale parent, whatever its revision).
-- Without a valid pointer (`asOf.selection` `max-revision` on a legacy
-  scope, or `invalid-designation`), **no head is designated**: every head is
-  `undesignated`. `asOf.stateId` still shows the highest revision, but it is
-  not known to be the lineage tip, and `record`/`patch` conflict on every
-  head until a reconcile designates one. (A plain write still branches as
-  before.)
+- Without a valid pointer, **no head is designated**: every head is
+  `undesignated`, and `record`/`patch` conflict on every head until a
+  reconcile designates one. (A plain write still branches as before.) The
+  two cases differ in what `asOf` shows:
+  - `asOf.selection` `max-revision` (a legacy scope that never had a
+    pointer): `asOf.stateId`/`asOf.revision` fall back to the highest
+    revision, shown as working state only. It is not known to be the
+    lineage tip.
+  - `asOf.selection` `invalid-designation` (the pointer names a snapshot
+    that is not a live head): resume fails closed. `asOf.stateId` and
+    `asOf.revision` are `null` and no working state is shown.
 - `asOf.selectionReason` says, in fixed-size text, which head is designated,
   what the others are, and whether writes are blocked.
 - `asOf.reconcileNeeded` is true **only when writes are blocked** (no valid
