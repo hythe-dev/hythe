@@ -4822,8 +4822,9 @@ export class MemoryManager {
   /**
    * Rehydration capsules for an entity (resume resultVersion=2): every
    * observation whose metadata.kind === 'capsule' that is NOT superseded by
-   * any observation on the entity, newest first. Supersession is computed
-   * over ALL of the entity's indexed observations (full paged scan), so a non-capsule
+   * any observation on the entity, newest first. Only observations the entity
+   * owns count (see getScopeObservationSelections). Supersession is computed
+   * over ALL of the entity's owned observations (full paged scan), so a non-capsule
    * observation that supersedes a capsule still retires it — but an unrelated
    * newer append never hides one (data-audit HIGH 1, 2026-09-03).
    */
@@ -4862,7 +4863,10 @@ export class MemoryManager {
    *    name or one of its declared aliases, and compute supersession from
    *    those rows only (a sibling's supersedes cannot hide the scope's own
    *    decision). At most `decisionLimit` are returned; totalCount counts all.
-   *  - capsules keep the frozen v2 selection unchanged (all scanned rows).
+   *  - capsules apply the same ownership rule (issue #31): a sibling's
+   *    capsule is never the scope's current capsule or a conflict, and a
+   *    sibling's supersedes cannot retire the scope's capsule.
+   *    candidatesConsidered counts the owned rows examined.
    */
   getScopeObservationSelections(
     entityId: string,
@@ -4945,17 +4949,15 @@ export class MemoryManager {
       contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
     });
 
-    const allSuperseded = supersededBy(parsed);
-    const capsules = parsed
-      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !allSuperseded.has(row.id))
-      .map(toItem);
-
     const owned = parsed.filter(({ content }) =>
       typeof content?.entityName === 'string' && ownerKeys.has(this.normalizeEntityLookup(content.entityName)));
     const ownedSuperseded = supersededBy(owned);
+    const capsules = owned
+      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !ownedSuperseded.has(row.id))
+      .map(toItem);
     const allDecisions = owned.filter(({ row, content }) => content?.metadata?.kind === 'decision' && !ownedSuperseded.has(row.id));
     return {
-      capsules: { capsules, candidatesConsidered: parsed.length },
+      capsules: { capsules, candidatesConsidered: owned.length },
       decisions: {
         decisions: allDecisions.slice(0, Math.max(0, decisionLimit)).map(toItem),
         totalCount: allDecisions.length,

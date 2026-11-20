@@ -457,7 +457,11 @@ export interface ResumeCapsule {
   current: CapsuleObservation | null;
   /** Every OTHER unsuperseded kind=capsule observation delivered on this page, newest first — a fork to reconcile. */
   conflicts: CapsuleObservation[];
-  /** Every visible observation on the scope entity examined (FULL indexed scan, not a window). */
+  /**
+   * Every visible observation OWNED by the scope entity that was examined (FULL
+   * indexed scan, not a window). Owned: its entityName is the entity's name or
+   * a declared alias; prefix siblings found by the lookup index are excluded.
+   */
   candidatesConsidered: number;
   /**
    * true iff current AND all conflicts are delivered on this page

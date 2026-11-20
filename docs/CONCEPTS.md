@@ -108,6 +108,12 @@ when their name extends the scope's (`scope-root-child` for `scope-root`), and
 their `supersedes` cannot hide the scope's own decisions. Record decisions on
 the scope entity, or find others with `search_entities`.
 
+The `capsule` block (`resultVersion` 2 or 3) uses the same ownership rule: a
+sibling entity's `kind:"capsule"` observation is never the scope's
+`capsule.current` or a conflict, and a sibling's `supersedes` cannot retire
+the scope's capsule. `capsule.candidatesConsidered` counts only the scope
+entity's own observations.
+
 ### Reading head conflicts
 
 A scope can have more than one **live head**: a checkpoint written against a
