@@ -93,6 +93,11 @@ export interface ScopeObservationItem {
   contents: string[];
 }
 
+export interface ScopeObservationSelections {
+  capsules: { capsules: ScopeObservationItem[]; candidatesConsidered: number };
+  decisions: { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number };
+}
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -4860,11 +4865,13 @@ export class MemoryManager {
    * variants (prefixes), so it can also return observations on OTHER
    * entities ("scope-root-child" rows for "scope-root"). Those are retrieval
    * candidates, not proof of ownership. A row is OWNED when its entityName
-   * refers to this entity and only this entity: an exact (normalized) match
-   * of its name or a declared alias that no other entity shares, or else a
-   * company-suffix / -vN variant that the exact resolver resolves to this
-   * entity alone. Never by prefix. A name that also refers to another
-   * entity is ambiguous and owned by none.
+   * names this entity and only this entity, judged at read time against the
+   * current catalog: an exact (normalized) match of its name or a declared
+   * alias that no other entity shares; or, when no entity has the name
+   * exactly, a one-directional variant (the ROW name with a trailing -vN
+   * stripped or a company suffix added/removed) that is an exact key of this
+   * entity alone and that the exact resolver resolves to this entity alone.
+   * Never by prefix. See selectScopeObservations for the complete lookup.
    *  - decisions keep only owned rows and compute supersession from owned
    *    rows only (a sibling's supersedes cannot hide the scope's own
    *    decision). At most `decisionLimit` are returned; totalCount counts all.
@@ -4877,10 +4884,18 @@ export class MemoryManager {
     entityId: string,
     tenantId: string,
     decisionLimit: number = MemoryManager.RESUME_DECISION_OBSERVATION_LIMIT
-  ): {
-    capsules: { capsules: ScopeObservationItem[]; candidatesConsidered: number };
-    decisions: { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number };
-  } {
+  ): ScopeObservationSelections {
+    // ONE read transaction: every page of the scan and every ownership lookup
+    // see the same snapshot, so a concurrent writer (WAL) cannot make pages
+    // repeat or skip rows, or change the catalog between ownership checks.
+    return this.db.transaction(() => this.selectScopeObservations(entityId, tenantId, decisionLimit))();
+  }
+
+  private selectScopeObservations(
+    entityId: string,
+    tenantId: string,
+    decisionLimit: number
+  ): ScopeObservationSelections {
     const empty = {
       capsules: { capsules: [], candidatesConsidered: 0 },
       decisions: { decisions: [], totalCount: 0, candidatesConsidered: 0 },
@@ -4924,8 +4939,9 @@ export class MemoryManager {
       ORDER BY sm.created_at DESC, sm.rowid DESC
       LIMIT ? OFFSET ?
     `);
-    // sm.id IN (subquery) yields each stored row at most once, and the ORDER BY
-    // is total, so pages neither repeat nor skip rows.
+    // sm.id IN (subquery) yields each stored row at most once, the ORDER BY is
+    // total, and all pages read one snapshot (see the caller's transaction),
+    // so pages neither repeat nor skip rows.
     const rows: Array<{ id: string; content: string; created_by: string; created_at: string }> = [];
     for (let offset = 0; ; offset += PAGE) {
       const batch = page.all(tenantId, tenantId, scanKeysJson, PAGE, offset) as typeof rows;
@@ -4958,46 +4974,87 @@ export class MemoryManager {
       contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
     });
 
-    // OWNED is decided in two tiers, per distinct entityName (memoized: one
-    // resolution per name, not per row):
-    //  1. EXACT: the name normalizes exactly to the canonical name or a
-    //     declared alias of one or more resolver candidates. It belongs to
-    //     those entities only, and is owned when that is exactly this entity.
-    //     So x-v2 keeps rows written as "x-v2" even when x-v3 also exists
-    //     (the resolver alone would call "x-v2" ambiguous, since both share x).
-    //  2. VARIANT: otherwise the exact resolver (resolveEntityCandidatesExact)
-    //     must resolve the name to this entity and ONLY this entity
-    //     (resolveRef's fail-closed rule). A variant shared with a sibling
-    //     ("x" when x-v2 and x-v3 both exist, "acme" for acme-llc and
-    //     acme-inc) is ambiguous and counts for neither scope.
-    // Prefixes are never variants, so "scope-root-child" is never owned by
-    // "scope-root".
+    // OWNED is decided per distinct entityName (memoized), at READ time
+    // against the current entity catalog, in two tiers:
+    //  1. EXACT: when the name normalizes exactly to the canonical name or a
+    //     declared alias of any entity, it belongs to those entities only, and
+    //     is owned when that is exactly this entity. So x-v2 keeps rows written
+    //     as "x-v2" even when x-v3 also exists.
+    //  2. VARIANT (only when no entity has the name exactly): ONE-DIRECTIONAL.
+    //     Stripping a trailing -vN from the ROW name, or adding/removing a
+    //     company suffix, must yield an exact key of this entity and of no
+    //     other entity, AND the exact resolver must resolve the name to this
+    //     entity alone. So "acme" counts for acme-llc while no acme-inc
+    //     exists, but "nx-v3" never counts for nx-v2 (no shared stripped base).
+    // "Exactly / no other entity" uses a COMPLETE exact-owner lookup, not the
+    // capped search index alone (MAX_LOOKUP_KEYS_PER_MEMORY may hide a
+    // competing alias): index hits plus a payload check of every entity whose
+    // index entries may have been truncated (or of every entity when the
+    // tenant has no index rows). Prefixes are never variants, so
+    // "scope-root-child" is never owned by "scope-root".
+    const exactKeysById = new Map<string, Set<string>>();
     const exactKeysOf = (id: string): Set<string> => {
+      let keys = exactKeysById.get(id);
+      if (keys) return keys;
+      keys = new Set();
       const row = this.db.prepare(
         `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
       ).get(id, tenantId) as { content: string } | undefined;
       try {
         const content = JSON.parse(row?.content || '{}');
         const names = [content?.name, ...(Array.isArray(content?.aliases) ? content.aliases : [])];
-        return new Set(names.filter((n): n is string => typeof n === 'string').map((n) => this.normalizeEntityLookup(n)).filter(Boolean));
+        for (const n of names) {
+          if (typeof n !== 'string') continue;
+          const key = this.normalizeEntityLookup(n);
+          if (key) keys.add(key);
+        }
       } catch {
-        return new Set();
+        /* unparseable entity: owns no name */
       }
+      exactKeysById.set(id, keys);
+      return keys;
     };
-    const exactKeysById = new Map<string, Set<string>>([[entityId, exactKeysOf(entityId)]]);
+    let alwaysCheckIds: string[] | null = null; // entities the index may not fully cover
+    const uncoveredEntityIds = (): string[] => {
+      if (alwaysCheckIds) return alwaysCheckIds;
+      const sql = this.graphLookupIndexHasRows(tenantId)
+        ? `SELECT memory_id AS id FROM graph_lookup_keys
+            WHERE tenant_id = ? AND memory_type = 'entity'
+            GROUP BY memory_id HAVING COUNT(*) >= ${MemoryManager.MAX_LOOKUP_KEYS_PER_MEMORY}`
+        : `SELECT id FROM shared_memory WHERE tenant_id = ? AND memory_type = 'entity'`;
+      alwaysCheckIds = (this.db.prepare(sql).all(tenantId) as Array<{ id: string }>).map((r) => String(r.id));
+      return alwaysCheckIds;
+    };
+    const exactOwnersByKey = new Map<string, Set<string>>();
+    const exactOwners = (key: string): Set<string> => {
+      let owners = exactOwnersByKey.get(key);
+      if (owners) return owners;
+      const indexed = (this.db.prepare(
+        `SELECT DISTINCT memory_id AS id FROM graph_lookup_keys
+          WHERE tenant_id = ? AND lookup_key = ? AND memory_type = 'entity'`
+      ).all(tenantId, key) as Array<{ id: string }>).map((r) => String(r.id));
+      owners = new Set([...indexed, ...uncoveredEntityIds()].filter((id) => exactKeysOf(id).has(key)));
+      exactOwnersByKey.set(key, owners);
+      return owners;
+    };
+    const ownKeys = exactKeysOf(entityId);
     const ownsName = new Map<string, boolean>();
     const isOwned = (name: unknown): boolean => {
       if (typeof name !== 'string' || !name.trim()) return false;
       let owned = ownsName.get(name);
       if (owned === undefined) {
-        const ids = [...new Set(this.resolveEntityCandidatesExact(name, tenantId).map((c) => c.id))];
         const key = this.normalizeEntityLookup(name);
-        const exactIds = ids.filter((id) => {
-          if (!exactKeysById.has(id)) exactKeysById.set(id, exactKeysOf(id));
-          return exactKeysById.get(id)!.has(key);
-        });
-        const deciding = exactIds.length > 0 ? exactIds : ids;
-        owned = deciding.length === 1 && deciding[0] === entityId;
+        const exact = key ? exactOwners(key) : new Set<string>();
+        if (exact.size > 0) {
+          owned = exact.size === 1 && exact.has(entityId);
+        } else {
+          const targets = this.entityQueryVariants(name).filter((v) => v !== key);
+          const variantOwners = new Set(targets.flatMap((v) => [...exactOwners(v)]));
+          const resolved = new Set(this.resolveEntityCandidatesExact(name, tenantId).map((c) => c.id));
+          owned = targets.some((v) => ownKeys.has(v)) &&
+            variantOwners.size === 1 && variantOwners.has(entityId) &&
+            resolved.size === 1 && resolved.has(entityId);
+        }
         ownsName.set(name, owned);
       }
       return owned;

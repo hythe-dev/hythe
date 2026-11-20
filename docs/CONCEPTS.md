@@ -103,23 +103,32 @@ budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
 without `source`.
 
 Only observations whose `entityName` names the scope entity, and only that
-entity, count:
+entity, count. Names are compared case- and punctuation-insensitively:
 
-- an exact match (case- and punctuation-insensitive) of the entity's name
-  or one of its declared aliases that no other entity shares; or
-- a variant that the exact entity resolver resolves to this entity and
-  only this entity: a company suffix (`-llc`, `-inc`, `-corp`, `-co`,
-  `-company`) added or removed, or a trailing `-vN` removed.
+- **Exact name.** If the name is the canonical name or a declared alias of
+  any entity, it belongs to those entities only. It counts for the scope
+  when the scope is the only such entity. A name that two entities share
+  exactly counts for neither. Every declared alias is checked, even those
+  the search index does not keep.
+- **Variant**, only when no entity has the name exactly. The name counts when
+  removing a trailing `-vN` from it, or adding or removing a company suffix
+  (`-llc`, `-inc`, `-corp`, `-co`, `-company`), gives the scope's name or
+  one of its aliases, gives no other entity's, and the exact entity
+  resolver resolves the name to the scope alone. The rule runs one way only:
+  `x-v3` never counts for `x-v2`, and `x` never counts for `x-v2`.
 
-So for an entity `acme-llc`, observations stored under `Acme LLC` or one of
-its aliases always count, and those stored under `acme` count only while no
-other entity (such as `acme-inc`) also answers to `acme`. A name the resolver
-maps to more than one entity is ambiguous and counts for none of them.
-Decisions on other entities are not included, even when their name extends
-the scope's (`scope-root-child` for `scope-root`) or differs only by suffix or
-version (`x-v3` for `x-v2`), and their `supersedes` cannot hide the scope's
-own decisions. Record decisions on the scope entity, or find others with
-`search_entities`.
+So for an entity `acme-llc`, observations under `Acme LLC` count, and those
+under `acme` count only while no other entity (such as `acme-inc`) also has
+`acme` as a variant. Decisions on other entities are not included, even when
+their name extends the scope's (`scope-root-child` for `scope-root`) or
+differs only by suffix or version (`x-v3` for `x-v2`), and their `supersedes`
+cannot hide the scope's own decisions. Record decisions on the scope entity,
+or find others with `search_entities`.
+
+Ownership is decided when `resume` reads, against the entities that exist
+then; observations do not record an entity id. Creating an entity or alias
+can therefore move an observation from one scope to none: once `acme-inc`
+exists, observations under `acme` no longer count for `acme-llc`.
 
 The `capsule` block (`resultVersion` 2 or 3) uses the same ownership rule: a
 sibling entity's `kind:"capsule"` observation is never the scope's

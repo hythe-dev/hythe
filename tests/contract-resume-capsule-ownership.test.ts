@@ -5,11 +5,13 @@
  * become the scope's capsule.current or a conflict, and a sibling's
  * supersedes could retire the scope's capsule. Capsules now use the same
  * ownership rule as observation decisions (#29): an observation counts only
- * when its entityName refers to the scope entity and ONLY that entity: an
- * exact (normalized) name or declared alias no other entity shares, or a
- * company-suffix / -vN variant the exact resolver resolves to the scope
- * entity alone. Prefix siblings never count; names shared with a suffix or
- * version sibling count for neither entity.
+ * when its entityName names the scope entity and ONLY that entity, judged at
+ * read time: an exact (normalized) name or declared alias that no other
+ * entity has (checked completely, not through the capped search index); or,
+ * when no entity has the name exactly, a one-directional variant (the row
+ * name with a trailing -vN stripped or a company suffix added/removed) that
+ * is an exact key of the scope entity alone. Prefix siblings never count;
+ * names shared with another entity count for neither.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import Ajv from 'ajv';
@@ -66,7 +68,13 @@ describe('resume capsule selection counts only the scope entity\'s own observati
     setCreated(ids.selfOld, '2026-11-01 00:00:00');
     setCreated(ids.selfNew, '2026-11-02 00:00:00');
     setCreated(ids.selfNote, '2026-11-03 00:00:00');
-    ids.verCapsule = await add(`c31-ver-${suffix}`, 'capsule under the base name', { kind: 'capsule' });
+    // Version names are one-directional: stripping -vN from the ROW name may
+    // reach the scope's key, never the reverse, and two versions never meet
+    // at a shared base.
+    ids.verOwn = await add(`C31 Ver ${suffix} V2`, 'own capsule under a case variant', { kind: 'capsule' });
+    ids.verBase = await add(`c31-ver-${suffix}`, 'capsule under the base name', { kind: 'capsule' });
+    ids.verOther = await add(`c31-ver-${suffix}-v3`, 'note under another version', { kind: 'decision', metadata: { supersedes: [ids.verOwn] } });
+    setCreated(ids.verOwn, '2026-11-01 00:00:00');
   });
 
   afterAll(() => {
@@ -99,9 +107,14 @@ describe('resume capsule selection counts only the scope entity\'s own observati
     });
   }
 
-  it('an entity named like a version (-vN) sees observations stored under its base name, as the resolver does', async () => {
+  it('x-v2 owns neither rows under its base name x nor rows under x-v3 when no x-v3 entity exists', async () => {
     const bundle = await resume(verScope, 2);
-    expect(bundle.capsule.current?.observationId).toBe(ids.verCapsule);
+    expect(bundle.capsule.current?.observationId).toBe(ids.verOwn); // not retired by the x-v3 row
+    expect(bundle.capsule.conflicts).toEqual([]);
+    expect(bundle.capsule.candidatesConsidered).toBe(1);
+    const text = JSON.stringify(bundle);
+    expect(text).not.toContain(ids.verBase);
+    expect(text).not.toContain(ids.verOther);
   });
 
   it('the sibling still sees its own capsule', async () => {
@@ -334,14 +347,14 @@ describe('resume ownership scan with a very large alias set', () => {
     delete process.env.ENABLE_ADVANCED_MEMORY;
   });
 
-  it('resume v2 scans without exceeding the SQL variable cap and owns rows under a resolvable alias', async () => {
+  it('resume v2 scans without exceeding the SQL variable cap and owns rows under every declared alias', async () => {
     const manager = server.getMemoryManager() as any;
     const entityId = manager.resolveEntityCandidatesExact(name, 'default')[0].id;
     const content = JSON.parse(manager.getDb().prepare('SELECT content FROM shared_memory WHERE id = ?').get(entityId).content);
     expect(manager.entityNameAndAliasLookupValues(content).length).toBeGreaterThan(32_766);
-    // The lookup index keeps at most MAX_LOOKUP_KEYS_PER_MEMORY keys per entity,
-    // so the resolver resolves only some of 5,500 aliases. Ownership follows
-    // the resolver: a resolvable alias counts, an unresolvable one does not.
+    // The search index keeps at most MAX_LOOKUP_KEYS_PER_MEMORY keys per
+    // entity, so the resolver cannot resolve most of 5,500 aliases. Exact
+    // ownership does not depend on that index: every declared alias counts.
     const resolvesHere = (alias: string) =>
       [...new Set(manager.resolveEntityCandidatesExact(alias, 'default').map((c: any) => c.id))].join() === entityId;
     const resolvable = aliases.find(resolvesHere);
@@ -352,11 +365,111 @@ describe('resume ownership scan with a very large alias set', () => {
       (await mcpCall(server, 'add_observations', { observations: [{ entityName, contents: [contents], kind: 'capsule', metadata }] })).observations[0].id as string;
     const own = await add(name, 'own capsule');
     const viaAlias = await add(resolvable!, 'capsule under a resolvable alias', { supersedes: [own] });
-    const unowned = await add(unresolvable!, 'capsule under an alias the resolver cannot resolve');
+    const viaDeepAlias = await add(unresolvable!, 'capsule under an alias outside the search index', { supersedes: [viaAlias] });
     const bundle = await mcpCall(server, 'resume', { agentId: 'c31big-agent', scope: { project: name }, budget: 8000, resultVersion: 2 });
-    expect(bundle.capsule.current?.observationId).toBe(viaAlias);
+    expect(bundle.capsule.current?.observationId).toBe(viaDeepAlias);
     expect(bundle.capsule.conflicts).toEqual([]);
-    expect(bundle.capsule.candidatesConsidered).toBe(2);
-    expect(JSON.stringify(bundle.capsule)).not.toContain(unowned);
+    expect(bundle.capsule.candidatesConsidered).toBe(3);
   }, 120_000);
+});
+
+/**
+ * PR #34 round 4. Exact uniqueness must not be proved from the capped search
+ * index; version names are one-directional; ownership is decided at read
+ * time against the current catalog.
+ */
+describe('resume ownership: complete exact owners, one-directional variants, read-time catalog', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+  const agentId = 'c31r4-test-agent';
+  const resume = (project: string, resultVersion = 2) =>
+    mcpCall(server, 'resume', { agentId, scope: { project }, budget: 8000, resultVersion });
+  const add = async (entityName: string, contents: string, extra: Record<string, any> = {}) =>
+    (await mcpCall(server, 'add_observations', { observations: [{ entityName, contents: [contents], ...extra }] })).observations[0].id as string;
+  const setCreated = (id: string, at: string) =>
+    server.getMemoryManager().getDb().prepare('UPDATE shared_memory SET created_at = ? WHERE id = ?').run(at, id);
+  const observationDecisionIds = (bundle: any) =>
+    bundle.decisions.filter((d: any) => d.source === 'observation').map((d: any) => d.observationId);
+  const resolvedNames = (name: string) =>
+    [...new Set((server.getMemoryManager() as any).resolveEntityCandidatesExact(name, 'default').map((c: any) => c.name))].sort();
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('an alias hidden from the capped search index still makes a shared exact name ambiguous', async () => {
+    const shared = `zz-initial-b-${s}`;
+    const a = `c31r4-a-${s}`;
+    const b = shared; // B's canonical name is A's (hidden) alias
+    const fillers = Array.from({ length: 100 }, (_, i) => `f${i}x${s}`); // sort before "zz-…", pushing it out of A's 64 keys
+    await mcpCall(server, 'create_entities', {
+      entities: [
+        { name: a, entityType: 'project', observations: [], aliases: [...fillers, shared, `c31r4-a-handle-${s}`] },
+        { name: b, entityType: 'project', observations: [], aliases: [`initial-b-handle-${s}`] },
+      ],
+    });
+    // Precondition: the resolver sees only B for the shared name: A's alias is hidden.
+    expect(resolvedNames(shared)).toEqual([b]);
+    const bCapsule = await add(`initial-b-handle-${s}`, 'B capsule under its own handle', { kind: 'capsule' });
+    const bDecision = await add(`initial-b-handle-${s}`, 'B decision under its own handle', { kind: 'decision' });
+    const sharedCapsule = await add(shared, 'capsule under the shared name', { kind: 'capsule', metadata: { supersedes: [bCapsule, bDecision] } });
+    setCreated(bCapsule, '2026-11-01 00:00:00');
+    for (const version of [2, 3]) {
+      const viaB = await resume(`initial-b-handle-${s}`, version);
+      expect(viaB.capsule.current?.observationId).toBe(bCapsule); // not adopted, not retired
+      expect(viaB.capsule.conflicts).toEqual([]);
+      expect(observationDecisionIds(viaB)).toEqual([bDecision]);
+      expect(JSON.stringify(viaB)).not.toContain(sharedCapsule);
+      const viaA = await resume(`c31r4-a-handle-${s}`, version);
+      expect(viaA.capsule.current).toBeNull();
+      expect(JSON.stringify(viaA)).not.toContain(sharedCapsule);
+    }
+  });
+
+  it('foo-v2 rows belong to foo-v2 only when foo and foo-v2 coexist', async () => {
+    const foo = `c31r4-foo-${s}`;
+    const fooV2 = `${foo}-v2`;
+    await mcpCall(server, 'create_entities', {
+      entities: [
+        { name: foo, entityType: 'project', observations: [], aliases: [`c31r4-foo-handle-${s}`] },
+        { name: fooV2, entityType: 'project', observations: [], aliases: [`c31r4-foov2-handle-${s}`] },
+      ],
+    });
+    const fooCapsule = await add(foo, 'foo capsule', { kind: 'capsule' });
+    const v2Capsule = await add(fooV2, 'foo-v2 capsule', { kind: 'capsule', metadata: { supersedes: [fooCapsule] } });
+    setCreated(fooCapsule, '2026-11-01 00:00:00');
+    expect((await resume(`c31r4-foov2-handle-${s}`)).capsule.current?.observationId).toBe(v2Capsule);
+    const viaFoo = await resume(`c31r4-foo-handle-${s}`);
+    expect(viaFoo.capsule.current?.observationId).toBe(fooCapsule);
+    expect(viaFoo.capsule.candidatesConsidered).toBe(1);
+  });
+
+  it('a variant counts when stripping -vN or a company suffix from the ROW name reaches the scope', async () => {
+    const solo = `c31r4-solo-${s}`;
+    await mcpCall(server, 'create_entities', { entities: [{ name: solo, entityType: 'project', observations: [] }] });
+    const v7 = await add(`${solo}-v7`, 'capsule under a later version name', { kind: 'capsule' });
+    const llc = await add(`${solo} LLC`, 'decision under a suffixed name', { kind: 'decision' });
+    const bundle = await resume(solo);
+    expect(bundle.capsule.current?.observationId).toBe(v7);
+    expect(observationDecisionIds(bundle)).toEqual([llc]);
+  });
+
+  it('ownership is read-time: creating a suffix sibling withdraws a shared variant from both', async () => {
+    const llc = `c31r4-acme-${s}-llc`;
+    const base = `c31r4-acme-${s}`;
+    await mcpCall(server, 'create_entities', { entities: [{ name: llc, entityType: 'project', observations: [], aliases: [`c31r4-acme-handle-${s}`] }] });
+    const own = await add(llc, 'own capsule', { kind: 'capsule' });
+    const viaBase = await add(base, 'capsule under the base name', { kind: 'capsule', metadata: { supersedes: [own] } });
+    expect((await resume(llc)).capsule.current?.observationId).toBe(viaBase);
+    await mcpCall(server, 'create_entities', { entities: [{ name: `${base}-inc`, entityType: 'project', observations: [] }] });
+    const after = await resume(`c31r4-acme-handle-${s}`);
+    expect(after.capsule.current?.observationId).toBe(own);
+    expect(JSON.stringify(after)).not.toContain(viaBase);
+  });
 });
