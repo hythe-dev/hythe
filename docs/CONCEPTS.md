@@ -54,6 +54,35 @@ The two session primitives treat agent working state as data:
   masquerade as a complete one). Reading never consumes anything;
   handoff acknowledgement is explicit.
 
+### Two kinds of decision
+
+A decision can be recorded in two places, and they mean different things:
+
+- **Checkpoint decision**: an `events` item with `kind:"decision"` on a
+  `checkpoint`. It is part of that snapshot, so it describes the current
+  working state and is replaced when the next checkpoint omits it.
+- **Observation decision**: `add_observations` with `kind:"decision"`
+  (exact, case-sensitive) on the scope entity: the project, or the task when
+  the scope names only a task. It is durable knowledge that stays current
+  until another observation on the same entity supersedes it
+  (`metadata.supersedes`, which `mode:"replace-current"` also writes: a
+  replace-current note of any kind hides the decision it replaces).
+
+`resume` with `resultVersion` 2 or 3 lists both in `decisions`:
+checkpoint decisions first (`source:"checkpoint"`), then the unsuperseded
+observation decisions on the scope entity, newest first
+(`source:"observation"`, with `observationId` and `author`). At most the 10
+newest observation decisions are listed; `observationDecisions` reports
+`listedCount`, `totalCount` and `omittedCount`. They share the section's
+budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
+without `source`.
+
+Only observations whose `entityName` is the scope entity's name or one of its
+declared aliases count. Decisions on other entities are not included, even
+when their name extends the scope's (`scope-root-child` for `scope-root`), and
+their `supersedes` cannot hide the scope's own decisions. Record decisions on
+the scope entity, or find others with `search_entities`.
+
 History and full message/handoff bodies are **resources**
 (`engram://snapshot/…`, `engram://message/…`, `engram://handoff/…`),
 deliberately not tools: bulk history stays off the tool surface and

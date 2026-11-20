@@ -454,6 +454,19 @@ export interface ResumeCapsule {
   complete: boolean;
 }
 
+export interface ResumeDecision {
+  id: string;
+  summary: string;
+  recordedAt: string;
+  evidenceRefs: string[];
+  /** schemaVersion>=2 only. */
+  source?: 'checkpoint' | 'observation';
+  /** source:'observation' only. */
+  observationId?: string;
+  /** source:'observation' only: the observation's author. */
+  author?: string;
+}
+
 export interface ResumeBundle {
   /**
    * 1 = frozen bundle (default); 2 = v1 + capsule (request resultVersion=2);
@@ -467,6 +480,13 @@ export interface ResumeBundle {
   definition: string | null;
   /** Present ONLY on schemaVersion>=2. */
   capsule?: ResumeCapsule;
+  /**
+   * Present ONLY on schemaVersion>=2 (field feedback P1 item 2): the
+   * observation decisions on the scope entity. resume lists the newest
+   * listedCount of totalCount; omittedCount older ones are not listed (read
+   * them with search_entities / get_entity_detail).
+   */
+  observationDecisions?: { listedCount: number; totalCount: number; omittedCount: number };
   /** Present ONLY on schemaVersion=3: every live head, budgeted (H1). */
   heads?: HeadItem[];
   /** Present ONLY on schemaVersion=3 (H4): materialized divergent terminals off the accepted lineage. */
@@ -477,7 +497,14 @@ export interface ResumeBundle {
   openLoops: OpenLoop[];
   messages: InboxItem[];
   currentFacts: CurrentFact[];
-  decisions: Array<{ id: string; summary: string; recordedAt: string; evidenceRefs: string[] }>;
+  /**
+   * v1: decision events of the current checkpoint only. v2/v3 (field feedback
+   * P1 item 2): those first, each labelled source:'checkpoint', then the
+   * unsuperseded add_observations(kind:'decision') observations on the scope
+   * entity, newest first, labelled source:'observation' with observationId
+   * and author.
+   */
+  decisions: ResumeDecision[];
   evidence: ContentHandle[];
   pointers: Array<{ label: string; entity: string; relation: string }>;
   /** All seven v1 sections present ALWAYS (closedness — review e0d81d4d #2); `capsule` coverage ONLY on schemaVersion>=2; `heads` ONLY on 3. */

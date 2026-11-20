@@ -394,10 +394,44 @@ const CAPSULE_OBSERVATION = {
  */
 export const RESUME_OUTPUT_SCHEMA_V2 = {
   ...RESUME_OUTPUT_SCHEMA_V1,
-  required: [...RESUME_OUTPUT_SCHEMA_V1.required, 'capsule'],
+  required: [...RESUME_OUTPUT_SCHEMA_V1.required, 'capsule', 'observationDecisions'],
   properties: {
     ...RESUME_OUTPUT_SCHEMA_V1.properties,
     schemaVersion: { const: 2 },
+    observationDecisions: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['listedCount', 'totalCount', 'omittedCount'],
+      description: 'The scope entity\'s unsuperseded add_observations(kind:"decision"): resume lists the newest listedCount (at most 10) of totalCount in `decisions`; omittedCount older ones are not listed.',
+      properties: {
+        listedCount: { type: 'integer', minimum: 0 },
+        totalCount: { type: 'integer', minimum: 0 },
+        omittedCount: { type: 'integer', minimum: 0 },
+      },
+    },
+    // Field feedback P1 item 2: v2/v3 decisions are labelled by source and
+    // include add_observations(kind:"decision") on the scope entity. The v1
+    // item shape above stays frozen.
+    decisions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'summary', 'recordedAt', 'evidenceRefs', 'source'],
+        properties: {
+          id: { type: 'string' },
+          summary: { type: 'string' },
+          recordedAt: { type: 'string' },
+          evidenceRefs: { type: 'array', items: { type: 'string' } },
+          source: {
+            enum: ['checkpoint', 'observation'],
+            description: 'checkpoint: a decision event of the current checkpoint. observation: an unsuperseded add_observations(kind:"decision") on the scope entity (listed after the checkpoint decisions, newest first).',
+          },
+          observationId: { type: 'string', description: 'source:"observation" only.' },
+          author: { type: 'string', description: 'source:"observation" only: the observation author.' },
+        },
+      },
+    },
     capsule: {
       type: 'object',
       additionalProperties: false,
