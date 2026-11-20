@@ -5,7 +5,7 @@
  * (source:"checkpoint"), then the unsuperseded decision observations on the
  * scope entity, newest first (source:"observation"). The v1 bundle is frozen.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { NeuralMCPServer } from '../src/unified-neural-mcp-server.js';
 import Ajv from 'ajv';
 import { RESUME_OUTPUT_SCHEMA, RESUME_OUTPUT_SCHEMA_V1 } from '../src/unified-server/eng4/schemas.js';
@@ -26,6 +26,8 @@ describe('resume lists observation-sourced decisions (v2/v3)', () => {
   const suffix = Date.now();
   const project = `c2-decisions-${suffix}`;
   const other = `c2-other-${suffix}`;
+  // A PREFIX SIBLING: its observations share the scope's lookup-key prefix.
+  const sibling = `${project}-child`;
   const agentId = 'c2-test-agent';
   let oldId = '';
   let keptId = '';
@@ -46,6 +48,7 @@ describe('resume lists observation-sourced decisions (v2/v3)', () => {
       entities: [
         { name: project, entityType: 'project', observations: [] },
         { name: other, entityType: 'project', observations: [] },
+        { name: sibling, entityType: 'project', observations: [] },
       ],
     });
     await mcpCall(server, 'checkpoint', {
@@ -71,6 +74,14 @@ describe('resume lists observation-sourced decisions (v2/v3)', () => {
       ],
     });
     newestId = second.observations[0].id;
+    // The sibling records its own decision and a note that claims to supersede
+    // the scope's kept decision: neither may affect the scope's resume.
+    await mcpCall(server, 'add_observations', {
+      observations: [
+        { entityName: sibling, contents: ['sibling decision'], kind: 'decision' },
+        { entityName: sibling, contents: ['sibling note'], metadata: { supersedes: [keptId] } },
+      ],
+    });
     const db = server.getMemoryManager().getDb();
     db.prepare('UPDATE shared_memory SET created_at = ? WHERE id = ?').run('2026-11-02 00:00:00', oldId);
     db.prepare('UPDATE shared_memory SET created_at = ? WHERE id = ?').run('2026-11-03 00:00:00', keptId);
@@ -102,6 +113,8 @@ describe('resume lists observation-sourced decisions (v2/v3)', () => {
       expect(summaries).not.toContain('decision to be replaced'); // superseded
       expect(summaries).not.toContain('a plain note, not a decision'); // not kind:decision
       expect(summaries).not.toContain('decision on another entity'); // other scope
+      expect(summaries).not.toContain('sibling decision'); // prefix sibling
+      expect(bundle.observationDecisions).toEqual({ listedCount: 2, totalCount: 2, omittedCount: 0 });
       expect(bundle.coverage.decisions).toMatchObject({ includedCount: 3, totalCount: 3, contentComplete: true });
       expect(validBundle(bundle), JSON.stringify(validBundle.errors)).toBe(true);
     });
@@ -110,6 +123,7 @@ describe('resume lists observation-sourced decisions (v2/v3)', () => {
   it('v1 (frozen) is unchanged: checkpoint decisions only, no source field', async () => {
     const bundle = await resume();
     expect(bundle.schemaVersion).toBe(1);
+    expect(bundle).not.toHaveProperty('observationDecisions');
     expect(bundle.decisions).toHaveLength(1);
     expect(bundle.decisions[0]).toEqual({
       id: expect.stringMatching(/:0$/),
@@ -144,5 +158,44 @@ describe('resume lists observation-sourced decisions (v2/v3)', () => {
     });
     expect(page2.decisions[0].observationId).not.toBe(page1.decisions[0].observationId);
     expect(page2.decisions[0].source).toBe('observation');
+  });
+
+  it('a prefix sibling neither leaks its decisions in nor hides the scope decisions (ownership, not lookup prefix)', async () => {
+    const bundle = await resume(2);
+    const ids = bundle.decisions.map((d: any) => d.observationId).filter(Boolean);
+    expect(ids).toContain(keptId); // the sibling's supersedes:[keptId] is ignored
+    expect(bundle.decisions.map((d: any) => d.summary)).not.toContain('sibling decision');
+    // The sibling's own resume does list its decision.
+    const own = await mcpCall(server, 'resume', { agentId, scope: { project: sibling }, budget: 8000, resultVersion: 2 });
+    expect(own.decisions.map((d: any) => d.summary)).toEqual(['sibling decision']);
+  });
+
+  it('lists at most the 10 newest observation decisions and counts the rest', async () => {
+    const many = `c2-many-${suffix}`;
+    await mcpCall(server, 'create_entities', { entities: [{ name: many, entityType: 'project', observations: [] }] });
+    const added = await mcpCall(server, 'add_observations', {
+      observations: Array.from({ length: 12 }, (_, n) => ({ entityName: many, contents: [`many decision ${n}`], kind: 'decision' })),
+    });
+    const db = server.getMemoryManager().getDb();
+    added.observations.forEach((o: any, n: number) =>
+      db.prepare('UPDATE shared_memory SET created_at = ? WHERE id = ?').run(`2026-10-${String(n + 1).padStart(2, '0')} 00:00:00`, o.id));
+    const bundle = await mcpCall(server, 'resume', { agentId, scope: { project: many }, budget: 8000, resultVersion: 3 });
+    expect(bundle.decisions.map((d: any) => d.summary)).toEqual(
+      Array.from({ length: 10 }, (_, i) => `many decision ${11 - i}`));
+    expect(bundle.observationDecisions).toEqual({ listedCount: 10, totalCount: 12, omittedCount: 2 });
+  });
+
+  it('one observation scan per resume, even for an unrequested section', async () => {
+    const manager = server.getMemoryManager() as any;
+    const scan = vi.spyOn(manager, 'getScopeObservationSelections');
+    const capsules = vi.spyOn(manager, 'getCapsuleObservations');
+    try {
+      await mcpCall(server, 'resume', { agentId, scope: { project }, budget: 8000, resultVersion: 2, sections: ['working'] });
+      expect(scan).toHaveBeenCalledTimes(1);
+      expect(capsules).not.toHaveBeenCalled();
+    } finally {
+      scan.mockRestore();
+      capsules.mockRestore();
+    }
   });
 });

@@ -76,11 +76,16 @@ export interface ResumeDirectory extends EntityDirectory {
    */
   getCapsuleObservations(entityId: string, tenantId: string): { capsules: CapsuleObservation[]; candidatesConsidered: number };
   /**
-   * resume v2/v3 (field feedback P1 item 2): unsuperseded observations with
-   * metadata.kind === 'decision' on the entity, newest first. Optional so
-   * narrow test directories need not implement it (absent = none).
+   * resume v2/v3 (field feedback P1 item 2): ONE scan serving the capsule
+   * selection and the decision observations (unsuperseded
+   * metadata.kind === 'decision' rows OWNED by the entity, newest first,
+   * capped; totalCount counts all). Optional so narrow test directories need
+   * not implement it (absent = getCapsuleObservations and no decisions).
    */
-  getDecisionObservations?(entityId: string, tenantId: string): { decisions: CapsuleObservation[]; candidatesConsidered: number };
+  getScopeObservationSelections?(entityId: string, tenantId: string): {
+    capsules: { capsules: CapsuleObservation[]; candidatesConsidered: number };
+    decisions: { decisions: CapsuleObservation[]; totalCount: number; candidatesConsidered: number };
+  };
 }
 
 const SECTION_ORDER: readonly ResumeSectionNameV1[] = [
@@ -174,7 +179,7 @@ function performResumeInner(
     // all sections empty but ACCOUNTED — never a silently-empty bundle.
     return {
       schemaVersion: resultVersion,
-      ...(resultVersion >= 2 ? { capsule: emptyCapsule } : {}),
+      ...(resultVersion >= 2 ? { capsule: emptyCapsule, observationDecisions: { listedCount: 0, totalCount: 0, omittedCount: 0 } } : {}),
       ...(resultVersion === 3 ? { heads: [], divergentValues: [], legacyValues: [] } : {}),
       resolvedScope: resolved,
       asOf: { assembledAt, stateId: null, revision: null, stateAgeSec: null, stale: true, conflicts: [], ...emptyHeadFields },
@@ -239,9 +244,13 @@ function performResumeInner(
   // capsule is omitted with omittedReason=budget + a cursor, never trimmed
   // silently. Distinct from `definition` (immutable founding prose) and from
   // get_current_observation (newest of ANY kind).
-  const capsuleSelection = resultVersion >= 2 && scopeEntityId
-    ? directory.getCapsuleObservations(scopeEntityId, tenantId)
-    : { capsules: [] as CapsuleObservation[], candidatesConsidered: 0 };
+  const noDecisionObservations = { decisions: [] as CapsuleObservation[], totalCount: 0, candidatesConsidered: 0 };
+  const scopeObservations = resultVersion >= 2 && scopeEntityId
+    ? (directory.getScopeObservationSelections
+        ? directory.getScopeObservationSelections(scopeEntityId, tenantId)
+        : { capsules: directory.getCapsuleObservations(scopeEntityId, tenantId), decisions: noDecisionObservations })
+    : { capsules: { capsules: [] as CapsuleObservation[], candidatesConsidered: 0 }, decisions: noDecisionObservations };
+  const capsuleSelection = scopeObservations.capsules;
 
   // --- heads (v3 only): every live head, revision ASC; exactly the effective
   // current head is flagged; parentRetired marks a resurrection (§4.5).
@@ -414,23 +423,28 @@ function performResumeInner(
 
   // Field feedback P1 item 2: add_observations(kind:"decision") on the scope
   // entity never reached resume, which only read checkpoint events. v2/v3
-  // list them AFTER the checkpoint decisions, labelled source:"observation";
-  // the v1 bundle is frozen and unchanged. Same budget/cursor accounting as
-  // every other decisions item.
-  if (resultVersion >= 2 && scopeEntityId && directory.getDecisionObservations) {
-    for (const d of directory.getDecisionObservations(scopeEntityId, tenantId).decisions) {
-      const summary = d.contents.length > 0 ? d.contents.join('\n') : (d.canonicalFact ?? '');
-      decisions.push({
-        id: `observation:${d.observationId}`,
-        summary,
-        recordedAt: d.recordedAt,
-        evidenceRefs: [],
-        source: 'observation',
-        observationId: d.observationId,
-        author: d.author,
-      });
-    }
+  // list them AFTER the checkpoint decisions, labelled source:"observation",
+  // newest first and capped (observationDecisions reports the cap and the
+  // total); the v1 bundle is frozen and unchanged. Same budget/cursor
+  // accounting as every other decisions item.
+  const decisionObservations = scopeObservations.decisions;
+  for (const d of decisionObservations.decisions) {
+    const summary = d.contents.length > 0 ? d.contents.join('\n') : (d.canonicalFact ?? '');
+    decisions.push({
+      id: `observation:${d.observationId}`,
+      summary,
+      recordedAt: d.recordedAt,
+      evidenceRefs: [],
+      source: 'observation',
+      observationId: d.observationId,
+      author: d.author,
+    });
   }
+  const observationDecisions = {
+    listedCount: decisionObservations.decisions.length,
+    totalCount: decisionObservations.totalCount,
+    omittedCount: decisionObservations.totalCount - decisionObservations.decisions.length,
+  };
 
   // --- H4 v3 read model: accepted-lineage selection from verified versions.
   // The in-place lists above stay the frozen v1/v2 view and feed legacyValues.
@@ -563,7 +577,7 @@ function performResumeInner(
 
   return {
     schemaVersion: resultVersion,
-    ...(capsule ? { capsule } : {}),
+    ...(capsule ? { capsule, observationDecisions } : {}),
     ...(resultVersion === 3
       ? { heads: (included.heads ?? []) as HeadItem[], divergentValues: included.divergentValues ?? [], legacyValues: included.legacyValues ?? [] }
       : {}),

@@ -480,6 +480,13 @@ export interface ResumeBundle {
   definition: string | null;
   /** Present ONLY on schemaVersion>=2. */
   capsule?: ResumeCapsule;
+  /**
+   * Present ONLY on schemaVersion>=2 (field feedback P1 item 2): the
+   * observation decisions on the scope entity. resume lists the newest
+   * listedCount of totalCount; omittedCount older ones are not listed (read
+   * them with search_entities / get_entity_detail).
+   */
+  observationDecisions?: { listedCount: number; totalCount: number; omittedCount: number };
   /** Present ONLY on schemaVersion=3: every live head, budgeted (H1). */
   heads?: HeadItem[];
   /** Present ONLY on schemaVersion=3 (H4): materialized divergent terminals off the accepted lineage. */

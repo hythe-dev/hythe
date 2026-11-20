@@ -83,6 +83,16 @@ import { MAX_CONTENT_CHARS, codePointLength } from '../../shared/limits.js';
 import { normalizedTimestampSql, sinceForQuery } from '../../shared/message-since.js';
 export { MAX_CONTENT_CHARS };
 
+/** One selected observation as resume consumes it (capsule or decision). */
+export interface ScopeObservationItem {
+  observationId: string;
+  entityId: string;
+  recordedAt: string;
+  author: string;
+  canonicalFact: string | null;
+  contents: string[];
+}
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -4820,44 +4830,69 @@ export class MemoryManager {
   getCapsuleObservations(
     entityId: string,
     tenantId: string
-  ): { capsules: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
-    const { items, candidatesConsidered } = this.getUnsupersededObservationsOfKind(entityId, tenantId, 'capsule');
-    return { capsules: items, candidatesConsidered };
+  ): { capsules: ScopeObservationItem[]; candidatesConsidered: number } {
+    return this.getScopeObservationSelections(entityId, tenantId).capsules;
   }
 
   /**
    * Decisions recorded as observations (add_observations kind:"decision") on
-   * an entity, newest first, superseded ones excluded: the same selection as
-   * capsules (field feedback P1 item 2). resume v2/v3 lists them next to the
-   * checkpoint-event decisions, labelled source:"observation".
+   * an entity, newest first, superseded ones excluded (field feedback P1
+   * item 2). See getScopeObservationSelections for ownership and the cap.
    */
   getDecisionObservations(
     entityId: string,
-    tenantId: string
-  ): { decisions: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
-    const { items, candidatesConsidered } = this.getUnsupersededObservationsOfKind(entityId, tenantId, 'decision');
-    return { decisions: items, candidatesConsidered };
+    tenantId: string,
+    limit: number = MemoryManager.RESUME_DECISION_OBSERVATION_LIMIT
+  ): { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number } {
+    return this.getScopeObservationSelections(entityId, tenantId, limit).decisions;
   }
 
-  private getUnsupersededObservationsOfKind(
+  /** resume lists at most this many observation decisions (newest first). */
+  static readonly RESUME_DECISION_OBSERVATION_LIMIT = 10;
+
+  /**
+   * ONE full indexed scan of an entity's observations serving both resume
+   * selections (capsules and decisions), so a v2/v3 resume pays the scan once.
+   *
+   * The scan selects through graph_lookup_keys, whose keys include derived
+   * name variants (prefixes), so it can also return observations on OTHER
+   * entities ("scope-root-child" rows for "scope-root"). Those are retrieval
+   * candidates, not proof of ownership:
+   *  - decisions keep only rows whose entityName normalizes to the entity's
+   *    name or one of its declared aliases, and compute supersession from
+   *    those rows only (a sibling's supersedes cannot hide the scope's own
+   *    decision). At most `decisionLimit` are returned; totalCount counts all.
+   *  - capsules keep the frozen v2 selection unchanged (all scanned rows).
+   */
+  getScopeObservationSelections(
     entityId: string,
     tenantId: string,
-    kind: string
-  ): { items: Array<{ observationId: string; entityId: string; recordedAt: string; author: string; canonicalFact: string | null; contents: string[] }>; candidatesConsidered: number } {
+    decisionLimit: number = MemoryManager.RESUME_DECISION_OBSERVATION_LIMIT
+  ): {
+    capsules: { capsules: ScopeObservationItem[]; candidatesConsidered: number };
+    decisions: { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number };
+  } {
+    const empty = {
+      capsules: { capsules: [], candidatesConsidered: 0 },
+      decisions: { decisions: [], totalCount: 0, candidatesConsidered: 0 },
+    };
     const entityRow = this.db.prepare(
       `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
     ).get(entityId, tenantId) as { content: string } | undefined;
-    if (!entityRow) return { items: [], candidatesConsidered: 0 };
+    if (!entityRow) return empty;
     let entityName: string | null = null;
+    let aliases: string[] = [];
     try {
       const content = JSON.parse(entityRow.content || '{}');
-      if (this.isConfidentialMessageSearchItem('entity', content)) return { items: [], candidatesConsidered: 0 };
+      if (this.isConfidentialMessageSearchItem('entity', content)) return empty;
       entityName = typeof content?.name === 'string' ? content.name : null;
+      aliases = Array.isArray(content?.aliases) ? content.aliases.filter((a: unknown) => typeof a === 'string') : [];
     } catch {
-      return { items: [], candidatesConsidered: 0 };
+      return empty;
     }
-    if (!entityName) return { items: [], candidatesConsidered: 0 };
+    if (!entityName) return empty;
     const canonicalKey = this.normalizeEntityLookup(entityName);
+    const ownerKeys = new Set([canonicalKey, ...aliases.map((a) => this.normalizeEntityLookup(a))].filter(Boolean));
 
     // FULL indexed scan, paged (review b2641137 blocker 2): a bounded window
     // would silently drop a still-current capsule behind N newer unrelated
@@ -4891,25 +4926,42 @@ export class MemoryManager {
       return { row, content };
     }).filter(({ row }) => !this.isConfidentialGraphRow('observation', row.content, tenantId));
 
-    const supersededIds = new Set<string>();
-    for (const { content } of parsed) {
-      const supersedes = Array.isArray(content?.metadata?.supersedes)
-        ? content.metadata.supersedes
-        : Array.isArray(content?.supersedes) ? content.supersedes : [];
-      for (const id of supersedes) if (typeof id === 'string' && id.trim()) supersededIds.add(id.trim());
-    }
+    const supersededBy = (subset: typeof parsed): Set<string> => {
+      const ids = new Set<string>();
+      for (const { content } of subset) {
+        const supersedes = Array.isArray(content?.metadata?.supersedes)
+          ? content.metadata.supersedes
+          : Array.isArray(content?.supersedes) ? content.supersedes : [];
+        for (const id of supersedes) if (typeof id === 'string' && id.trim()) ids.add(id.trim());
+      }
+      return ids;
+    };
+    const toItem = ({ row, content }: (typeof parsed)[number]): ScopeObservationItem => ({
+      observationId: String(row.id),
+      entityId,
+      recordedAt: String(content?.timestamp || row.created_at),
+      author: String(content?.addedBy || row.created_by || ''),
+      canonicalFact: typeof content?.metadata?.canonicalFact === 'string' ? content.metadata.canonicalFact : null,
+      contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
+    });
 
-    const items = parsed
-      .filter(({ row, content }) => content?.metadata?.kind === kind && !supersededIds.has(row.id))
-      .map(({ row, content }) => ({
-        observationId: String(row.id),
-        entityId,
-        recordedAt: String(content?.timestamp || row.created_at),
-        author: String(content?.addedBy || row.created_by || ''),
-        canonicalFact: typeof content?.metadata?.canonicalFact === 'string' ? content.metadata.canonicalFact : null,
-        contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
-      }));
-    return { items, candidatesConsidered: parsed.length };
+    const allSuperseded = supersededBy(parsed);
+    const capsules = parsed
+      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !allSuperseded.has(row.id))
+      .map(toItem);
+
+    const owned = parsed.filter(({ content }) =>
+      typeof content?.entityName === 'string' && ownerKeys.has(this.normalizeEntityLookup(content.entityName)));
+    const ownedSuperseded = supersededBy(owned);
+    const allDecisions = owned.filter(({ row, content }) => content?.metadata?.kind === 'decision' && !ownedSuperseded.has(row.id));
+    return {
+      capsules: { capsules, candidatesConsidered: parsed.length },
+      decisions: {
+        decisions: allDecisions.slice(0, Math.max(0, decisionLimit)).map(toItem),
+        totalCount: allDecisions.length,
+        candidatesConsidered: owned.length,
+      },
+    };
   }
 
   findEntitiesByNameOrAlias(entityName: string, tenantId: string): any[] {
