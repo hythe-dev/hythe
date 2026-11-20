@@ -142,14 +142,17 @@ entity name (the first two or three segments, initials, corporate suffixes),
 so an exact search for `ascend-website` also returns `ascend-website-redesign`
 and other rows that merely share the name's prefix or mention it in prose.
 
-Every result carries `matchKind`, and relevance order is `matchKind` first,
-then `searchScore`:
+Every result carries `matchKind`. When the search is anchored on exact name
+matches (any `searchType:"exact"` search, and a hybrid search whose query
+equals a stored name), relevance order is `matchKind` first, then
+`searchScore`. The broad hybrid/semantic fallback, used when nothing matches
+the name, still labels each row but orders by `searchScore` alone.
 
 | matchKind | Meaning |
 |---|---|
 | `exact` | The name (an observation's `entityName`; a relation's `from`/`to`) equals the trimmed query byte for byte. |
-| `exact-ci` | Equal after case and separator normalization, or a declared alias equals the query. |
-| `prefix` | The normalized name starts with the normalized query plus a separator. |
+| `exact-ci` | Equal after case and separator normalization, or a declared alias equals the query (checked even when the name itself is only a prefix match). |
+| `prefix` | The normalized name, or a declared alias, starts with the normalized query plus a separator. |
 | `related` | Anything else: derived variants, handles in prose, semantic matches. |
 
 For exact **identity**, keep only `matchKind` `exact` (or `exact-ci`), or pass

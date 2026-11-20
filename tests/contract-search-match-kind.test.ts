@@ -9,7 +9,7 @@
  * won. Results now carry matchKind (exact | exact-ci | prefix | related) and
  * relevance order is matchKind first, then searchScore.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { NeuralMCPServer } from '../src/unified-neural-mcp-server.js';
 import { UnifiedToolSchemas } from '../src/shared/toolSchemas.js';
 
@@ -32,6 +32,9 @@ describe('search_entities matchKind and exact-name ranking', () => {
   const spaced = `C4 Site ${suffix}`;
   const aliasHolder = `c4-alias-holder-${suffix}`;
   const mentioner = `c4-mentioner-${suffix}`;
+  const topic = `c4-topic-${suffix}`;
+  const topicChild = `${topic}-child`;
+  const big = `c4-big-${suffix}`;
 
   beforeAll(async () => {
     process.env.ENABLE_ADVANCED_MEMORY = 'false';
@@ -53,6 +56,20 @@ describe('search_entities matchKind and exact-name ranking', () => {
         { entityName: prefixA, contents: ['redesign detail'] },
         { entityName: mentioner, contents: [`see ${base} for the plan`] },
       ],
+    });
+    // The name is only a prefix match for `topic`, but a declared alias equals it.
+    await mcpCall(server, 'create_entities', {
+      entities: [
+        { name: topicChild, entityType: 'project', observations: [], aliases: [topic] },
+        { name: big, entityType: 'project', observations: [] },
+      ],
+    });
+    // Large enough (>= 2KB) to take the compact envelope.
+    await mcpCall(server, 'add_observations', {
+      observations: [{ entityName: big, contents: ['large '.padEnd(3000, 'y')] }],
+    });
+    await mcpCall(server, 'create_relations', {
+      relations: [{ from: base, to: prefixA, relationType: 'c4_parent_of' }],
     });
     const db = server.getMemoryManager().getDb();
     // Make the newest-first tie-break of the old ordering visible: the canonical row is the oldest.
@@ -106,9 +123,60 @@ describe('search_entities matchKind and exact-name ranking', () => {
   });
 
   it('a lone prefix query labels the longer names prefix, never exact', async () => {
-    const page = await mcpCall(server, 'search_entities', { query: `c4-site`, searchType: 'exact', memoryTypes: ['entity'] });
-    for (const r of page.results) expect(r.matchKind).not.toBe('exact');
+    const page = await mcpCall(server, 'search_entities', { query: 'c4-site', searchType: 'exact', memoryTypes: ['entity'] });
+    expect(page.results.length).toBeGreaterThan(0);
+    for (const r of page.results) {
+      expect(Object.keys(RANK)).toContain(r.matchKind);
+      expect(r.matchKind).not.toBe('exact');
+    }
+    for (const name of [base, prefixA, prefixB]) {
+      const kind = kindOf(page.results, name);
+      if (kind !== undefined) expect(kind).toBe('prefix');
+    }
   });
+
+  it('a declared alias equal to the query is exact-ci even when the name is only a prefix match', async () => {
+    const page = await mcpCall(server, 'search_entities', { query: topic, searchType: 'exact', memoryTypes: ['entity'] });
+    expect(kindOf(page.results, topicChild)).toBe('exact-ci');
+    expect(page.results[0].canonicalEntityName).toBe(topicChild);
+  });
+
+  it('a relation takes the best of from/to', async () => {
+    const page = await mcpCall(server, 'search_entities', { query: base, searchType: 'exact', memoryTypes: ['relation'], compact: false });
+    const rel = page.results.find((r: any) => r.content?.relationType === 'c4_parent_of' || r.storageMemoryType === 'relation');
+    expect(rel).toBeDefined();
+    expect(rel.matchKind).toBe('exact');
+  });
+
+  it('the compact envelope carries matchKind', async () => {
+    const page = await mcpCall(server, 'search_entities', { query: big, searchType: 'exact', memoryTypes: ['observation'] });
+    const compacted = page.results.find((r: any) => r._compacted);
+    expect(compacted).toBeDefined();
+    expect(compacted.matchKind).toBe('exact');
+  });
+
+  for (const searchType of ['hybrid', 'semantic']) {
+    it(`${searchType} broad fallback (no name anchor) keeps pure searchScore order`, async () => {
+      const query = `c4 zebra quartz ${suffix}`;
+      const prefixNamed = `c4-zebra-quartz-${suffix}-child`;
+      const manager = server.getMemoryManager();
+      const spy = vi.spyOn(manager, 'search').mockResolvedValue([
+        { id: `r-unrelated-${suffix}`, type: 'shared', memoryType: 'entity', content: { name: `c4-unrelated-${suffix}`, entityType: 'project', observations: [] }, timestamp: '2026-01-02T00:00:00Z', semanticSimilarity: 0.95 },
+        { id: `r-prefix-${suffix}`, type: 'shared', memoryType: 'entity', content: { name: prefixNamed, entityType: 'project', observations: [] }, timestamp: '2026-01-01T00:00:00Z', semanticSimilarity: 0.3 },
+      ] as any);
+      try {
+        const page = await mcpCall(server, 'search_entities', { query, searchType, compact: false });
+        expect(spy).toHaveBeenCalled();
+        const rows = page.results.map((r: any) => ({ name: r.canonicalEntityName, kind: r.matchKind, score: r.searchScore }));
+        expect(rows.map((r: any) => r.name)).toEqual([`c4-unrelated-${suffix}`, prefixNamed]);
+        expect(rows[0].score).toBeGreaterThan(rows[1].score);
+        // Still labelled, just not used for ordering.
+        expect(rows.map((r: any) => r.kind)).toEqual(['related', 'prefix']);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  }
 
   it('sortBy:recency still wins over matchKind when explicitly requested', async () => {
     const page = await mcpCall(server, 'search_entities', { query: base, searchType: 'exact', memoryTypes: ['entity'], sortBy: 'recency' });
