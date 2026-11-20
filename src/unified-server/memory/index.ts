@@ -93,6 +93,11 @@ export interface ScopeObservationItem {
   contents: string[];
 }
 
+export interface ScopeObservationSelections {
+  capsules: { capsules: ScopeObservationItem[]; candidatesConsidered: number };
+  decisions: { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number };
+}
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -1098,7 +1103,7 @@ export class MemoryManager {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
-      stmt.run(
+      const insertRow = () => stmt.run(
         id,
         tenantId,
         type,
@@ -1109,8 +1114,24 @@ export class MemoryManager {
         ownerActorId
       );
 
-      if (this.isGraphMemoryType(type)) {
-        this.refreshGraphLookupIndexForMemory(id, tenantId, type, memory || {});
+      if (type === 'entity') {
+        // An entity and its lookup keys commit together or not at all (PR #34
+        // round 5): name ownership (resume capsules/decisions) and resolution
+        // read the index, so a stored entity without its keys would be
+        // invisible as a competing owner. If indexing fails the write fails.
+        try {
+          this.db.transaction(() => {
+            insertRow();
+            this.replaceGraphLookupIndexForMemory(id, tenantId, 'entity', memory || {});
+          })();
+        } finally {
+          this.confidentialEntityReferenceCache.delete(tenantId);
+        }
+      } else {
+        insertRow();
+        if (this.isGraphMemoryType(type)) {
+          this.refreshGraphLookupIndexForMemory(id, tenantId, type, memory || {});
+        }
       }
 
       // DUAL-WRITE SHIM: Also write to canonical tables when enabled
@@ -4822,8 +4843,9 @@ export class MemoryManager {
   /**
    * Rehydration capsules for an entity (resume resultVersion=2): every
    * observation whose metadata.kind === 'capsule' that is NOT superseded by
-   * any observation on the entity, newest first. Supersession is computed
-   * over ALL of the entity's indexed observations (full paged scan), so a non-capsule
+   * any observation on the entity, newest first. Only observations the entity
+   * owns count (see getScopeObservationSelections). Supersession is computed
+   * over ALL of the entity's owned observations (full paged scan), so a non-capsule
    * observation that supersedes a capsule still retires it — but an unrelated
    * newer append never hides one (data-audit HIGH 1, 2026-09-03).
    */
@@ -4854,24 +4876,42 @@ export class MemoryManager {
    * ONE full indexed scan of an entity's observations serving both resume
    * selections (capsules and decisions), so a v2/v3 resume pays the scan once.
    *
-   * The scan selects through graph_lookup_keys, whose keys include derived
-   * name variants (prefixes), so it can also return observations on OTHER
+   * The scan selects through graph_lookup_keys for every query variant of
+   * the entity's name and declared aliases. Those keys include derived name
+   * variants (prefixes), so it can also return observations on OTHER
    * entities ("scope-root-child" rows for "scope-root"). Those are retrieval
-   * candidates, not proof of ownership:
-   *  - decisions keep only rows whose entityName normalizes to the entity's
-   *    name or one of its declared aliases, and compute supersession from
-   *    those rows only (a sibling's supersedes cannot hide the scope's own
+   * candidates, not proof of ownership. A row is OWNED when its entityName
+   * names this entity and only this entity, judged at read time against the
+   * current catalog: an exact (normalized) match of its name or a declared
+   * alias that no other entity shares; or, when no entity has the name
+   * exactly, a one-directional variant (the ROW name with a trailing -vN
+   * stripped or a company suffix added/removed) that is an exact key of this
+   * entity alone and that the exact resolver resolves to this entity alone.
+   * Never by prefix. See selectScopeObservations for how owners are found.
+   *  - decisions keep only owned rows and compute supersession from owned
+   *    rows only (a sibling's supersedes cannot hide the scope's own
    *    decision). At most `decisionLimit` are returned; totalCount counts all.
-   *  - capsules keep the frozen v2 selection unchanged (all scanned rows).
+   *  - capsules apply the same ownership rule (issue #31): a sibling's
+   *    capsule is never the scope's current capsule or a conflict, and a
+   *    sibling's supersedes cannot retire the scope's capsule.
+   *    candidatesConsidered counts the owned rows examined.
    */
   getScopeObservationSelections(
     entityId: string,
     tenantId: string,
     decisionLimit: number = MemoryManager.RESUME_DECISION_OBSERVATION_LIMIT
-  ): {
-    capsules: { capsules: ScopeObservationItem[]; candidatesConsidered: number };
-    decisions: { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number };
-  } {
+  ): ScopeObservationSelections {
+    // ONE read transaction: every page of the scan and every ownership lookup
+    // see the same snapshot, so a concurrent writer (WAL) cannot make pages
+    // repeat or skip rows, or change the catalog between ownership checks.
+    return this.db.transaction(() => this.selectScopeObservations(entityId, tenantId, decisionLimit))();
+  }
+
+  private selectScopeObservations(
+    entityId: string,
+    tenantId: string,
+    decisionLimit: number
+  ): ScopeObservationSelections {
     const empty = {
       capsules: { capsules: [], candidatesConsidered: 0 },
       decisions: { decisions: [], totalCount: 0, candidatesConsidered: 0 },
@@ -4880,19 +4920,20 @@ export class MemoryManager {
       `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
     ).get(entityId, tenantId) as { content: string } | undefined;
     if (!entityRow) return empty;
-    let entityName: string | null = null;
-    let aliases: string[] = [];
+    let entityContent: any;
     try {
-      const content = JSON.parse(entityRow.content || '{}');
-      if (this.isConfidentialMessageSearchItem('entity', content)) return empty;
-      entityName = typeof content?.name === 'string' ? content.name : null;
-      aliases = Array.isArray(content?.aliases) ? content.aliases.filter((a: unknown) => typeof a === 'string') : [];
+      entityContent = JSON.parse(entityRow.content || '{}');
     } catch {
       return empty;
     }
-    if (!entityName) return empty;
-    const canonicalKey = this.normalizeEntityLookup(entityName);
-    const ownerKeys = new Set([canonicalKey, ...aliases.map((a) => this.normalizeEntityLookup(a))].filter(Boolean));
+    if (this.isConfidentialMessageSearchItem('entity', entityContent)) return empty;
+    if (typeof entityContent?.name !== 'string' || !this.normalizeEntityLookup(entityContent.name)) return empty;
+    // The scan queries every owner variant (name and aliases), so observations
+    // stored under an alias or a suffix/-vN variant of the name are found, not
+    // only those whose index keys happen to include the canonical key. The
+    // keys are bound as ONE JSON parameter: an entity may declare thousands of
+    // aliases, and one placeholder per key would exceed SQLite's variable cap.
+    const scanKeysJson = JSON.stringify(this.entityNameAndAliasLookupValues(entityContent));
 
     // FULL indexed scan, paged (review b2641137 blocker 2): a bounded window
     // would silently drop a still-current capsule behind N newer unrelated
@@ -4901,22 +4942,26 @@ export class MemoryManager {
     const PAGE = 500;
     const page = this.db.prepare(`
       SELECT sm.id, sm.content, sm.created_by, sm.created_at
-      FROM graph_lookup_keys glk
-      JOIN shared_memory sm
-        ON sm.id = glk.memory_id AND sm.tenant_id = glk.tenant_id
-      WHERE glk.tenant_id = ?
-        AND glk.lookup_key = ?
-        AND glk.memory_type = 'observation'
-        AND glk.key_kind = 'entity_name'
+      FROM shared_memory sm
+      WHERE sm.tenant_id = ?
         AND sm.memory_type = 'observation'
+        AND sm.id IN (
+          SELECT glk.memory_id FROM graph_lookup_keys glk
+          WHERE glk.tenant_id = ?
+            AND glk.lookup_key IN (SELECT value FROM json_each(?))
+            AND glk.memory_type = 'observation'
+            AND glk.key_kind = 'entity_name'
+        )
       ORDER BY sm.created_at DESC, sm.rowid DESC
       LIMIT ? OFFSET ?
     `);
+    // sm.id IN (subquery) yields each stored row at most once, the ORDER BY is
+    // total, and all pages read one snapshot (see the caller's transaction),
+    // so pages neither repeat nor skip rows.
     const rows: Array<{ id: string; content: string; created_by: string; created_at: string }> = [];
-    const seen = new Set<string>();
     for (let offset = 0; ; offset += PAGE) {
-      const batch = page.all(tenantId, canonicalKey, PAGE, offset) as typeof rows;
-      for (const r of batch) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+      const batch = page.all(tenantId, tenantId, scanKeysJson, PAGE, offset) as typeof rows;
+      rows.push(...batch);
       if (batch.length < PAGE) break;
     }
 
@@ -4945,17 +4990,114 @@ export class MemoryManager {
       contents: Array.isArray(content?.contents) ? content.contents.filter((c: unknown) => typeof c === 'string') : [],
     });
 
-    const allSuperseded = supersededBy(parsed);
-    const capsules = parsed
-      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !allSuperseded.has(row.id))
-      .map(toItem);
-
-    const owned = parsed.filter(({ content }) =>
-      typeof content?.entityName === 'string' && ownerKeys.has(this.normalizeEntityLookup(content.entityName)));
+    // OWNED is decided per distinct entityName (memoized), at READ time
+    // against the current entity catalog, in two tiers:
+    //  1. EXACT: when the name normalizes exactly to the canonical name or a
+    //     declared alias of any entity, it belongs to those entities only, and
+    //     is owned when that is exactly this entity. So x-v2 keeps rows written
+    //     as "x-v2" even when x-v3 also exists.
+    //  2. VARIANT (only when no entity has the name exactly): ONE-DIRECTIONAL.
+    //     Stripping a trailing -vN from the ROW name, or adding/removing a
+    //     company suffix, must yield an exact key of this entity and of no
+    //     other entity, AND the exact resolver must resolve the name to this
+    //     entity alone. So "acme" counts for acme-llc while no acme-inc
+    //     exists, but "nx-v3" never counts for nx-v2 (no shared stripped base).
+    // "Exactly / no other entity" does not trust the capped search index alone
+    // (MAX_LOOKUP_KEYS_PER_MEMORY may hide a competing alias, and an entity
+    // may have no index rows at all): owners are the index hits plus a payload
+    // check of every entity with no index rows or at the key cap. An entity
+    // with some but not all of its keys is not expected: entity writes commit
+    // their keys in the same transaction (store), and rebuild/import replace
+    // them atomically. Tier 2 additionally needs the exact resolver, which
+    // reads the capped index; when it cannot see the scope uniquely the row is
+    // NOT owned (fails closed). Prefixes are never variants, so
+    // "scope-root-child" is never owned by "scope-root".
+    const exactKeysById = new Map<string, Set<string>>();
+    const exactKeysOf = (id: string): Set<string> => {
+      let keys = exactKeysById.get(id);
+      if (keys) return keys;
+      keys = new Set();
+      const row = this.db.prepare(
+        `SELECT content FROM shared_memory WHERE id = ? AND tenant_id = ? AND memory_type = 'entity'`
+      ).get(id, tenantId) as { content: string } | undefined;
+      try {
+        const content = JSON.parse(row?.content || '{}');
+        const names = [content?.name, ...(Array.isArray(content?.aliases) ? content.aliases : [])];
+        for (const n of names) {
+          if (typeof n !== 'string') continue;
+          const key = this.normalizeEntityLookup(n);
+          if (key) keys.add(key);
+        }
+      } catch {
+        /* unparseable entity: owns no name */
+      }
+      exactKeysById.set(id, keys);
+      return keys;
+    };
+    // Entities the index may not fully cover, so their payload is always
+    // checked: those with NO index rows (written before the index existed, by
+    // a path that does not index, or whose refresh failed before entity
+    // writes became atomic with their keys) and those at the key cap (aliases
+    // may have been truncated). One bounded pass over the tenant's entities
+    // through the (tenant_id, memory_id) index: at most 64 key probes each.
+    let alwaysCheckIds: string[] | null = null;
+    const uncoveredEntityIds = (): string[] => {
+      if (alwaysCheckIds) return alwaysCheckIds;
+      alwaysCheckIds = (this.db.prepare(`
+        SELECT sm.id FROM shared_memory sm
+        WHERE sm.tenant_id = ? AND sm.memory_type = 'entity'
+          AND (
+            NOT EXISTS (SELECT 1 FROM graph_lookup_keys g WHERE g.tenant_id = sm.tenant_id AND g.memory_id = sm.id)
+            OR EXISTS (
+              SELECT 1 FROM graph_lookup_keys g WHERE g.tenant_id = sm.tenant_id AND g.memory_id = sm.id
+              LIMIT 1 OFFSET ${MemoryManager.MAX_LOOKUP_KEYS_PER_MEMORY - 1}
+            )
+          )
+      `).all(tenantId) as Array<{ id: string }>).map((r) => String(r.id));
+      return alwaysCheckIds;
+    };
+    const exactOwnersByKey = new Map<string, Set<string>>();
+    const exactOwners = (key: string): Set<string> => {
+      let owners = exactOwnersByKey.get(key);
+      if (owners) return owners;
+      const indexed = (this.db.prepare(
+        `SELECT DISTINCT memory_id AS id FROM graph_lookup_keys
+          WHERE tenant_id = ? AND lookup_key = ? AND memory_type = 'entity'`
+      ).all(tenantId, key) as Array<{ id: string }>).map((r) => String(r.id));
+      owners = new Set([...indexed, ...uncoveredEntityIds()].filter((id) => exactKeysOf(id).has(key)));
+      exactOwnersByKey.set(key, owners);
+      return owners;
+    };
+    const ownKeys = exactKeysOf(entityId);
+    const ownsName = new Map<string, boolean>();
+    const isOwned = (name: unknown): boolean => {
+      if (typeof name !== 'string' || !name.trim()) return false;
+      let owned = ownsName.get(name);
+      if (owned === undefined) {
+        const key = this.normalizeEntityLookup(name);
+        const exact = key ? exactOwners(key) : new Set<string>();
+        if (exact.size > 0) {
+          owned = exact.size === 1 && exact.has(entityId);
+        } else {
+          const targets = this.entityQueryVariants(name).filter((v) => v !== key);
+          const variantOwners = new Set(targets.flatMap((v) => [...exactOwners(v)]));
+          const resolved = new Set(this.resolveEntityCandidatesExact(name, tenantId).map((c) => c.id));
+          owned = targets.some((v) => ownKeys.has(v)) &&
+            variantOwners.size === 1 && variantOwners.has(entityId) &&
+            resolved.size === 1 && resolved.has(entityId);
+        }
+        ownsName.set(name, owned);
+      }
+      return owned;
+    };
+    const owned = parsed.filter(({ content }) => isOwned(content?.entityName));
     const ownedSuperseded = supersededBy(owned);
+    const capsules = owned
+      .filter(({ row, content }) => content?.metadata?.kind === 'capsule' && !ownedSuperseded.has(row.id))
+      .map(toItem);
     const allDecisions = owned.filter(({ row, content }) => content?.metadata?.kind === 'decision' && !ownedSuperseded.has(row.id));
     return {
-      capsules: { capsules, candidatesConsidered: parsed.length },
+      capsules: { capsules, candidatesConsidered: owned.length },
       decisions: {
         decisions: allDecisions.slice(0, Math.max(0, decisionLimit)).map(toItem),
         totalCount: allDecisions.length,
