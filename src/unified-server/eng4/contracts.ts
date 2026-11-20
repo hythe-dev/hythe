@@ -387,10 +387,12 @@ export interface AsOfHeader {
   retiredHeadCount?: number;
   /** H4: UNRESOLVED divergent terminals with no truthful value (unversioned) — rejections a reconcile still owes; they are also listed in divergentValues with value null. */
   opaqueDivergentCount?: number;
-  /** v3 (field feedback P1 item 5): one fixed-size sentence on why this head is current and what the other live heads are. */
+  /** v3 (field feedback P1 item 5): fixed-size text on which head is designated (if any), what the other live heads are, and whether writes are blocked. */
   selectionReason?: string;
-  /** v3: true when more than one head is live or the pointer is invalid; checkpoint operation:"reconcile" resolves it. */
+  /** v3: true only when writes are blocked: no valid pointer (legacy max-revision or invalid designation), so record/patch conflict until checkpoint operation:"reconcile" designates a head. */
   reconcileNeeded?: boolean;
+  /** v3: true when a valid pointer designates the current head and other live heads (retained branches) exist; reconciling them is optional cleanup. */
+  cleanupAvailable?: boolean;
 }
 
 export type HeadSelection = 'empty-scope' | 'max-revision' | 'pointer' | 'invalid-designation';
@@ -416,8 +418,13 @@ export interface HeadItem {
   author: string;
   recordedAt: string;
   isCurrent: boolean;
-  /** Field feedback P1 item 5: 'current' for the effective current head, 'divergent' for every other live head (a branch, whatever its revision). */
-  role: 'current' | 'divergent';
+  /**
+   * Field feedback P1 item 5. With a valid pointer: 'current' for the pointed
+   * head, 'divergent' for every other live head (a retained branch, whatever
+   * its revision). Without one (legacy max-revision, invalid designation):
+   * 'undesignated' for every head.
+   */
+  role: 'current' | 'divergent' | 'undesignated';
   parentRetired: boolean;
 }
 

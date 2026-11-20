@@ -464,8 +464,8 @@ const HEAD_ITEM = {
     ...STATE_HEAD.properties,
     isCurrent: { type: 'boolean' },
     role: {
-      enum: ['current', 'divergent'],
-      description: 'current: the effective current head (asOf.stateId). divergent: any other live head, a branch from a stale parent, never current whatever its revision.',
+      enum: ['current', 'divergent', 'undesignated'],
+      description: 'With a valid scope pointer: current is the pointed head (asOf.stateId); divergent is any other live head, a branch retained from a stale parent, never current whatever its revision. Without one (asOf.selection max-revision or invalid-designation): every head is undesignated.',
     },
     parentRetired: { type: 'boolean' },
   },
@@ -628,7 +628,7 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
       required: [
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.required,
         'selection', 'pointer', 'liveHeadCount', 'divergentHeadCount', 'retiredHeadCount', 'opaqueDivergentCount',
-        'selectionReason', 'reconcileNeeded',
+        'selectionReason', 'reconcileNeeded', 'cleanupAvailable',
       ],
       properties: {
         ...RESUME_OUTPUT_SCHEMA_V1.properties.asOf.properties,
@@ -638,8 +638,9 @@ export const RESUME_OUTPUT_SCHEMA_V3 = {
         divergentHeadCount: { type: 'integer', minimum: 0 },
         retiredHeadCount: { type: 'integer', minimum: 0 },
         opaqueDivergentCount: { type: 'integer', minimum: 0 },
-        selectionReason: { type: 'string', description: 'Why asOf.stateId is current and what the other live heads are (fixed-size, counts only).' },
-        reconcileNeeded: { type: 'boolean', description: 'True when more than one head is live or the pointer is invalid; resolve with checkpoint operation:"reconcile".' },
+        selectionReason: { type: 'string', description: 'Which head is designated (if any), what the other live heads are, and whether writes are blocked (fixed-size, counts only).' },
+        reconcileNeeded: { type: 'boolean', description: 'True only when writes are blocked: no valid pointer (selection max-revision or invalid-designation), so record/patch conflict until checkpoint operation:"reconcile" designates a head.' },
+        cleanupAvailable: { type: 'boolean', description: 'True when a valid pointer designates the current head and other live heads (retained branches) exist. Writes succeed; reconciling them is optional cleanup.' },
       },
     },
     heads: { type: 'array', items: HEAD_ITEM },

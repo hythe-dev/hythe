@@ -117,7 +117,7 @@ const attack = (db: any) => {
 };
 
 const V1_ASOF_KEYS = ['assembledAt', 'conflicts', 'revision', 'stale', 'stateAgeSec', 'stateId'];
-const V3_ASOF_KEYS = [...V1_ASOF_KEYS, 'divergentHeadCount', 'liveHeadCount', 'opaqueDivergentCount', 'pointer', 'reconcileNeeded', 'retiredHeadCount', 'selection', 'selectionReason'].sort(); // opaqueDivergentCount added by H4; selectionReason + reconcileNeeded by field feedback P1 item 5
+const V3_ASOF_KEYS = [...V1_ASOF_KEYS, 'divergentHeadCount', 'liveHeadCount', 'opaqueDivergentCount', 'cleanupAvailable', 'pointer', 'reconcileNeeded', 'retiredHeadCount', 'selection', 'selectionReason'].sort(); // opaqueDivergentCount added by H4; selectionReason, reconcileNeeded, cleanupAvailable by field feedback P1 item 5
 
 // ---------------------------------------------------------------------------
 

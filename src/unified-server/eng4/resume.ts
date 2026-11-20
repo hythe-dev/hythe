@@ -148,23 +148,34 @@ function emptyCoverage(omittedReason: SectionCoverage['omittedReason'], totalCou
  * current head and what the other live heads are. Counts only (the heads
  * section lists them), so asOf stays fixed-size.
  */
-export function describeSelection(selection: HeadSelection, currentRevision: number | null, divergent: number): string {
-  const others = divergent === 1 ? '1 other live head is' : `${divergent} other live heads are`;
-  const branches =
-    ` ${others} a branch written from a stale parent: NOT current, even when its revision is higher.` +
-    ' Merge or retire with checkpoint operation:"reconcile" (resultVersion 3).';
+export function describeSelection(selection: HeadSelection, currentRevision: number | null, otherHeads: number): string {
+  const reconcile = 'checkpoint operation:"reconcile" (resultVersion 3)';
   switch (selection) {
     case 'empty-scope':
       return 'No snapshot in this scope yet.';
-    case 'pointer':
-      return `Current is the head the scope pointer designates (revision ${currentRevision}).` +
-        (divergent > 0 ? branches : ' It is the only live head.');
-    case 'max-revision':
-      return `Legacy scope without a pointer: current is the highest live revision (${currentRevision}).` +
-        (divergent > 0 ? branches : ' It is the only live head.');
+    case 'pointer': {
+      if (otherHeads === 0) return `Current is the head the scope pointer designates (revision ${currentRevision}). It is the only live head.`;
+      const others = otherHeads === 1
+        ? '1 other live head is a branch'
+        : `${otherHeads} other live heads are branches`;
+      return `Current is the head the scope pointer designates (revision ${currentRevision}). ` +
+        `${others} retained from a stale parent: not current, even with a higher revision. ` +
+        `Writes to the current revision succeed; retiring the branches with ${reconcile} is optional cleanup.`;
+    }
+    case 'max-revision': {
+      // No pointer: nothing proves which head is the lineage tip, and record/
+      // patch conflict on every head (checkpoint.ts admits only the POINTED
+      // head). Never claim lineage here: the highest revision may itself be
+      // a stale branch.
+      const heads = otherHeads === 0
+        ? `Its only live head (revision ${currentRevision}) is shown as working state.`
+        : `The highest of ${otherHeads + 1} live heads (revision ${currentRevision}) is shown as working state only; it is not known to be the lineage tip.`;
+      return `Legacy scope without a pointer: no head is designated. ${heads} ` +
+        `record and patch conflict until ${reconcile} designates a head.`;
+    }
     case 'invalid-designation':
-      return 'The scope pointer names a snapshot that is not a live head, so no head is current (fail closed).' +
-        ' Repair with checkpoint operation:"reconcile" (resultVersion 3).';
+      return 'The scope pointer names a snapshot that is not a live head, so no head is designated (fail closed). ' +
+        `record and patch conflict until ${reconcile} repairs it.`;
   }
 }
 
@@ -197,7 +208,7 @@ function performResumeInner(
   const emptyCapsule: ResumeCapsule = { current: null, conflicts: [], candidatesConsidered: 0, complete: true };
   // v3 fixed-size asOf fields for a scope with no storage at all.
   const emptyHeadFields = resultVersion === 3
-    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0, opaqueDivergentCount: 0, selectionReason: describeSelection('empty-scope', null, 0), reconcileNeeded: false }
+    ? { selection: 'empty-scope' as const, pointer: null, liveHeadCount: 0, divergentHeadCount: 0, retiredHeadCount: 0, opaqueDivergentCount: 0, selectionReason: describeSelection('empty-scope', null, 0), reconcileNeeded: false, cleanupAvailable: false }
     : {};
 
   if (!resolved.scopeKey) {
@@ -284,7 +295,12 @@ function performResumeInner(
     ? liveHeadDetails(db, tenantId, scopeKey).map((h) => ({
         stateId: h.stateId, revision: h.revision, author: h.author, recordedAt: h.recordedAt,
         isCurrent: current !== null && h.stateId === current.stateId,
-        role: current !== null && h.stateId === current.stateId ? 'current' as const : 'divergent' as const,
+        // Only a valid pointer designates a head. Without one (legacy
+        // max-revision fallback, invalid pointer) every head is undesignated;
+        // isCurrent keeps its pre-existing fallback meaning.
+        role: effective.selection !== 'pointer'
+          ? 'undesignated' as const
+          : (current !== null && h.stateId === current.stateId ? 'current' as const : 'divergent' as const),
         parentRetired: h.parentRetired,
       }))
     : [];
@@ -600,7 +616,11 @@ function performResumeInner(
         retiredHeadCount: retiredHeadCount(db, tenantId, scopeKey),
         opaqueDivergentCount: selection ? selection.opaqueDivergentCount : 0,
         selectionReason: describeSelection(effective.selection, current ? current.revision : null, heads.length - (current ? 1 : 0)),
-        reconcileNeeded: effective.selection === 'invalid-designation' || heads.length > 1,
+        // True only when writes are blocked: record/patch conflict on every
+        // head until a reconcile designates one. Branches beside a valid
+        // pointer are cleanupAvailable, not blocking.
+        reconcileNeeded: effective.selection === 'max-revision' || effective.selection === 'invalid-designation',
+        cleanupAvailable: effective.selection === 'pointer' && heads.length > 1,
       }
     : {};
 

@@ -90,17 +90,27 @@ stale `expectedRevision` becomes a branch instead of overwriting. Which head
 is current is decided by the scope **pointer**, not by revision number, so a
 branch can have a higher revision than the current head.
 
-- In every bundle version, `asOf.stateId`/`asOf.revision` is the current
-  head. When more than one head is live, `asOf.conflicts` lists **all** of
-  them, the current one included.
-- `resultVersion:3` labels them. Each item in `heads` has `role`:
-  `current` or `divergent`. `asOf.selectionReason` says in one sentence why
-  the current head was chosen and what the others are, and
-  `asOf.reconcileNeeded` is true when more than one head is live or the
-  pointer is invalid.
-- A divergent head is never adopted automatically. Keep writing against the
-  current revision; to merge or retire the branches, use
-  `checkpoint` with `operation:"reconcile"` (`resultVersion:3`).
+- In every bundle version, `asOf.stateId`/`asOf.revision` is the head
+  shown as working state. When more than one head is live, `asOf.conflicts`
+  lists **all** of them, that one included.
+- `resultVersion:3` labels them. With a valid pointer, each item in `heads`
+  has `role` `current` (the pointed head) or `divergent` (a branch retained
+  from a stale parent, whatever its revision).
+- Without a valid pointer (`asOf.selection` `max-revision` on a legacy
+  scope, or `invalid-designation`), **no head is designated**: every head is
+  `undesignated`. `asOf.stateId` still shows the highest revision, but it is
+  not known to be the lineage tip, and `record`/`patch` conflict on every
+  head until a reconcile designates one. (A plain write still branches as
+  before.)
+- `asOf.selectionReason` says, in fixed-size text, which head is designated,
+  what the others are, and whether writes are blocked.
+- `asOf.reconcileNeeded` is true **only when writes are blocked** (no valid
+  pointer): run `checkpoint` with `operation:"reconcile"`
+  (`resultVersion:3`).
+- `asOf.cleanupAvailable` is true when a valid pointer coexists with other
+  live heads. Nothing is blocked: keep writing against the current revision.
+  A divergent head is never adopted automatically; reconciling it away is
+  optional cleanup.
 
 History and full message/handoff bodies are **resources**
 (`engram://snapshot/…`, `engram://message/…`, `engram://handoff/…`),
