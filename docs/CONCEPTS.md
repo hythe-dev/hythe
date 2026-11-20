@@ -134,6 +134,32 @@ make it durable with the separate `create_relations` tool. A relation records
 relevance; it never grants access, which remains controlled by tenant and
 credential scopes.
 
+## Finding an entity by name: anchor vs identity
+
+`search_entities(query, searchType:"exact")` is an exact-name **anchor**, not
+an identity lookup. The lookup index also stores derived forms of every
+entity name (the first two or three segments, initials, corporate suffixes),
+so an exact search for `ascend-website` also returns `ascend-website-redesign`
+and other rows that merely share the name's prefix or mention it in prose.
+
+Every result carries `matchKind`. When the search is anchored on exact name
+matches (any `searchType:"exact"` search, and a hybrid search whose query
+equals a stored name), relevance order is `matchKind` first, then
+`searchScore`. The broad hybrid/semantic fallback, used when nothing matches
+the name, still labels each row but orders by `searchScore` alone.
+
+| matchKind | Meaning |
+|---|---|
+| `exact` | The name (an observation's `entityName`; a relation's `from`/`to`) equals the trimmed query byte for byte. |
+| `exact-ci` | Equal after case and separator normalization, or a declared alias equals the query (checked even when the name itself is only a prefix match). |
+| `prefix` | The normalized name, or a declared alias, starts with the normalized query plus a separator. |
+| `related` | Anything else: derived variants, handles in prose, semantic matches. |
+
+For exact **identity**, keep only `matchKind` `exact` (or `exact-ci`), or pass
+`canonicalEntityKey` (optionally with `memoryTypes:["entity"]`), which filters
+to that one entity and its own observations and relations. `sortBy:"recency"`
+replaces this ordering with newest-first.
+
 ## Scopes and tenancy
 
 Every read and write is bound to a tenant (the security boundary) and most
