@@ -108,14 +108,17 @@ entity, count. Names are compared case- and punctuation-insensitively:
 - **Exact name.** If the name is the canonical name or a declared alias of
   any entity, it belongs to those entities only. It counts for the scope
   when the scope is the only such entity. A name that two entities share
-  exactly counts for neither. Every declared alias is checked, even those
-  the search index does not keep.
+  exactly counts for neither. Every declared alias is checked, including
+  aliases the search index drops (it keeps at most 64 keys per entity) and
+  entities that have no index entries at all.
 - **Variant**, only when no entity has the name exactly. The name counts when
   removing a trailing `-vN` from it, or adding or removing a company suffix
   (`-llc`, `-inc`, `-corp`, `-co`, `-company`), gives the scope's name or
   one of its aliases, gives no other entity's, and the exact entity
   resolver resolves the name to the scope alone. The rule runs one way only:
   `x-v3` never counts for `x-v2`, and `x` never counts for `x-v2`.
+  The resolver uses the search index, so a variant of an alias the index
+  dropped does not count: the observation is left out rather than guessed.
 
 So for an entity `acme-llc`, observations under `Acme LLC` count, and those
 under `acme` count only while no other entity (such as `acme-inc`) also has

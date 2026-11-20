@@ -1103,7 +1103,7 @@ export class MemoryManager {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
-      stmt.run(
+      const insertRow = () => stmt.run(
         id,
         tenantId,
         type,
@@ -1114,8 +1114,24 @@ export class MemoryManager {
         ownerActorId
       );
 
-      if (this.isGraphMemoryType(type)) {
-        this.refreshGraphLookupIndexForMemory(id, tenantId, type, memory || {});
+      if (type === 'entity') {
+        // An entity and its lookup keys commit together or not at all (PR #34
+        // round 5): name ownership (resume capsules/decisions) and resolution
+        // read the index, so a stored entity without its keys would be
+        // invisible as a competing owner. If indexing fails the write fails.
+        try {
+          this.db.transaction(() => {
+            insertRow();
+            this.replaceGraphLookupIndexForMemory(id, tenantId, 'entity', memory || {});
+          })();
+        } finally {
+          this.confidentialEntityReferenceCache.delete(tenantId);
+        }
+      } else {
+        insertRow();
+        if (this.isGraphMemoryType(type)) {
+          this.refreshGraphLookupIndexForMemory(id, tenantId, type, memory || {});
+        }
       }
 
       // DUAL-WRITE SHIM: Also write to canonical tables when enabled
@@ -4871,7 +4887,7 @@ export class MemoryManager {
    * exactly, a one-directional variant (the ROW name with a trailing -vN
    * stripped or a company suffix added/removed) that is an exact key of this
    * entity alone and that the exact resolver resolves to this entity alone.
-   * Never by prefix. See selectScopeObservations for the complete lookup.
+   * Never by prefix. See selectScopeObservations for how owners are found.
    *  - decisions keep only owned rows and compute supersession from owned
    *    rows only (a sibling's supersedes cannot hide the scope's own
    *    decision). At most `decisionLimit` are returned; totalCount counts all.
@@ -4986,11 +5002,15 @@ export class MemoryManager {
     //     other entity, AND the exact resolver must resolve the name to this
     //     entity alone. So "acme" counts for acme-llc while no acme-inc
     //     exists, but "nx-v3" never counts for nx-v2 (no shared stripped base).
-    // "Exactly / no other entity" uses a COMPLETE exact-owner lookup, not the
-    // capped search index alone (MAX_LOOKUP_KEYS_PER_MEMORY may hide a
-    // competing alias): index hits plus a payload check of every entity whose
-    // index entries may have been truncated (or of every entity when the
-    // tenant has no index rows). Prefixes are never variants, so
+    // "Exactly / no other entity" does not trust the capped search index alone
+    // (MAX_LOOKUP_KEYS_PER_MEMORY may hide a competing alias, and an entity
+    // may have no index rows at all): owners are the index hits plus a payload
+    // check of every entity with no index rows or at the key cap. An entity
+    // with some but not all of its keys is not expected: entity writes commit
+    // their keys in the same transaction (store), and rebuild/import replace
+    // them atomically. Tier 2 additionally needs the exact resolver, which
+    // reads the capped index; when it cannot see the scope uniquely the row is
+    // NOT owned (fails closed). Prefixes are never variants, so
     // "scope-root-child" is never owned by "scope-root".
     const exactKeysById = new Map<string, Set<string>>();
     const exactKeysOf = (id: string): Set<string> => {
@@ -5014,15 +5034,26 @@ export class MemoryManager {
       exactKeysById.set(id, keys);
       return keys;
     };
-    let alwaysCheckIds: string[] | null = null; // entities the index may not fully cover
+    // Entities the index may not fully cover, so their payload is always
+    // checked: those with NO index rows (written before the index existed, by
+    // a path that does not index, or whose refresh failed before entity
+    // writes became atomic with their keys) and those at the key cap (aliases
+    // may have been truncated). One bounded pass over the tenant's entities
+    // through the (tenant_id, memory_id) index: at most 64 key probes each.
+    let alwaysCheckIds: string[] | null = null;
     const uncoveredEntityIds = (): string[] => {
       if (alwaysCheckIds) return alwaysCheckIds;
-      const sql = this.graphLookupIndexHasRows(tenantId)
-        ? `SELECT memory_id AS id FROM graph_lookup_keys
-            WHERE tenant_id = ? AND memory_type = 'entity'
-            GROUP BY memory_id HAVING COUNT(*) >= ${MemoryManager.MAX_LOOKUP_KEYS_PER_MEMORY}`
-        : `SELECT id FROM shared_memory WHERE tenant_id = ? AND memory_type = 'entity'`;
-      alwaysCheckIds = (this.db.prepare(sql).all(tenantId) as Array<{ id: string }>).map((r) => String(r.id));
+      alwaysCheckIds = (this.db.prepare(`
+        SELECT sm.id FROM shared_memory sm
+        WHERE sm.tenant_id = ? AND sm.memory_type = 'entity'
+          AND (
+            NOT EXISTS (SELECT 1 FROM graph_lookup_keys g WHERE g.tenant_id = sm.tenant_id AND g.memory_id = sm.id)
+            OR EXISTS (
+              SELECT 1 FROM graph_lookup_keys g WHERE g.tenant_id = sm.tenant_id AND g.memory_id = sm.id
+              LIMIT 1 OFFSET ${MemoryManager.MAX_LOOKUP_KEYS_PER_MEMORY - 1}
+            )
+          )
+      `).all(tenantId) as Array<{ id: string }>).map((r) => String(r.id));
       return alwaysCheckIds;
     };
     const exactOwnersByKey = new Map<string, Set<string>>();

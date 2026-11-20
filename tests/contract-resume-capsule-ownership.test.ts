@@ -7,7 +7,8 @@
  * ownership rule as observation decisions (#29): an observation counts only
  * when its entityName names the scope entity and ONLY that entity, judged at
  * read time: an exact (normalized) name or declared alias that no other
- * entity has (checked completely, not through the capped search index); or,
+ * entity has (checked against stored names and aliases, not only the capped
+ * search index, including entities with no index entries); or,
  * when no entity has the name exactly, a one-directional variant (the row
  * name with a trailing -vN stripped or a company suffix added/removed) that
  * is an exact key of the scope entity alone. Prefix siblings never count;
@@ -378,7 +379,7 @@ describe('resume ownership scan with a very large alias set', () => {
  * index; version names are one-directional; ownership is decided at read
  * time against the current catalog.
  */
-describe('resume ownership: complete exact owners, one-directional variants, read-time catalog', () => {
+describe('resume ownership: payload-checked exact owners, one-directional variants, read-time catalog', () => {
   let server: NeuralMCPServer;
   const s = Date.now();
   const agentId = 'c31r4-test-agent';
@@ -430,6 +431,54 @@ describe('resume ownership: complete exact owners, one-directional variants, rea
       expect(viaA.capsule.current).toBeNull();
       expect(JSON.stringify(viaA)).not.toContain(sharedCapsule);
     }
+  });
+
+  it('an entity stored with NO index entries still makes a shared exact name ambiguous', async () => {
+    const shared = `c31r5-shared-${s}`;
+    const a = `c31r5-a-${s}`;
+    const b = shared; // B's canonical name is A's alias
+    await mcpCall(server, 'create_entities', {
+      entities: [
+        { name: a, entityType: 'project', observations: [], aliases: [shared, `c31r5-a-handle-${s}`] },
+        { name: b, entityType: 'project', observations: [], aliases: [`c31r5-b-handle-${s}`] },
+      ],
+    });
+    // A is stored but has no index entries: its refresh failed under the old
+    // log-and-continue write, or it was written by a path that does not index.
+    const db = server.getMemoryManager().getDb();
+    const aId = (db.prepare(`SELECT id FROM shared_memory WHERE memory_type = 'entity' AND json_extract(content, '$.name') = ?`).get(a) as any).id;
+    db.prepare('DELETE FROM graph_lookup_keys WHERE memory_id = ?').run(aId);
+    expect(resolvedNames(shared)).toEqual([b]); // precondition: the index sees only B
+    const bCapsule = await add(`c31r5-b-handle-${s}`, 'B capsule under its own handle', { kind: 'capsule' });
+    const bDecision = await add(`c31r5-b-handle-${s}`, 'B decision under its own handle', { kind: 'decision' });
+    const sharedCapsule = await add(shared, 'capsule under the shared name', { kind: 'capsule', metadata: { supersedes: [bCapsule, bDecision] } });
+    setCreated(bCapsule, '2026-11-01 00:00:00');
+    for (const version of [2, 3]) {
+      const viaB = await resume(`c31r5-b-handle-${s}`, version);
+      expect(viaB.capsule.current?.observationId).toBe(bCapsule); // not adopted, not retired
+      expect(viaB.capsule.conflicts).toEqual([]);
+      expect(observationDecisionIds(viaB)).toEqual([bDecision]);
+      expect(JSON.stringify(viaB)).not.toContain(sharedCapsule);
+    }
+  });
+
+  it('create_entities fails and stores nothing when indexing the entity fails', async () => {
+    const a = `c31r5-fail-${s}`;
+    const db = server.getMemoryManager().getDb();
+    db.exec(`CREATE TRIGGER c31r5_force_index_failure BEFORE INSERT ON graph_lookup_keys
+      WHEN NEW.lookup_key = '${a}' BEGIN SELECT RAISE(ABORT, 'forced index failure'); END`);
+    try {
+      await expect(mcpCall(server, 'create_entities', {
+        entities: [{ name: a, entityType: 'project', observations: [], aliases: [`c31r5-fail-handle-${s}`] }],
+      })).rejects.toThrow(/forced index failure/);
+    } finally {
+      db.exec('DROP TRIGGER c31r5_force_index_failure');
+    }
+    const stored = db.prepare(`SELECT COUNT(*) AS c FROM shared_memory WHERE memory_type = 'entity' AND json_extract(content, '$.name') = ?`).get(a) as any;
+    expect(stored.c).toBe(0);
+    // The same create succeeds once indexing works, and is fully indexed.
+    await mcpCall(server, 'create_entities', { entities: [{ name: a, entityType: 'project', observations: [] }] });
+    expect(resolvedNames(a)).toEqual([a]);
   });
 
   it('foo-v2 rows belong to foo-v2 only when foo and foo-v2 coexist', async () => {
