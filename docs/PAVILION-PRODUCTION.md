@@ -30,25 +30,41 @@ The server runs its database in WAL mode with `synchronous = FULL` (issue
 connection (CLI tools included) uses WAL too. On a graceful stop it
 checkpoints the WAL and switches the file back to the rollback journal, so a
 stopped database is one self-contained file, as offline tools (migrations,
-sanitation) and file copies expect. Server snapshots are always single-file
+sanitation) and file copies expect. That switch needs every other connection
+to the database closed; see below. Server snapshots are always single-file
 rollback-journal databases.
 
 - While the server runs, the database is three files: `engram.db`,
   `engram.db-wal` and `engram.db-shm`. Never copy `engram.db` alone from a
-  running server. Back up with the SQLite backup API (`sqlite3 engram.db
-  ".backup <target>"`, or the server's own snapshots).
-- After a crash or a forced stop (`SIGKILL`) the file stays in WAL and the
-  sidecars may remain. Before offline work, open it once with no server
-  running, run `PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;`,
-  and confirm the `-wal` and `-shm` files are gone (the sanitation tool
-  refuses to run while they exist).
-- Restoring a server snapshot needs exclusive use of the database: it
-  checkpoints the WAL first and refuses to run while another connection holds
-  a read open.
+  running server. Back up with the server's own snapshots, or with the SQLite
+  backup API (`sqlite3 engram.db ".backup <target>"`). A `.backup` copy keeps
+  the WAL mode of the source, so before offline tools use the copy, run
+  `PRAGMA journal_mode=DELETE;` on it once.
+- The file can be left in WAL, with the sidecars, in three cases: a crash, a
+  forced stop (`SIGKILL`), or a graceful stop while another connection (a
+  CLI session, a backup, another tool) still had the database open; the
+  server then logs a warning at close. Before offline work, close every other
+  connection, open the file once with no server running, run
+  `PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;`, and confirm
+  the `-wal` and `-shm` files are gone (the sanitation tool refuses to run
+  while either is non-empty).
+- Restoring a server snapshot needs the database to itself: no other
+  connection may be open, idle or mid-read. The server checkpoints the WAL,
+  leaves WAL mode (which SQLite allows only when no other connection has the
+  file open) and takes an exclusive lock; if any step fails it refuses at
+  once, keeps its data and its journal mode, and removes the pre-restore
+  snapshot it had just made. After the swap the server reopens the file in
+  WAL; if that fails, the restore reports an error (the restored data is
+  served, in rollback-journal mode, until a restart). With the
+  `HYTHE_SQLITE_JOURNAL_MODE=delete` opt-out, a connection that is open but
+  idle holds no lock and cannot be detected: close other tools before a
+  restore.
 - WAL is not safe on network filesystems (NFS, SMB). The data directory must
   be a local filesystem (Pavilion binds a local host directory). For a
   network mount, set `HYTHE_SQLITE_JOURNAL_MODE=delete`; `wal` (the default)
-  and `delete` are the only accepted values.
+  and `delete` are the only accepted values. If the opt-out cannot be applied
+  at start (another connection holds the file in WAL), the server refuses to
+  start rather than run in WAL.
 
 ## Validate the rendered deployment
 
