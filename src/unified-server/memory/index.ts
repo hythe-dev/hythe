@@ -116,6 +116,20 @@ interface ExactOwnerCatalog {
   blockedKeys: Set<string>;
 }
 
+/**
+ * True only for a complete WAL checkpoint: busy 0, a real frame count and
+ * every frame copied. SQLite reports {busy: 1, log: -1, checkpointed: -1}
+ * when another connection holds the checkpoint lock; that is a failure, not
+ * "not in WAL". Callers decide WAL vs not from journal_mode, never from log.
+ */
+export function walCheckpointComplete(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const { busy, log, checkpointed } = result as Record<string, unknown>;
+  return busy === 0
+    && typeof log === 'number' && Number.isInteger(log) && log >= 0
+    && checkpointed === log;
+}
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -146,6 +160,12 @@ export class MemoryManager {
   constructor(dbPath: string = './data/unified-platform.db') {
     this.db = new Database(dbPath);
     this.dbPath = dbPath;
+    try {
+      this.applyJournalMode({ strict: false });
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     this.memorySystem = this.createEmptyMemorySystem();
 
     this.initializeDatabase();
@@ -155,6 +175,168 @@ export class MemoryManager {
     this.loadMemoryFromDatabase();
     this.initializeAdvancedSystems();
     this.initializeDualWrite();
+  }
+
+  /**
+   * Journal mode of the server database (issue #39), applied on every open
+   * (startup and snapshot restore) before any schema work.
+   *
+   * WAL by default: readers and the one writer run concurrently, and
+   * checkpoint's IMMEDIATE transaction does not block resume readers. The
+   * mode is stored in the file, so while the server runs every other
+   * connection (CLI tools included) uses WAL too; on graceful close the file
+   * goes back to DELETE (releaseWalForStoppedFile). While running, WAL keeps
+   * `-wal` and `-shm` files next to the database: copy it with the SQLite
+   * backup API (createSnapshot does), not by copying the main file alone.
+   * WAL is not safe on network filesystems; set
+   * HYTHE_SQLITE_JOURNAL_MODE=delete for such a mount (the only other value
+   * accepted).
+   *
+   * `synchronous` is set to FULL on this connection, separately from the
+   * journal mode, so a failed mode change cannot skip it: the bundled SQLite
+   * opens an existing WAL database at NORMAL, which is faster but can lose
+   * the last commits on power loss; FULL keeps the durability the rollback
+   * journal had. If FULL cannot be set, this throws.
+   *
+   * In-memory databases report `memory` and are left alone. If the mode
+   * cannot be set (another connection holds the file):
+   * - an explicit HYTHE_SQLITE_JOURNAL_MODE=delete opt-out throws (startup
+   *   refuses: WAL on a mount where it is unsafe is worse than not starting);
+   * - `strict` (the reopen after a restore) throws;
+   * - otherwise (WAL wanted at startup) a warning is logged and the server
+   *   continues in the file's current mode.
+   */
+  private applyJournalMode(options: { strict: boolean }): void {
+    const requested = String(process.env.HYTHE_SQLITE_JOURNAL_MODE ?? '').trim().toLowerCase();
+    if (requested && requested !== 'wal' && requested !== 'delete') {
+      console.warn(`⚠️ Ignoring HYTHE_SQLITE_JOURNAL_MODE=${requested}: only "wal" or "delete" is accepted; using wal`);
+    }
+    const mode = requested === 'delete' ? 'delete' : 'wal';
+    let actual: string;
+    try {
+      actual = String(this.db.pragma(`journal_mode = ${mode}`, { simple: true })).toLowerCase();
+    } catch (error: any) {
+      actual = `unchanged (${error?.message || error})`;
+    }
+
+    let synchronousError: unknown = null;
+    try {
+      this.db.pragma('synchronous = FULL');
+      const synchronous = this.db.pragma('synchronous', { simple: true });
+      if (synchronous !== 2) synchronousError = `synchronous reads back as ${String(synchronous)}`;
+    } catch (error: any) {
+      synchronousError = error?.message || error;
+    }
+    if (synchronousError) {
+      throw new Error(`SQLite synchronous=FULL could not be set on ${this.dbPath}: ${String(synchronousError)}`);
+    }
+
+    if (actual === mode || actual === 'memory') return;
+    const problem = `SQLite journal_mode=${mode} could not be set on ${this.dbPath} (journal mode: ${actual}); another connection probably holds the file`;
+    if (requested === 'delete') {
+      throw new Error(`${problem}. HYTHE_SQLITE_JOURNAL_MODE=delete was requested explicitly, so the server will not run in another mode: close the other connections and start again`);
+    }
+    if (options.strict) throw new Error(problem);
+    console.warn(`⚠️ ${problem}; continuing in the current mode`);
+  }
+
+  /**
+   * Run `fn` with busy_timeout 0 on `db`, then restore the previous timeout.
+   * The WAL hand-offs below only need to know whether another connection is
+   * in the way; waiting the full timeout would block the event loop for
+   * nothing.
+   */
+  private withoutBusyWait<T>(db: Database.Database, fn: () => T): T {
+    const previous = Number(db.pragma('busy_timeout', { simple: true })) || 0;
+    db.pragma('busy_timeout = 0');
+    try {
+      return fn();
+    } finally {
+      db.pragma(`busy_timeout = ${previous}`);
+    }
+  }
+
+  /**
+   * A database that is not being served is kept as ONE file in rollback-
+   * journal mode, so offline tools (migrations, sanitation, file copies) see
+   * no -wal/-shm sidecars: on graceful close (and for every snapshot file)
+   * the WAL is checkpointed and the file switched back to DELETE. The next
+   * startup switches it to WAL again. If any other connection still has the
+   * database open the switch cannot happen; the file stays in WAL and a
+   * warning is logged (after a crash it also stays WAL: checkpoint before
+   * offline work, see docs/PAVILION-PRODUCTION.md).
+   */
+  private releaseWalForStoppedFile(db: Database.Database): void {
+    try {
+      if (String(db.pragma('journal_mode', { simple: true })).toLowerCase() !== 'wal') return;
+      const mode = this.withoutBusyWait(db, () => {
+        db.pragma('wal_checkpoint(TRUNCATE)');
+        return String(db.pragma('journal_mode = DELETE', { simple: true })).toLowerCase();
+      });
+      if (mode !== 'delete') console.warn(`⚠️ SQLite database left in journal_mode=${mode} at close; another connection has it open`);
+    } catch (error: any) {
+      console.warn('⚠️ Could not switch the SQLite database back to journal_mode=DELETE at close (another connection has it open?):', error?.message || error);
+    }
+  }
+
+  /**
+   * Before the database file is replaced (restoreSnapshot): make sure this is
+   * the only connection and nothing committed is left outside the main file.
+   * Throws, without waiting, when that cannot be established; the database
+   * is then unchanged (still in its journal mode).
+   *
+   * In WAL: checkpoint with TRUNCATE and require a complete one
+   * (walCheckpointComplete: busy 0 and every frame copied; a busy result
+   * with log -1, which is what a competing checkpointer produces, is a
+   * failure), then switch to DELETE. Leaving WAL needs every other
+   * connection closed, idle ones included (each keeps the WAL index open),
+   * so the switch is the exclusivity check, and the swap is then a plain
+   * DELETE-to-DELETE file copy with no sidecars. In every mode an
+   * EXCLUSIVE transaction is then opened and rolled back, which fails if
+   * another connection is mid-read or writing. (An idle connection to a
+   * DELETE-mode database holds no lock, so SQLite cannot see it.)
+   */
+  private takeExclusiveForFileSwap(): void {
+    const refuse = (why: string) =>
+      new Error(`restore: another connection is using the database (${why}); close every other connection and retry`);
+    this.withoutBusyWait(this.db, () => {
+      if (String(this.db.pragma('journal_mode', { simple: true })).toLowerCase() === 'wal') {
+        let result: unknown;
+        try {
+          [result] = this.db.pragma('wal_checkpoint(TRUNCATE)') as unknown[];
+        } catch (error: any) {
+          throw refuse(`WAL checkpoint failed: ${error?.message || error}`);
+        }
+        if (!walCheckpointComplete(result)) {
+          throw refuse(`WAL checkpoint incomplete: ${JSON.stringify(result ?? null)}`);
+        }
+        let mode: string;
+        try {
+          mode = String(this.db.pragma('journal_mode = DELETE', { simple: true })).toLowerCase();
+        } catch (error: any) {
+          mode = `wal (${error?.message || error})`;
+        }
+        if (mode !== 'delete') throw refuse(`could not leave WAL: ${mode}`);
+      }
+      try {
+        this.db.exec('BEGIN EXCLUSIVE');
+        this.db.exec('ROLLBACK');
+      } catch (error: any) {
+        throw refuse(`no exclusive lock: ${error?.message || error}`);
+      }
+    });
+  }
+
+  /** Remove a snapshot this manager just created (file and manifest entry). */
+  private discardSnapshot(entry: { snapshotId: string; filename: string; location: string }): void {
+    try {
+      fs.rmSync(path.join(entry.location, entry.filename), { force: true });
+      const manifestPath = path.join(entry.location, 'manifest.json');
+      const manifest = this.readManifest(entry.location).filter((e: any) => e?.snapshotId !== entry.snapshotId);
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    } catch (error: any) {
+      console.warn(`⚠️ Could not remove the unused pre-restore snapshot ${entry.filename}:`, error?.message || error);
+    }
   }
 
   private createEmptyMemorySystem(): MemorySystem {
@@ -2919,6 +3101,7 @@ export class MemoryManager {
   }
 
   async close(): Promise<void> {
+    this.releaseWalForStoppedFile(this.db);
     this.db.close();
     // Embedded vector client does not require explicit closing.
     console.log('🧠 Enhanced memory manager closed');
@@ -6498,6 +6681,14 @@ export class MemoryManager {
 
     // Use better-sqlite3 built-in backup
     await this.db.backup(targetPath);
+    // A snapshot is a stopped database: one self-contained file in
+    // rollback-journal mode, whatever mode the live database runs in.
+    const snapshotDb = new Database(targetPath);
+    try {
+      this.releaseWalForStoppedFile(snapshotDb);
+    } finally {
+      snapshotDb.close();
+    }
 
     const stats = fs.statSync(targetPath);
     const createdAt = now.toISOString();
@@ -6614,9 +6805,31 @@ export class MemoryManager {
     // Create pre-restore safety backup
     const preRestoreBackup = await this.createSnapshot('pre-restore');
 
+    // The file may only be replaced while this is the only connection and
+    // the -wal file is empty: frames left in it would be replayed onto the
+    // restored file at reopen, and another connection would keep using the
+    // old file's WAL index. takeExclusiveForFileSwap checkpoints, leaves WAL
+    // and takes an exclusive lock, or throws without waiting; the restore is
+    // then refused here, before any cache is cleared or the file is touched,
+    // the server goes back to its journal mode, and the unused pre-restore
+    // snapshot is removed. Everything from here to the close below is
+    // synchronous.
+    try {
+      this.takeExclusiveForFileSwap();
+    } catch (error) {
+      this.discardSnapshot(preRestoreBackup);
+      try {
+        this.applyJournalMode({ strict: false });
+      } catch (modeError: any) {
+        console.warn('⚠️ After the refused restore:', modeError?.message || modeError);
+      }
+      throw error;
+    }
+
     // A snapshot replaces every tenant's entity set. Drop both the old cache
     // before the file swap and any references populated during reinitialization
     // after it, so no request can classify observations using the wrong DB.
+    let reopenModeError: unknown = null;
     this.confidentialEntityReferenceCache.clear();
     try {
       // All cache branches are served directly by getAgentMemory(),
@@ -6625,21 +6838,32 @@ export class MemoryManager {
       // cannot survive solely in individual/shared/task caches.
       this.resetServedMemoryCaches();
 
-      // Close current DB
+      // Close current DB (now a single DELETE-mode file, see above).
       this.db.close();
 
       // Copy snapshot over live DB
       fs.copyFileSync(snapshotPath, this.dbPath);
 
       // Reopen — the FK pragma is PER CONNECTION, so the eng4 apply (pragma +
-      // idempotent DDL) must run again on this fresh handle.
+      // idempotent DDL) must run again on this fresh handle. A journal mode
+      // that cannot be set here is an error (strict), reported after the
+      // reopen finishes so the server still serves the restored file.
       this.db = new Database(this.dbPath);
+      try {
+        this.applyJournalMode({ strict: true });
+      } catch (error) {
+        reopenModeError = error;
+      }
       this.initializeDatabase();
       applyEng4Schema(this.db);
       this.loadMemoryFromDatabase();
       this.initializeAdvancedSystems();
     } finally {
       this.confidentialEntityReferenceCache.clear();
+    }
+    if (reopenModeError) {
+      const why = (reopenModeError as any)?.message || String(reopenModeError);
+      throw new Error(`restore: ${snapshot.filename} was restored, but the reopened database is not in the configured journal mode: ${why}. Close the other connections and restart the server.`);
     }
 
     return {
