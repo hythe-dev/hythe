@@ -894,24 +894,31 @@ describe('search and key-deriving readers with a non-string entity name (PR #36 
     delete process.env.ENABLE_ADVANCED_MEMORY;
   });
 
-  it('search_entities (exact, semantic, hybrid) does not crash on an imported array name and never lists it under that name', async () => {
-    const name = `srch-imported-${s}`;
-    await (server.getMemoryManager() as any).importEntities({
-      schemaVersion: 1,
-      entities: [{
-        id: `srch-${s}`,
-        content: JSON.stringify({ name: [name], entityType: ['project'], aliases: [], metadata: { aliases: [name] } }),
-        created_by: 'r5', tags: '[]', created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-      }],
-      observations: [],
-      relations: [],
-    }, 'default');
-    for (const searchType of ['exact', 'semantic', 'hybrid']) {
-      const found = await call('search_entities', { query: name, searchType, compact: false });
-      const text = JSON.stringify(found);
-      expect(text).not.toContain(`"canonicalEntityName":["${name}"]`);
-      for (const r of found.results ?? []) {
-        expect(r.canonicalEntityName === undefined || typeof r.canonicalEntityName === 'string').toBe(true);
+  it('search_entities (exact, semantic, hybrid) does not crash on non-string names/types and never lists them as names', async () => {
+    const shapes: Array<[string, unknown, unknown]> = [
+      ['array', null, ['project']],
+      ['number', 424242, 7],
+      ['object', { text: 'x' }, { kind: 'project' }],
+      ['boolean', true, false],
+    ];
+    for (const [label, nameValue, typeValue] of shapes) {
+      const name = `srch-${label}-${s}`;
+      await (server.getMemoryManager() as any).importEntities({
+        schemaVersion: 1,
+        entities: [{
+          id: `srch-${label}-${s}`,
+          content: JSON.stringify({ name: nameValue ?? [name], entityType: typeValue, aliases: [], metadata: { aliases: [name] } }),
+          created_by: 'r5', tags: '[]', created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+        }],
+        observations: [],
+        relations: [],
+      }, 'default');
+      for (const searchType of ['exact', 'semantic', 'hybrid']) {
+        const found = await call('search_entities', { query: name, searchType, compact: false });
+        for (const r of found.results ?? []) {
+          expect(r.canonicalEntityName === undefined || typeof r.canonicalEntityName === 'string', `${label}/${searchType}`).toBe(true);
+        }
+        expect(JSON.stringify(found)).not.toContain(`"canonicalEntityName":["${name}"]`);
       }
     }
   });
