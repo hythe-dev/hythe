@@ -106,6 +106,16 @@ interface ExactOwner {
   confidential: boolean;
 }
 
+/**
+ * The tenant's exact-owner catalog: owners per normalized key, plus the keys
+ * that point (through graph_lookup_keys) at an entity row whose stored JSON
+ * cannot be read; such a key never resolves.
+ */
+interface ExactOwnerCatalog {
+  owners: Map<string, ExactOwner[]>;
+  blockedKeys: Set<string>;
+}
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -127,7 +137,7 @@ export class MemoryManager {
    * from the STORED entity records, valid while the database is unchanged
    * (see entityExactOwners).
    */
-  private entityExactOwnerCache = new Map<string, { stamp: string; owners: Map<string, ExactOwner[]> }>();
+  private entityExactOwnerCache = new Map<string, { db: Database.Database; stamp: string; catalog: ExactOwnerCatalog }>();
   readonly contentSizeThreshold: number = parseInt(process.env.CONTENT_SIZE_THRESHOLD || '51200', 10); // 50KB default
 
   constructor(dbPath: string = './data/unified-platform.db') {
@@ -2221,7 +2231,7 @@ export class MemoryManager {
 
   async getSystemStatus(): Promise<any> {
     const status = {
-      sqlite: { connected: true, type: 'SQLite' },
+      sqlite: { connected: true, type: 'SQLite', invalidEntityRows: this.countInvalidEntityRows() },
       vector: { connected: false, type: 'sqlite-vec', backend: 'sqlite-vec' },
       // Backward-compat alias for older dashboards/clients.
       weaviate: { connected: false, type: 'Vector Database (legacy alias)', backend: 'sqlite-vec' },
@@ -4801,9 +4811,13 @@ export class MemoryManager {
     // entity with no index rows and an alias added without a reindex all
     // count, and a stale index row for a removed alias or a deleted entity
     // does not. Two or more exact owners are ambiguous.
-    const owners = this.entityExactOwners(tenantId);
-    if (owners === null) return []; // read error: unresolved, never "no exact owner"
-    const exact = owners.get(this.normalizeEntityLookup(entityName)) ?? [];
+    const catalog = this.entityExactOwners(tenantId);
+    if (catalog === null) return []; // read error: unresolved, never "no exact owner"
+    const queryKey = this.normalizeEntityLookup(entityName);
+    // A name whose index key points at an unreadable entity row is
+    // unresolved: that row may own it, and no other entity may take it.
+    if (catalog.blockedKeys.has(queryKey)) return [];
+    const exact = catalog.owners.get(queryKey) ?? [];
     if (exact.length > 0) {
       // A private (message_detail) entity holding the name: fail closed
       // without exposing it, as unresolved.
@@ -4818,6 +4832,7 @@ export class MemoryManager {
     // VARIANT (-vN stripped, company suffix added/removed), only when no
     // entity has the name exactly. This path uses the lookup index and
     // re-verifies each hit against its payload.
+    if ([...queryVariants].some((variant) => catalog.blockedKeys.has(variant))) return [];
     const candidates: Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> = [];
     for (const row of this.findEntitiesByNameOrAlias(entityName, tenantId)) {
       try {
@@ -4845,77 +4860,106 @@ export class MemoryManager {
   }
 
   /**
-   * Exact owners of every normalized canonical name and declared (top-level)
-   * alias in a tenant, read from the stored entity records: one query over
-   * the tenant's entity rows, extracting only name, aliases and the fields
-   * the confidentiality check reads. Deleted entities are gone from
-   * shared_memory and so own nothing. Rows whose JSON is invalid own nothing
-   * (every graph read path already treats them as private and skips them).
+   * Exact owners of every normalized canonical name and declared alias in a
+   * tenant, read from the stored entity records with the same JSON.parse
+   * semantics as every other reader (a duplicated key: the LAST one wins).
+   *  - A name counts only when it is a string; a non-string name owns
+   *    nothing. Aliases count only when `aliases` is a real JSON array, and
+   *    only its string elements.
+   *  - Privacy uses the full parsed payload and the shared classifier
+   *    (isConfidentialMessageSearchItem), so a private owner is flagged.
+   *  - A row whose JSON is invalid, or is not an object, owns nothing; every
+   *    lookup key the index still has for it is BLOCKED (never resolves).
+   *  - Deleted entities are gone from shared_memory and own nothing.
    *
-   * Cached per tenant and reused while the database is unchanged: the stamp
-   * is PRAGMA data_version (commits by other connections) plus
-   * total_changes() (every write on this connection, including direct SQL).
-   * So a request pays at most one build, and requests with no write in
-   * between pay none. Returns null when the read fails; callers fail closed.
+   * Cached per tenant and connection while the database is unchanged (stamp:
+   * PRAGMA data_version for other connections' commits plus total_changes()
+   * for this connection's writes). Inside a transaction the cache may be
+   * READ when the stamp matches but is never POPULATED: a rollback does not
+   * move the stamp back, so a map built from uncommitted rows must not
+   * outlive the transaction. restoreSnapshot clears it. Returns null when
+   * the read fails; callers fail closed.
    */
-  private entityExactOwners(tenantId: string): Map<string, ExactOwner[]> | null {
+  private entityExactOwners(tenantId: string): ExactOwnerCatalog | null {
     try {
       const dataVersion = this.db.pragma('data_version', { simple: true });
       const changes = (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
       const stamp = `${dataVersion}:${changes}`;
       const cached = this.entityExactOwnerCache.get(tenantId);
-      if (cached && cached.stamp === stamp) return cached.owners;
+      if (cached && cached.db === this.db && cached.stamp === stamp) return cached.catalog;
 
-      const rows = this.db.prepare(`
-        SELECT id,
-               json_extract(content, '$.name') AS name,
-               json_extract(content, '$.aliases') AS aliases,
-               json_extract(content, '$.entityType') AS entityType,
-               json_extract(content, '$.type') AS type,
-               json_extract(content, '$.memoryType') AS memoryType,
-               json_extract(content, '$.memory_type') AS memoryTypeSnake
-        FROM shared_memory
-        WHERE tenant_id = ? AND memory_type = 'entity' AND json_valid(content)
-      `).all(tenantId) as Array<Record<string, any>>;
+      const rows = this.db.prepare(
+        `SELECT id, content FROM shared_memory WHERE tenant_id = ? AND memory_type = 'entity'`
+      ).all(tenantId) as Array<{ id: string; content: string }>;
       const owners = new Map<string, ExactOwner[]>();
+      const unreadable: string[] = [];
       for (const row of rows) {
-        let aliases: unknown = row.aliases;
-        if (typeof aliases === 'string') {
-          try { aliases = JSON.parse(aliases); } catch { aliases = null; }
-        }
-        const payload = {
-          name: row.name,
-          aliases: Array.isArray(aliases) ? aliases : [],
-          entityType: row.entityType,
-          type: row.type,
-          memoryType: row.memoryType,
-          memory_type: row.memoryTypeSnake,
-        };
-        const confidential = this.isConfidentialMessageSearchItem('entity', payload);
         const id = String(row.id);
-        const name = typeof row.name === 'string' ? row.name : '';
+        let content: any;
+        try {
+          content = JSON.parse(row.content);
+        } catch {
+          unreadable.push(id);
+          continue;
+        }
+        if (!content || typeof content !== 'object' || Array.isArray(content)) {
+          unreadable.push(id);
+          continue;
+        }
+        const confidential = this.isConfidentialMessageSearchItem('entity', content);
+        const name = typeof content.name === 'string' ? content.name : '';
         const keys = new Map<string, boolean>(); // key -> viaName
         if (name) {
           const key = this.normalizeEntityLookup(name);
           if (key) keys.set(key, true);
         }
-        for (const alias of payload.aliases) {
-          if (typeof alias !== 'string') continue;
-          const key = this.normalizeEntityLookup(alias);
-          if (key && !keys.has(key)) keys.set(key, false);
+        if (Array.isArray(content.aliases)) {
+          for (const alias of content.aliases) {
+            if (typeof alias !== 'string') continue;
+            const key = this.normalizeEntityLookup(alias);
+            if (key && !keys.has(key)) keys.set(key, false);
+          }
         }
         for (const [key, viaName] of keys) {
-          const list = owners.get(key);
           const owner = { id, name, viaName, confidential };
+          const list = owners.get(key);
           if (list) list.push(owner); else owners.set(key, [owner]);
         }
       }
-      this.entityExactOwnerCache.set(tenantId, { stamp, owners });
-      return owners;
+      const blockedKeys = new Set<string>();
+      if (unreadable.length > 0) {
+        const blocked = this.db.prepare(
+          `SELECT DISTINCT lookup_key FROM graph_lookup_keys
+            WHERE tenant_id = ? AND memory_type = 'entity'
+              AND memory_id IN (SELECT value FROM json_each(?))`
+        ).all(tenantId, JSON.stringify(unreadable)) as Array<{ lookup_key: string }>;
+        for (const row of blocked) blockedKeys.add(String(row.lookup_key));
+      }
+      const catalog = { owners, blockedKeys };
+      if (!this.db.inTransaction) {
+        this.entityExactOwnerCache.set(tenantId, { db: this.db, stamp, catalog });
+      }
+      return catalog;
     } catch (error: any) {
       console.warn('⚠️ Exact-owner lookup failed; resolution fails closed:', error?.message || error);
       return null;
     }
+  }
+
+  /**
+   * Operator health count: entity rows whose stored content is not a valid
+   * JSON object (count only, never content). Such a row owns no name, and
+   * any name its index keys still point at does not resolve, until it is
+   * repaired. Surfaced as databases.sqlite.invalidEntityRows on
+   * /system/status.
+   */
+  countInvalidEntityRows(tenantId?: string): number {
+    const sql = `SELECT COUNT(*) AS c FROM shared_memory
+      WHERE memory_type = 'entity'
+        AND CASE WHEN json_valid(content) THEN json_type(content) <> 'object' ELSE 1 END
+        ${tenantId ? 'AND tenant_id = ?' : ''}`;
+    const row = (tenantId ? this.db.prepare(sql).get(tenantId) : this.db.prepare(sql).get()) as { c: number };
+    return row.c;
   }
 
   /**
@@ -5148,10 +5192,13 @@ export class MemoryManager {
     // Exact owners come from the stored entity records (entityExactOwners),
     // the same map the resolver uses, so the two never disagree. A read
     // failure owns nothing (fails closed).
-    const ownerMap = this.entityExactOwners(tenantId);
-    if (ownerMap === null) return empty;
-    const exactOwners = (key: string): Set<string> =>
-      new Set((ownerMap.get(key) ?? []).map((owner) => owner.id));
+    const catalog = this.entityExactOwners(tenantId);
+    if (catalog === null) return empty;
+    // A blocked key (it points at an unreadable entity row) has an unknown
+    // owner: give it a sentinel owner so it is never owned here.
+    const exactOwners = (key: string): Set<string> => catalog.blockedKeys.has(key)
+      ? new Set(['\u0000unreadable'])
+      : new Set((catalog.owners.get(key) ?? []).map((owner) => owner.id));
     const ownKeys = exactKeysOf(entityId);
     const ownsName = new Map<string, boolean>();
     const isOwned = (name: unknown): boolean => {
@@ -6494,6 +6541,7 @@ export class MemoryManager {
     // before the file swap and any references populated during reinitialization
     // after it, so no request can classify observations using the wrong DB.
     this.confidentialEntityReferenceCache.clear();
+    this.entityExactOwnerCache.clear();
     try {
       // All cache branches are served directly by getAgentMemory(),
       // getSharedMemory(), and legacy context builders. Clear the entire
@@ -6516,6 +6564,7 @@ export class MemoryManager {
       this.initializeAdvancedSystems();
     } finally {
       this.confidentialEntityReferenceCache.clear();
+      this.entityExactOwnerCache.clear();
     }
 
     return {

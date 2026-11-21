@@ -8,6 +8,9 @@
  * that entity; variants apply only when no entity has the name exactly. A
  * name two entities share exactly stays ambiguous.
  */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { NeuralMCPServer } from '../src/unified-neural-mcp-server.js';
 import type { RequestContext } from '../src/middleware/auth/types.js';
@@ -439,5 +442,209 @@ describe('exact owners come from stored entity records (PR #36 round 2)', () => 
       manager.entityExactOwners = original;
     }
     await expectResolves(v2, v2);
+  });
+});
+
+/**
+ * PR #36 round 3 (codex-p1 R1-R5, corrupt-row rule, non-string name): the
+ * exact-owner catalog reads stored records with JSON.parse semantics, uses
+ * the shared privacy classifier on the parsed payload, never caches a map
+ * built inside a transaction, and treats unreadable entity rows as owning
+ * nothing while blocking every name their index keys point at.
+ */
+describe('exact-owner catalog edge cases (PR #36 round 3)', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+  const agentId = 'vsib-r3-agent';
+  const call = async (toolName: string, args: Record<string, any>) => {
+    const result = await (server as any)._handleToolCall(toolName, args);
+    const text = result?.content?.[0]?.text;
+    if (result?.isError) throw new Error(`Tool error: ${text}`);
+    return JSON.parse(text);
+  };
+  const manager = () => server.getMemoryManager() as any;
+  const db = () => server.getMemoryManager().getDb();
+  const resume = (project: string, resultVersion: number) =>
+    call('resume', { agentId, scope: { project }, budget: 8000, resultVersion });
+  const create = (entities: Array<{ name: string; aliases?: string[] }>) =>
+    call('create_entities', {
+      entities: entities.map((e) => ({ name: e.name, entityType: 'project', observations: [], aliases: e.aliases ?? [] })),
+    });
+  const idOf = (name: string) =>
+    (db().prepare(`SELECT id FROM shared_memory WHERE memory_type = 'entity' AND json_extract(content, '$.name') = ?`).get(name) as any).id as string;
+  const insertRaw = (id: string, content: string) =>
+    db().prepare(`INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by, tags) VALUES (?, 'default', 'entity', ?, 'r3', '[]')`).run(id, content);
+  const importRaw = (id: string, content: string) =>
+    manager().importEntities({
+      schemaVersion: 1,
+      entities: [{ id, content, created_by: 'r3', tags: '[]', created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+      observations: [],
+      relations: [],
+    }, 'default');
+  const names = (ref: string) => [...new Set(manager().resolveEntityCandidatesExact(ref, 'default').map((c: any) => c.name))].sort();
+  const checkpoint = (project: string, key: string) => call('checkpoint', {
+    agentId, scope: { project }, expectedRevision: null, idempotencyKey: key,
+    state: { objective: 'o', status: 's', owner: agentId, nextActions: [], blockers: [], guardrails: [] },
+  });
+  const expectAmbiguous = async (ref: string, expected: string[]) => {
+    for (const version of [2, 3]) {
+      const bundle = await resume(ref, version);
+      expect(bundle.resolvedScope.scopeKey).toBeNull();
+      expect(bundle.resolvedScope.ambiguousCandidates).toEqual([...expected].sort());
+    }
+  };
+  const expectUnresolved = async (ref: string, mustNotContain: string[] = []) => {
+    for (const version of [2, 3]) {
+      const bundle = await resume(ref, version);
+      expect(bundle.resolvedScope.scopeKey).toBeNull();
+      expect(bundle.resolvedScope.projectId ?? null).toBeNull();
+      expect(bundle.resolvedScope.ambiguousCandidates).toBeUndefined();
+      expect(bundle.capsule.current ?? null).toBeNull();
+      for (const text of mustNotContain) expect(JSON.stringify(bundle)).not.toContain(text);
+    }
+  };
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('R1: duplicate JSON keys read last-wins, like JSON.parse (imported raw bytes)', async () => {
+    const shared = `r1-shared-${s}`;
+    const x = `r1-x-${s}`;
+    await create([{ name: shared }, { name: x }]);
+    await importRaw(`r1-a-${s}`, `{"name":"r1-a-${s}","entityType":"project","aliases":[],"aliases":["${shared}"]}`);
+    await importRaw(`r1-d-${s}`, `{"name":"r1-decoy-${s}","name":"${x}","entityType":"project","aliases":[]}`);
+    expect((db().prepare('SELECT content FROM shared_memory WHERE id = ?').get(`r1-a-${s}`) as any).content).toContain('"aliases":[],"aliases"');
+    await expectAmbiguous(shared, [`r1-a-${s}`, shared]);
+    await expectAmbiguous(x, [x]); // two owners named x (names are listed once)
+  });
+
+  it('R2: a catalog built inside a rolled-back transaction is not reused', async () => {
+    const shared = `r2-shared-${s}`;
+    const a = `r2-a-${s}`;
+    await create([{ name: a, aliases: [shared] }, { name: shared }]);
+    const removeAliasAndResolve = () => {
+      db().prepare(`UPDATE shared_memory SET content = json_set(content, '$.aliases', json('[]')) WHERE id = ?`).run(idOf(a));
+      expect(names(shared)).toEqual([shared]); // inside: A's alias is gone
+      throw new Error('rollback');
+    };
+    expect(() => db().transaction(removeAliasAndResolve)()).toThrow('rollback');
+    expect(names(shared)).toEqual([a, shared].sort());
+    await expectAmbiguous(shared, [a, shared]);
+    await expect(checkpoint(shared, `r2-ckpt-${s}`)).rejects.toThrow(/ambiguous/);
+    // Savepoint: the inner transaction rolls back, the outer one commits.
+    db().transaction(() => {
+      try { db().transaction(removeAliasAndResolve)(); } catch { /* rolled back to the savepoint */ }
+    })();
+    expect(names(shared)).toEqual([a, shared].sort());
+    await expectAmbiguous(shared, [a, shared]);
+    await expect(checkpoint(shared, `r2-ckpt2-${s}`)).rejects.toThrow(/ambiguous/);
+    for (const v of [2, 3]) expect((await resume(a, v)).working).toBeNull();
+    for (const v of [2, 3]) expect((await resume(`${shared}`, v)).working ?? null).toBeNull();
+  });
+
+  it('R4: a private owner with an array-typed entityType fails closed and is never listed', async () => {
+    const shared = `r4-shared-${s}`;
+    const hidden = `r4-private-hidden-${s}`;
+    await create([{ name: shared }]);
+    insertRaw(`r4-p-${s}`, JSON.stringify({ name: hidden, entityType: ['message_detail'], aliases: [shared] }));
+    expect(manager().isConfidentialMessageSearchItem('entity', { name: hidden, entityType: ['message_detail'] })).toBe(true);
+    await expectUnresolved(shared, [hidden]);
+  });
+
+  it('R5: aliases count only as a real JSON array, not a string that looks like one', async () => {
+    const shared = `r5-shared-${s}`;
+    await create([{ name: shared }]);
+    insertRaw(`r5-a-${s}`, JSON.stringify({ name: `r5-a-${s}`, entityType: 'project', aliases: `["${shared}"]` }));
+    expect(names(shared)).toEqual([shared]);
+    const bundle = await resume(shared, 2);
+    expect(bundle.resolvedScope.projectId).toBe(idOf(shared));
+  });
+
+  it('corrupt entity row: owns nothing, its indexed names do not resolve (not to B), doctor counts it, checkpoint refused', async () => {
+    const shared = `cor-shared-${s}`;
+    const a = `cor-a-${s}`;
+    await create([{ name: a, aliases: [shared] }, { name: shared }]);
+    const aId = idOf(a);
+    const before = manager().countInvalidEntityRows('default');
+    db().prepare('UPDATE shared_memory SET content = ? WHERE id = ?').run('{"name": "cor-a", "aliases": [', aId);
+    expect(manager().countInvalidEntityRows('default')).toBe(before + 1);
+    expect((await manager().getSystemStatus()).sqlite.invalidEntityRows).toBeGreaterThanOrEqual(before + 1);
+    await expectUnresolved(shared);
+    await expectUnresolved(a);
+    await expect(checkpoint(shared, `cor-ckpt-${s}`)).rejects.toThrow(/did not resolve/);
+    // A valid-JSON non-object counts as unreadable too.
+    db().prepare('UPDATE shared_memory SET content = ? WHERE id = ?').run('[1,2]', aId);
+    expect(manager().countInvalidEntityRows('default')).toBe(before + 1);
+    await expectUnresolved(shared);
+    // Repaired: ambiguous again.
+    db().prepare('UPDATE shared_memory SET content = ? WHERE id = ?').run(JSON.stringify({ name: a, entityType: 'project', aliases: [shared] }), aId);
+    expect(manager().countInvalidEntityRows('default')).toBe(before);
+    await expectAmbiguous(shared, [a, shared]);
+  });
+
+  it('a non-string name owns nothing (not its stringified form); its string aliases still count', async () => {
+    const num = `9${String(s).slice(-6)}`;
+    const alias = `nsn-alias-${s}`;
+    await create([{ name: num }]);
+    insertRaw(`nsn-${s}`, JSON.stringify({ name: Number(num), entityType: 'project', aliases: [alias] }));
+    expect(names(num)).toEqual([num]);
+    expect(manager().resolveEntityCandidatesExact(alias, 'default').map((c: any) => c.id)).toEqual([`nsn-${s}`]);
+  });
+
+  it('a forged cache entry for another connection is ignored', async () => {
+    const shared = `conn-shared-${s}`;
+    const a = `conn-a-${s}`;
+    await create([{ name: a, aliases: [shared] }, { name: shared }]);
+    expect(names(shared)).toEqual([a, shared].sort()); // warms the cache
+    const entry = manager().entityExactOwnerCache.get('default');
+    const forged = { owners: new Map([[shared, [{ id: idOf(shared), name: shared, viaName: true, confidential: false }]]]), blockedKeys: new Set() };
+    manager().entityExactOwnerCache.set('default', { ...entry, db: {}, catalog: forged });
+    expect(names(shared)).toEqual([a, shared].sort());
+  });
+});
+
+describe('exact-owner cache across snapshot restore (PR #36 round 3, R3)', () => {
+  let server: NeuralMCPServer;
+  let tmpDir = '';
+  const s = Date.now();
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vsib-r3-snapshot-'));
+    server = new NeuralMCPServer(0, path.join(tmpDir, 'test.db'));
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('restoreSnapshot drops the warmed catalog: a shared name is ambiguous again', async () => {
+    const manager = server.getMemoryManager() as any;
+    const shared = `r3-shared-${s}`;
+    const a = `r3-a-${s}`;
+    await (server as any)._handleToolCall('create_entities', {
+      entities: [
+        { name: a, entityType: 'project', observations: [], aliases: [shared] },
+        { name: shared, entityType: 'project', observations: [], aliases: [] },
+      ],
+    });
+    const names = () => [...new Set(manager.resolveEntityCandidatesExact(shared, 'default').map((c: any) => c.name))].sort();
+    expect(names()).toEqual([a, shared].sort());
+    const snapshot = await manager.createSnapshot(`r3-${s}`);
+    await manager.retireEntitiesToTrash([a], 'default', 'r3');
+    expect(names()).toEqual([shared]); // warms a B-only catalog
+    expect(manager.entityExactOwnerCache.size).toBe(1);
+    await manager.restoreSnapshot(snapshot.snapshotId);
+    expect(manager.entityExactOwnerCache.size).toBe(0);
+    expect(names()).toEqual([a, shared].sort());
   });
 });
