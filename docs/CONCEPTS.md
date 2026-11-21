@@ -102,12 +102,23 @@ newest observation decisions are listed; `observationDecisions` reports
 budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
 without `source`.
 
-`scope.project` and `scope.task` resolve the same way, exact first. A name
-that is exactly an entity's canonical name or declared alias resolves to that
-entity, even when version or suffix siblings exist (`x-v2` and `x-v3`, or
-`hb-voice` and `hb-voice-v3`). A `-vN` or company-suffix variant is used only
-when no entity has the name exactly. A name that two entities share exactly is
-ambiguous: `resolvedScope` lists `ambiguousCandidates` and no scope is read.
+`scope.project` and `scope.task` resolve the same way (as do `checkpoint`
+and `discover_related_context`), exact first. Exact owners are read from the
+stored entity records: the canonical name and every top-level declared alias,
+compared case- and punctuation-insensitively. The search index is not used
+for this step, so an alias the index dropped (it keeps at most 64 keys per
+entity), an entity with no index entries, or an alias changed without a
+reindex still counts, and a stale index entry does not.
+
+- One exact owner: the name resolves to it, even when version or suffix
+  siblings exist (`x-v2` and `x-v3`, or `hb-voice` and `hb-voice-v3`).
+- Two or more exact owners: ambiguous. `resolvedScope` lists
+  `ambiguousCandidates`, nothing is read, and a `checkpoint` is refused.
+- No exact owner: a `-vN` or company-suffix variant is tried, through the
+  search index. A missing version can therefore resolve to another version:
+  with only `x-v3` stored, `x-v2` resolves to `x-v3`. Observation ownership
+  (below) is stricter and runs one way only.
+- If the entity records cannot be read, the name does not resolve.
 
 Only observations whose `entityName` names the scope entity, and only that
 entity, count. Names are compared case- and punctuation-insensitively:
@@ -115,9 +126,8 @@ entity, count. Names are compared case- and punctuation-insensitively:
 - **Exact name.** If the name is the canonical name or a declared alias of
   any entity, it belongs to those entities only. It counts for the scope
   when the scope is the only such entity. A name that two entities share
-  exactly counts for neither. Every declared alias is checked, including
-  aliases the search index drops (it keeps at most 64 keys per entity) and
-  entities that have no index entries at all.
+  exactly counts for neither. Exact owners are read from the stored entity
+  records, as for scope resolution above.
 - **Variant**, only when no entity has the name exactly. The name counts when
   removing a trailing `-vN` from it, or adding or removing a company suffix
   (`-llc`, `-inc`, `-corp`, `-co`, `-company`), gives the scope's name or

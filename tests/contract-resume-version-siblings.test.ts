@@ -10,6 +10,8 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { NeuralMCPServer } from '../src/unified-neural-mcp-server.js';
+import type { RequestContext } from '../src/middleware/auth/types.js';
+import { DEFAULT_REQUEST_CONTEXT } from '../src/middleware/auth/types.js';
 
 async function mcpCall(server: NeuralMCPServer, toolName: string, args: Record<string, any> = {}): Promise<any> {
   const result = await (server as any)._handleToolCall(toolName, args);
@@ -141,5 +143,301 @@ describe('resume resolves version siblings by exact name (issue #35)', () => {
       expect(bundle.resolvedScope.scopeKey).toBeNull();
       expect(bundle.resolvedScope.ambiguousCandidates?.length).toBe(2);
     }
+  });
+});
+
+/**
+ * PR #36 round 2: exact owners come from the STORED entity records, not the
+ * capped lookup index (64 keys per entity). A hidden exact owner must keep a
+ * shared name ambiguous; stale index rows must not create owners; the same
+ * resolution guards resume (v2, v3, task scopes), checkpoint writes and
+ * discover_related_context.
+ */
+describe('exact owners come from stored entity records (PR #36 round 2)', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+  const agentId = 'vsib-r2-agent';
+  const fillers = (tag: string) => Array.from({ length: 100 }, (_, i) => `f${i}x${tag}${s}`); // sort before "zz-…"
+  const call = async (toolName: string, args: Record<string, any>, context?: RequestContext) => {
+    const result = await (server as any)._handleToolCall(toolName, args, context);
+    const text = result?.content?.[0]?.text;
+    if (result?.isError) throw new Error(`Tool error: ${text}`);
+    return JSON.parse(text);
+  };
+  const resume = (scope: Record<string, string>, resultVersion: number) =>
+    call('resume', { agentId, scope, budget: 8000, resultVersion });
+  const create = (entities: Array<{ name: string; aliases?: string[]; observations?: string[] }>, context?: RequestContext) =>
+    call('create_entities', {
+      entities: entities.map((e) => ({ name: e.name, entityType: 'project', observations: e.observations ?? [], aliases: e.aliases ?? [] })),
+    }, context);
+  const capsule = async (entityName: string) =>
+    (await call('add_observations', { observations: [{ entityName, contents: [`capsule for ${entityName}`], kind: 'capsule' }] }))
+      .observations[0].id as string;
+  const db = () => server.getMemoryManager().getDb();
+  const idOf = (name: string, tenant = 'default') =>
+    (db().prepare(`SELECT id FROM shared_memory WHERE memory_type = 'entity' AND tenant_id = ? AND json_extract(content, '$.name') = ?`)
+      .get(tenant, name) as any).id as string;
+  const indexedNames = (key: string) =>
+    [...new Set((db().prepare(
+      `SELECT json_extract(sm.content, '$.name') AS name FROM graph_lookup_keys g
+         JOIN shared_memory sm ON sm.id = g.memory_id
+        WHERE g.lookup_key = ? AND g.memory_type = 'entity' AND g.tenant_id = 'default'`
+    ).all(key) as any[]).map((r) => r.name))].sort();
+  const setContent = (name: string, mutate: (content: any) => void) => {
+    const id = idOf(name);
+    const content = JSON.parse((db().prepare('SELECT content FROM shared_memory WHERE id = ?').get(id) as any).content);
+    mutate(content);
+    db().prepare('UPDATE shared_memory SET content = ? WHERE id = ?').run(JSON.stringify(content), id); // no reindex
+  };
+  const expectAmbiguous = async (scope: Record<string, string>, names: string[]) => {
+    for (const version of [2, 3]) {
+      const bundle = await resume(scope, version);
+      expect(bundle.resolvedScope.projectId ?? null).toBeNull();
+      expect(bundle.resolvedScope.taskId ?? null).toBeNull();
+      expect(bundle.resolvedScope.scopeKey).toBeNull();
+      expect(bundle.resolvedScope.ambiguousCandidates).toEqual([...names].sort());
+      expect(bundle.capsule.current ?? null).toBeNull();
+      expect(bundle.definition ?? null).toBeNull();
+    }
+  };
+  const expectResolves = async (ref: string, name: string, own?: string) => {
+    for (const version of [2, 3]) {
+      const bundle = await resume({ project: ref }, version);
+      expect(bundle.resolvedScope.ambiguousCandidates).toBeUndefined();
+      expect(bundle.resolvedScope.projectId).toBe(idOf(name));
+      if (own) expect(bundle.capsule.current?.observationId).toBe(own);
+    }
+  };
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('codex repro: a capped owner hides the shared alias from the index; the shared name stays ambiguous (with and without a -v3 sibling)', async () => {
+    for (const withV3 of [true, false]) {
+      const tag = withV3 ? 'c' : 'n';
+      const shared = `zz-pr36-shared-${tag}${s}`;
+      const a = `pr36-hidden-owner-${tag}${s}`;
+      const handle = `pr36-b-private-handle-${tag}${s}`;
+      await create([
+        { name: a, aliases: [...fillers(tag), shared] },
+        { name: shared, aliases: [handle], observations: ['B founding observation'] },
+        ...(withV3 ? [{ name: `${shared}-v3` }] : []),
+      ]);
+      expect(indexedNames(shared)).toContain(shared);
+      expect(indexedNames(shared)).not.toContain(a); // precondition: A's alias is not indexed
+      const bCapsule = await capsule(handle);
+      await expectAmbiguous({ project: shared }, [a, shared]);
+      await expectResolves(handle, shared, bCapsule);
+      if (withV3) await expectResolves(`${shared}-v3`, `${shared}-v3`);
+    }
+  });
+
+  it('hidden alias vs hidden alias: two capped owners of the same dropped alias are ambiguous', async () => {
+    const key = `zz-hh-${s}`;
+    const a = `hh-a-${s}`;
+    const b = `hh-b-${s}`;
+    await create([{ name: a, aliases: [...fillers('ha'), key] }, { name: b, aliases: [...fillers('hb'), key] }]);
+    expect(indexedNames(key)).toEqual([]);
+    await expectAmbiguous({ project: key }, [a, b]);
+  });
+
+  it('capped, zero-row and visible owners in the same query are all counted', async () => {
+    const key = `zz-mix-${s}`;
+    const capped = `mix-capped-${s}`;
+    const zero = `mix-zero-${s}`;
+    await create([{ name: capped, aliases: [...fillers('mc'), key] }, { name: zero, aliases: [key] }, { name: key }]);
+    db().prepare('DELETE FROM graph_lookup_keys WHERE memory_id = ?').run(idOf(zero));
+    expect(indexedNames(key)).toEqual([key]);
+    await expectAmbiguous({ project: key }, [capped, zero, key]);
+  });
+
+  it('the shared key as a capped entity\'s canonical name, also held as a hidden alias elsewhere', async () => {
+    const key = `zz-canon-${s}`;
+    const other = `canon-other-${s}`;
+    await create([{ name: key, aliases: fillers('ca') }, { name: other, aliases: [...fillers('cb'), key] }]);
+    expect(indexedNames(key)).toEqual([key]);
+    await expectAmbiguous({ project: key }, [key, other]);
+  });
+
+  it('an alias added after the cap was hit (reindexed, still dropped) counts', async () => {
+    const key = `zz-late-${s}`;
+    const a = `late-a-${s}`;
+    await create([{ name: a, aliases: fillers('la') }, { name: key }]);
+    setContent(a, (c) => { c.aliases.push(key); });
+    const manager = server.getMemoryManager() as any;
+    const content = JSON.parse((db().prepare('SELECT content FROM shared_memory WHERE id = ?').get(idOf(a)) as any).content);
+    manager.refreshGraphLookupIndexForMemory(idOf(a), 'default', 'entity', content);
+    expect(indexedNames(key)).toEqual([key]);
+    await expectAmbiguous({ project: key }, [a, key]);
+  });
+
+  it('aliases added, removed or renamed without a reindex; a stale index row for a removed alias owns nothing', async () => {
+    const added = `edit-added-${s}`;
+    const removed = `edit-removed-${s}`;
+    const a = `edit-a-${s}`;
+    const ren = `edit-ren-old-${s}`;
+    await create([{ name: a, aliases: [removed] }, { name: added }, { name: removed }, { name: ren }]);
+    // added without reindex -> A now shares `added` exactly
+    setContent(a, (c) => { c.aliases = [added]; });
+    await expectAmbiguous({ project: added }, [a, added]);
+    // removed without reindex -> the stale index row for `removed` is ignored
+    expect(indexedNames(removed)).toEqual([a, removed].sort());
+    await expectResolves(removed, removed);
+    // renamed without reindex -> the new name resolves, the old one does not
+    setContent(ren, (c) => { c.name = `edit-ren-new-${s}`; });
+    const renamed = await resume({ project: `edit-ren-new-${s}` }, 2);
+    expect(renamed.resolvedScope.projectId).toBe(idOf(`edit-ren-new-${s}`));
+    const old = await resume({ project: ren }, 2);
+    expect(old.resolvedScope.scopeKey).toBeNull();
+    expect(old.resolvedScope.ambiguousCandidates).toBeUndefined();
+  });
+
+  it('a deleted entity that still held the alias owns nothing, nor does a dangling index row', async () => {
+    const key = `del-key-${s}`;
+    const a = `del-a-${s}`;
+    await create([{ name: a, aliases: [key] }, { name: key }]);
+    await expectAmbiguous({ project: key }, [a, key]);
+    await (server.getMemoryManager() as any).retireEntitiesToTrash([a], 'default', 'test'); // what delete_entity does
+    db().prepare(`INSERT INTO graph_lookup_keys (tenant_id, lookup_key, memory_type, memory_id, key_kind, weight, updated_at)
+      VALUES ('default', ?, 'entity', 'dangling-id', 'alias', 95, CURRENT_TIMESTAMP)`).run(key);
+    await expectResolves(key, key);
+  });
+
+  it('the unindexed project-skeleton path still owns its name', async () => {
+    const key = `skel-${s}`;
+    const b = `skel-b-${s}`;
+    (server.getMemoryManager() as any).ensureProjectEntity(agentId, key, 'default');
+    await create([{ name: b, aliases: [key] }]);
+    expect(indexedNames(key)).toEqual([b]);
+    await expectAmbiguous({ project: key }, [key, b]);
+  });
+
+  it('many owners, some capped and some unindexed, are all listed', async () => {
+    const key = `zz-many-${s}`;
+    const names = Array.from({ length: 6 }, (_, i) => `many-${i}-${s}`);
+    await create(names.map((name, i) => ({ name, aliases: i < 2 ? [...fillers(`m${i}`), key] : [key] })));
+    db().prepare('DELETE FROM graph_lookup_keys WHERE memory_id = ?').run(idOf(names[2]));
+    await expectAmbiguous({ project: key }, names);
+  });
+
+  it('owners in another tenant have no effect', async () => {
+    const key = `tenant-key-${s}`;
+    const other = { ...DEFAULT_REQUEST_CONTEXT, tenantId: 'vsib-other-tenant' } as RequestContext;
+    await create([{ name: `tenant-other-${s}`, aliases: [key] }], other);
+    await create([{ name: key }]);
+    await expectResolves(key, key);
+  });
+
+  it('task scopes resolve the same way: version siblings resolve, a hidden collision is ambiguous', async () => {
+    const t2 = `task-x-${s}-v2`;
+    const t3 = `task-x-${s}-v3`;
+    const key = `zz-task-shared-${s}`;
+    const a = `task-hidden-${s}`;
+    await create([{ name: t2 }, { name: t3 }, { name: a, aliases: [...fillers('ta'), key] }, { name: key }]);
+    for (const version of [2, 3]) {
+      expect((await resume({ task: t2 }, version)).resolvedScope.taskId).toBe(idOf(t2));
+      expect((await resume({ task: t3 }, version)).resolvedScope.taskId).toBe(idOf(t3));
+    }
+    await expectAmbiguous({ task: key }, [a, key]);
+  });
+
+  it('checkpoint against a shared exact name is refused and writes into neither scope', async () => {
+    const key = `zz-ckpt-${s}`;
+    const a = `ckpt-a-${s}`;
+    const aHandle = `ckpt-a-handle-${s}`;
+    const bHandle = `ckpt-b-handle-${s}`;
+    await create([{ name: a, aliases: [...fillers('ck'), key, aHandle] }, { name: key, aliases: [bHandle] }]);
+    await expect(call('checkpoint', {
+      agentId, scope: { project: key }, expectedRevision: null, idempotencyKey: `ckpt-${s}`,
+      state: { objective: 'o', status: 's', owner: agentId, nextActions: [], blockers: [], guardrails: [] },
+    })).rejects.toThrow(/ambiguous/);
+    for (const handle of [aHandle, bHandle]) {
+      for (const version of [2, 3]) {
+        const bundle = await resume({ project: handle }, version);
+        expect(bundle.resolvedScope.scopeKey).not.toBeNull();
+        expect(bundle.working).toBeNull();
+      }
+    }
+    // Control: the unique handle checkpoints normally.
+    const ok = await call('checkpoint', {
+      agentId, scope: { project: bHandle }, expectedRevision: null, idempotencyKey: `ckpt-ok-${s}`,
+      state: { objective: 'o', status: 's', owner: agentId, nextActions: [], blockers: [], guardrails: [] },
+    });
+    expect(ok.outcome).toBe('written');
+    expect((await resume({ project: key }, 2)).resolvedScope.scopeKey).toBeNull();
+  });
+
+  it('discover_related_context: version siblings resolve; a hidden collision fails closed before retrieval', async () => {
+    const manager = server.getMemoryManager() as any;
+    const original = manager.searchRelatedContextSemantic;
+    let semanticCalls = 0;
+    manager.searchRelatedContextSemantic = async () => { semanticCalls++; return { results: [], degraded: false, reasons: [] }; };
+    try {
+      const d2 = `disc-x-${s}-v2`;
+      const d3 = `disc-x-${s}-v3`;
+      const key = `zz-disc-${s}`;
+      const a = `disc-hidden-${s}`;
+      await create([{ name: d2 }, { name: d3 }, { name: a, aliases: [...fillers('di'), key] }, { name: key }]);
+      for (const name of [d2, d3]) {
+        const found = await call('discover_related_context', { scope: { project: name }, intent: 'version sibling' });
+        expect(found.error).toBeUndefined();
+        expect(found.resolvedScope.projectId).toBe(idOf(name));
+      }
+      semanticCalls = 0;
+      const ambiguous = await call('discover_related_context', { scope: { project: key }, intent: 'must fail closed' });
+      expect(ambiguous.error).toMatchObject({ code: 'SCOPE_AMBIGUOUS' });
+      expect(ambiguous.resolvedScope.ambiguousCandidates).toEqual([a, key].sort());
+      expect(ambiguous.candidates).toEqual([]);
+      expect(semanticCalls).toBe(0);
+    } finally {
+      manager.searchRelatedContextSemantic = original;
+    }
+  });
+
+  it('repeated calls give a stable result, also across unrelated writes and a cache rebuild', async () => {
+    const key = `zz-stable-${s}`;
+    const a = `stable-a-${s}`;
+    await create([{ name: a, aliases: [...fillers('st'), key] }, { name: key }]);
+    for (let i = 0; i < 3; i++) {
+      await expectAmbiguous({ project: key }, [a, key]);
+      await call('send_ai_message', { from: agentId, to: 'vsib-nobody', content: `unrelated write ${i}` });
+    }
+  });
+
+  it('control: two visible owners stay ambiguous', async () => {
+    const key = `vis-key-${s}`;
+    await create([{ name: `vis-a-${s}`, aliases: [key] }, { name: `vis-b-${s}`, aliases: [key] }]);
+    expect(indexedNames(key)).toEqual([`vis-a-${s}`, `vis-b-${s}`]);
+    await expectAmbiguous({ project: key }, [`vis-a-${s}`, `vis-b-${s}`]);
+  });
+
+  it('documented (M1): with no exact owner, a missing version resolves to the stored version', async () => {
+    const v3 = `m1-x-${s}-v3`;
+    await create([{ name: v3 }]);
+    expect((await resume({ project: `m1-x-${s}-v2` }, 2)).resolvedScope.projectId).toBe(idOf(v3));
+  });
+
+  it('a read error fails closed: unresolved, not a variant fallback', async () => {
+    const v2 = `rerr-${s}-v2`;
+    await create([{ name: v2 }]);
+    const manager = server.getMemoryManager() as any;
+    const original = manager.entityExactOwners;
+    manager.entityExactOwners = () => null;
+    try {
+      expect(manager.resolveEntityCandidatesExact(v2, 'default')).toEqual([]);
+      expect(manager.resolveEntityCandidatesExact(`${v2} LLC`, 'default')).toEqual([]);
+      const bundle = await resume({ project: v2 }, 2);
+      expect(bundle.resolvedScope.scopeKey).toBeNull();
+    } finally {
+      manager.entityExactOwners = original;
+    }
+    await expectResolves(v2, v2);
   });
 });

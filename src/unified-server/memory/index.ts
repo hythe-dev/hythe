@@ -98,6 +98,14 @@ export interface ScopeObservationSelections {
   decisions: { decisions: ScopeObservationItem[]; totalCount: number; candidatesConsidered: number };
 }
 
+/** One entity that has a normalized key exactly as its canonical name or a declared alias. */
+interface ExactOwner {
+  id: string;
+  name: string;
+  viaName: boolean;
+  confidential: boolean;
+}
+
 export class MemoryManager {
   /** ENG-2 index diet: hard cap on graph_lookup_keys rows per memory. */
   static readonly MAX_LOOKUP_KEYS_PER_MEMORY = 64;
@@ -114,6 +122,12 @@ export class MemoryManager {
   private isAdvancedSystemsEnabled: boolean = false;
   private isDualWriteEnabled: boolean = false;
   private confidentialEntityReferenceCache = new Map<string, Set<string>>();
+  /**
+   * Exact-owner map per tenant (normalized name/alias key -> owners), built
+   * from the STORED entity records, valid while the database is unchanged
+   * (see entityExactOwners).
+   */
+  private entityExactOwnerCache = new Map<string, { stamp: string; owners: Map<string, ExactOwner[]> }>();
   readonly contentSizeThreshold: number = parseInt(process.env.CONTENT_SIZE_THRESHOLD || '51200', 10); // 50KB default
 
   constructor(dbPath: string = './data/unified-platform.db') {
@@ -4778,16 +4792,33 @@ export class MemoryManager {
   ): Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> {
     const queryVariants = new Set(this.entityQueryVariants(entityName));
     if (queryVariants.size === 0) return [];
-    const queryKey = this.normalizeEntityLookup(entityName);
-    const candidates: Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> = [];
-    // EXACT before VARIANT (issue #35, version siblings): a name that is
+    // EXACT before VARIANT (issue #35, version siblings). A name that is
     // exactly some entity's canonical name or declared alias resolves to
-    // those entities only. Variant matches (-vN stripped, company suffix
-    // added/removed) count only when no entity has the name exactly, so
-    // "x-v2" is not made ambiguous by "x-v3" (both reduce to "x"), and "x" is
-    // not made ambiguous by "x-v3". Two entities sharing the exact name or an
-    // alias stay ambiguous.
-    const exact: typeof candidates = [];
+    // those entities only, so "x-v2" is not made ambiguous by "x-v3" (both
+    // reduce to "x") and "x" is not made ambiguous by "x-v3". Exact owners
+    // come from the STORED entity records of the tenant (entityExactOwners),
+    // never from the capped lookup index, so an alias the index dropped, an
+    // entity with no index rows and an alias added without a reindex all
+    // count, and a stale index row for a removed alias or a deleted entity
+    // does not. Two or more exact owners are ambiguous.
+    const owners = this.entityExactOwners(tenantId);
+    if (owners === null) return []; // read error: unresolved, never "no exact owner"
+    const exact = owners.get(this.normalizeEntityLookup(entityName)) ?? [];
+    if (exact.length > 0) {
+      // A private (message_detail) entity holding the name: fail closed
+      // without exposing it, as unresolved.
+      if (exact.some((owner) => owner.confidential)) return [];
+      return exact.map((owner) => ({
+        id: owner.id,
+        name: owner.name,
+        matchedBy: owner.viaName ? 'canonical_name' as const : 'alias' as const,
+      }));
+    }
+
+    // VARIANT (-vN stripped, company suffix added/removed), only when no
+    // entity has the name exactly. This path uses the lookup index and
+    // re-verifies each hit against its payload.
+    const candidates: Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> = [];
     for (const row of this.findEntitiesByNameOrAlias(entityName, tenantId)) {
       try {
         const content = JSON.parse(row.content || '{}');
@@ -4801,26 +4832,90 @@ export class MemoryManager {
         const isNameOrAlias = isCanonical ||
           this.entityNameAndAliasLookupValues(content).some((v) => queryVariants.has(v));
         if (!isNameOrAlias) continue;
-        const candidate = {
+        candidates.push({
           id: String(row.id),
           name: String(content?.name ?? ''),
-          matchedBy: (isCanonical ? 'canonical_name' : 'alias') as 'canonical_name' | 'alias',
-        };
-        candidates.push(candidate);
-        if (queryKey) {
-          const exactName = this.normalizeEntityLookup(String(content?.name ?? '')) === queryKey;
-          const exactAlias = !exactName && Array.isArray(content?.aliases) && content.aliases.some(
-            (alias: unknown) => typeof alias === 'string' && this.normalizeEntityLookup(alias) === queryKey
-          );
-          if (exactName || exactAlias) {
-            exact.push({ ...candidate, matchedBy: exactName ? 'canonical_name' : 'alias' });
-          }
-        }
+          matchedBy: isCanonical ? 'canonical_name' : 'alias',
+        });
       } catch {
         /* unparseable row: never a candidate */
       }
     }
-    return exact.length > 0 ? exact : candidates;
+    return candidates;
+  }
+
+  /**
+   * Exact owners of every normalized canonical name and declared (top-level)
+   * alias in a tenant, read from the stored entity records: one query over
+   * the tenant's entity rows, extracting only name, aliases and the fields
+   * the confidentiality check reads. Deleted entities are gone from
+   * shared_memory and so own nothing. Rows whose JSON is invalid own nothing
+   * (every graph read path already treats them as private and skips them).
+   *
+   * Cached per tenant and reused while the database is unchanged: the stamp
+   * is PRAGMA data_version (commits by other connections) plus
+   * total_changes() (every write on this connection, including direct SQL).
+   * So a request pays at most one build, and requests with no write in
+   * between pay none. Returns null when the read fails; callers fail closed.
+   */
+  private entityExactOwners(tenantId: string): Map<string, ExactOwner[]> | null {
+    try {
+      const dataVersion = this.db.pragma('data_version', { simple: true });
+      const changes = (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
+      const stamp = `${dataVersion}:${changes}`;
+      const cached = this.entityExactOwnerCache.get(tenantId);
+      if (cached && cached.stamp === stamp) return cached.owners;
+
+      const rows = this.db.prepare(`
+        SELECT id,
+               json_extract(content, '$.name') AS name,
+               json_extract(content, '$.aliases') AS aliases,
+               json_extract(content, '$.entityType') AS entityType,
+               json_extract(content, '$.type') AS type,
+               json_extract(content, '$.memoryType') AS memoryType,
+               json_extract(content, '$.memory_type') AS memoryTypeSnake
+        FROM shared_memory
+        WHERE tenant_id = ? AND memory_type = 'entity' AND json_valid(content)
+      `).all(tenantId) as Array<Record<string, any>>;
+      const owners = new Map<string, ExactOwner[]>();
+      for (const row of rows) {
+        let aliases: unknown = row.aliases;
+        if (typeof aliases === 'string') {
+          try { aliases = JSON.parse(aliases); } catch { aliases = null; }
+        }
+        const payload = {
+          name: row.name,
+          aliases: Array.isArray(aliases) ? aliases : [],
+          entityType: row.entityType,
+          type: row.type,
+          memoryType: row.memoryType,
+          memory_type: row.memoryTypeSnake,
+        };
+        const confidential = this.isConfidentialMessageSearchItem('entity', payload);
+        const id = String(row.id);
+        const name = typeof row.name === 'string' ? row.name : '';
+        const keys = new Map<string, boolean>(); // key -> viaName
+        if (name) {
+          const key = this.normalizeEntityLookup(name);
+          if (key) keys.set(key, true);
+        }
+        for (const alias of payload.aliases) {
+          if (typeof alias !== 'string') continue;
+          const key = this.normalizeEntityLookup(alias);
+          if (key && !keys.has(key)) keys.set(key, false);
+        }
+        for (const [key, viaName] of keys) {
+          const list = owners.get(key);
+          const owner = { id, name, viaName, confidential };
+          if (list) list.push(owner); else owners.set(key, [owner]);
+        }
+      }
+      this.entityExactOwnerCache.set(tenantId, { stamp, owners });
+      return owners;
+    } catch (error: any) {
+      console.warn('⚠️ Exact-owner lookup failed; resolution fails closed:', error?.message || error);
+      return null;
+    }
   }
 
   /**
@@ -5021,13 +5116,10 @@ export class MemoryManager {
     //     other entity, AND the exact resolver must resolve the name to this
     //     entity alone. So "acme" counts for acme-llc while no acme-inc
     //     exists, but "nx-v3" never counts for nx-v2 (no shared stripped base).
-    // "Exactly / no other entity" does not trust the capped search index alone
-    // (MAX_LOOKUP_KEYS_PER_MEMORY may hide a competing alias, and an entity
-    // may have no index rows at all): owners are the index hits plus a payload
-    // check of every entity with no index rows or at the key cap. An entity
-    // with some but not all of its keys is not expected: entity writes commit
-    // their keys in the same transaction (store), and rebuild/import replace
-    // them atomically. Tier 2 additionally needs the exact resolver, which
+    // "Exactly / no other entity" is read from the stored entity records, not
+    // the capped search index (MAX_LOOKUP_KEYS_PER_MEMORY may drop an alias,
+    // an entity may have no index rows, and an alias may change without a
+    // reindex). Tier 2 additionally needs the resolver, whose variant step
     // reads the capped index; when it cannot see the scope uniquely the row is
     // NOT owned (fails closed). Prefixes are never variants, so
     // "scope-root-child" is never owned by "scope-root".
@@ -5053,40 +5145,13 @@ export class MemoryManager {
       exactKeysById.set(id, keys);
       return keys;
     };
-    // Entities the index may not fully cover, so their payload is always
-    // checked: those with NO index rows (written before the index existed, by
-    // a path that does not index, or whose refresh failed before entity
-    // writes became atomic with their keys) and those at the key cap (aliases
-    // may have been truncated). One bounded pass over the tenant's entities
-    // through the (tenant_id, memory_id) index: at most 64 key probes each.
-    let alwaysCheckIds: string[] | null = null;
-    const uncoveredEntityIds = (): string[] => {
-      if (alwaysCheckIds) return alwaysCheckIds;
-      alwaysCheckIds = (this.db.prepare(`
-        SELECT sm.id FROM shared_memory sm
-        WHERE sm.tenant_id = ? AND sm.memory_type = 'entity'
-          AND (
-            NOT EXISTS (SELECT 1 FROM graph_lookup_keys g WHERE g.tenant_id = sm.tenant_id AND g.memory_id = sm.id)
-            OR EXISTS (
-              SELECT 1 FROM graph_lookup_keys g WHERE g.tenant_id = sm.tenant_id AND g.memory_id = sm.id
-              LIMIT 1 OFFSET ${MemoryManager.MAX_LOOKUP_KEYS_PER_MEMORY - 1}
-            )
-          )
-      `).all(tenantId) as Array<{ id: string }>).map((r) => String(r.id));
-      return alwaysCheckIds;
-    };
-    const exactOwnersByKey = new Map<string, Set<string>>();
-    const exactOwners = (key: string): Set<string> => {
-      let owners = exactOwnersByKey.get(key);
-      if (owners) return owners;
-      const indexed = (this.db.prepare(
-        `SELECT DISTINCT memory_id AS id FROM graph_lookup_keys
-          WHERE tenant_id = ? AND lookup_key = ? AND memory_type = 'entity'`
-      ).all(tenantId, key) as Array<{ id: string }>).map((r) => String(r.id));
-      owners = new Set([...indexed, ...uncoveredEntityIds()].filter((id) => exactKeysOf(id).has(key)));
-      exactOwnersByKey.set(key, owners);
-      return owners;
-    };
+    // Exact owners come from the stored entity records (entityExactOwners),
+    // the same map the resolver uses, so the two never disagree. A read
+    // failure owns nothing (fails closed).
+    const ownerMap = this.entityExactOwners(tenantId);
+    if (ownerMap === null) return empty;
+    const exactOwners = (key: string): Set<string> =>
+      new Set((ownerMap.get(key) ?? []).map((owner) => owner.id));
     const ownKeys = exactKeysOf(entityId);
     const ownsName = new Map<string, boolean>();
     const isOwned = (name: unknown): boolean => {

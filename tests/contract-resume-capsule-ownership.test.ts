@@ -354,14 +354,19 @@ describe('resume ownership scan with a very large alias set', () => {
     const content = JSON.parse(manager.getDb().prepare('SELECT content FROM shared_memory WHERE id = ?').get(entityId).content);
     expect(manager.entityNameAndAliasLookupValues(content).length).toBeGreaterThan(32_766);
     // The search index keeps at most MAX_LOOKUP_KEYS_PER_MEMORY keys per
-    // entity, so the resolver cannot resolve most of 5,500 aliases. Exact
-    // ownership does not depend on that index: every declared alias counts.
+    // entity, so most of 5,500 aliases are not in it. Exact ownership and
+    // resolution read the stored record instead: every declared alias counts.
+    const indexed = new Set((manager.getDb().prepare(
+      'SELECT lookup_key FROM graph_lookup_keys WHERE memory_id = ?'
+    ).all(entityId) as any[]).map((r) => r.lookup_key));
     const resolvesHere = (alias: string) =>
       [...new Set(manager.resolveEntityCandidatesExact(alias, 'default').map((c: any) => c.id))].join() === entityId;
-    const resolvable = aliases.find(resolvesHere);
-    const unresolvable = [...aliases].reverse().find((alias) => !resolvesHere(alias));
+    const resolvable = aliases.find((alias) => indexed.has(alias));
+    const unresolvable = [...aliases].reverse().find((alias) => !indexed.has(alias)); // outside the index
     expect(resolvable).toBeDefined();
     expect(unresolvable).toBeDefined();
+    expect(resolvesHere(resolvable!)).toBe(true);
+    expect(resolvesHere(unresolvable!)).toBe(true);
     const add = async (entityName: string, contents: string, metadata: Record<string, any> = {}) =>
       (await mcpCall(server, 'add_observations', { observations: [{ entityName, contents: [contents], kind: 'capsule', metadata }] })).observations[0].id as string;
     const own = await add(name, 'own capsule');
@@ -394,6 +399,13 @@ describe('resume ownership: payload-checked exact owners, one-directional varian
   const resolvedNames = (name: string) =>
     [...new Set((server.getMemoryManager() as any).resolveEntityCandidatesExact(name, 'default').map((c: any) => c.name))].sort();
 
+  const indexedEntityNames = (key: string) =>
+    [...new Set((server.getMemoryManager().getDb().prepare(
+      `SELECT json_extract(sm.content, '$.name') AS name FROM graph_lookup_keys g
+         JOIN shared_memory sm ON sm.id = g.memory_id
+        WHERE g.lookup_key = ? AND g.memory_type = 'entity'`
+    ).all(key) as any[]).map((r) => r.name))].sort();
+
   beforeAll(() => {
     process.env.ENABLE_ADVANCED_MEMORY = 'false';
     server = new NeuralMCPServer(0, ':memory:');
@@ -415,8 +427,11 @@ describe('resume ownership: payload-checked exact owners, one-directional varian
         { name: b, entityType: 'project', observations: [], aliases: [`initial-b-handle-${s}`] },
       ],
     });
-    // Precondition: the resolver sees only B for the shared name: A's alias is hidden.
-    expect(resolvedNames(shared)).toEqual([b]);
+    // Precondition: the search index has only B for the shared name (A's alias
+    // was dropped at the key cap), yet the resolver reads stored records and
+    // sees both.
+    expect(indexedEntityNames(shared)).toEqual([b]);
+    expect(resolvedNames(shared)).toEqual([a, b].sort());
     const bCapsule = await add(`initial-b-handle-${s}`, 'B capsule under its own handle', { kind: 'capsule' });
     const bDecision = await add(`initial-b-handle-${s}`, 'B decision under its own handle', { kind: 'decision' });
     const sharedCapsule = await add(shared, 'capsule under the shared name', { kind: 'capsule', metadata: { supersedes: [bCapsule, bDecision] } });
@@ -448,7 +463,8 @@ describe('resume ownership: payload-checked exact owners, one-directional varian
     const db = server.getMemoryManager().getDb();
     const aId = (db.prepare(`SELECT id FROM shared_memory WHERE memory_type = 'entity' AND json_extract(content, '$.name') = ?`).get(a) as any).id;
     db.prepare('DELETE FROM graph_lookup_keys WHERE memory_id = ?').run(aId);
-    expect(resolvedNames(shared)).toEqual([b]); // precondition: the index sees only B
+    expect(indexedEntityNames(shared)).toEqual([b]); // precondition: the index has only B
+    expect(resolvedNames(shared)).toEqual([a, b].sort()); // the stored records have both
     const bCapsule = await add(`c31r5-b-handle-${s}`, 'B capsule under its own handle', { kind: 'capsule' });
     const bDecision = await add(`c31r5-b-handle-${s}`, 'B decision under its own handle', { kind: 'decision' });
     const sharedCapsule = await add(shared, 'capsule under the shared name', { kind: 'capsule', metadata: { supersedes: [bCapsule, bDecision] } });
