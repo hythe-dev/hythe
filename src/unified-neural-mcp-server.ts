@@ -2201,14 +2201,21 @@ export class NeuralMCPServer {
             return undefined;
           };
 
+          // Names and types are used only when they are non-empty STRINGS: a
+          // legacy or imported row may carry a number or an array there, which
+          // is never coerced into a name (PR #36: a non-string name owns
+          // nothing) and must not crash string operations below.
+          const nonEmptyString = (value: unknown): string | undefined =>
+            typeof value === 'string' && value ? value : undefined;
+
           const getDomainType = (result: any): string | undefined => {
             const payload = getContentPayload(result);
-            return payload?.entityType || payload?.type;
+            return nonEmptyString(payload?.entityType) ?? nonEmptyString(payload?.type);
           };
 
           const getEntityName = (result: any): string | undefined => {
             const payload = getContentPayload(result);
-            return payload?.name || payload?.entityName;
+            return nonEmptyString(payload?.name) ?? nonEmptyString(payload?.entityName);
           };
 
           const parseMatchedLookupKinds = (value: any): string[] => {

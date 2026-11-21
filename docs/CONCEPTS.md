@@ -102,15 +102,62 @@ newest observation decisions are listed; `observationDecisions` reports
 budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
 without `source`.
 
+`scope.project` and `scope.task` resolve the same way (as do `checkpoint`
+and `discover_related_context`), exact first. Exact owners are read from the
+stored entity records: the canonical name and every top-level declared alias,
+compared case- and punctuation-insensitively. The search index is not used
+for this step, so an alias the index dropped (it keeps at most 64 keys per
+entity), an entity with no index entries, or an alias changed without a
+reindex still counts, and a stale index entry does not.
+
+- One exact owner: the name resolves to it, even when version or suffix
+  siblings exist (`x-v2` and `x-v3`, or `hb-voice` and `hb-voice-v3`).
+- Two or more exact owners: ambiguous. `resolvedScope` lists
+  `ambiguousCandidates`, nothing is read, and a `checkpoint` is refused.
+- No exact owner: a `-vN` or company-suffix variant is tried, through the
+  search index. A missing version can therefore resolve to another version:
+  with only `x-v3` stored, `x-v2` resolves to `x-v3`. Observation ownership
+  (below) is stricter and runs one way only.
+- If the entity records cannot be read, the name does not resolve.
+
+What counts as a stored name: the record is read as JSON the way every
+other reader reads it (if a key appears twice, the last one wins). `name`
+counts only when it is a string; a non-string name (such as a number) owns
+nothing. Aliases count only when `aliases` is a real JSON array, and only its
+string elements. A name held by a private (`message_detail`) entity does not
+resolve, and private names are never listed in `ambiguousCandidates`.
+
+An entity record that is not a valid JSON object owns nothing, and any name
+the search index still links to it does not resolve (it is not handed to
+another entity) until the record is repaired. That includes the index's
+derived forms of its names: a corrupt record that held `cb-x-v2` also blocks
+`cb-x`, so an unrelated, healthy name can come back unresolved. A corrupt
+record the index never linked blocks nothing, but it still owns nothing, so
+a name it should hold may resolve to another entity. `/system/status`
+reports how many such records exist as `databases.sqlite.invalidEntityRows`
+(a count, never content; `null` if the count fails). Any non-zero value
+needs repair, not just watching.
+
+Each resume and checkpoint resolves and reads on one snapshot; checkpoint
+resolves and writes in one IMMEDIATE transaction; nothing is cached across
+calls. Within one call the exact-owner list is built once (one scan of the
+tenant's entity records, roughly 15 to 20 ms with 3,000 entities and 35 to
+45 ms with 8,000) and reused only until the call writes something; after
+that, lookups read fresh. Owner lists are never kept from one call to the
+next. `checkpoint` must not be called inside an open transaction: it refuses
+rather than nesting. If another writer holds the database, it retries a few
+times and then fails with a retryable error, having written nothing. Direct
+SQL on a live server's connection, including TEMP or ATTACH tables that
+shadow `shared_memory`, is unsupported.
+
 Only observations whose `entityName` names the scope entity, and only that
 entity, count. Names are compared case- and punctuation-insensitively:
 
 - **Exact name.** If the name is the canonical name or a declared alias of
   any entity, it belongs to those entities only. It counts for the scope
   when the scope is the only such entity. A name that two entities share
-  exactly counts for neither. Every declared alias is checked, including
-  aliases the search index drops (it keeps at most 64 keys per entity) and
-  entities that have no index entries at all.
+  exactly counts for neither. Exact owners are read from the stored entity
+  records, as for scope resolution above.
 - **Variant**, only when no entity has the name exactly. The name counts when
   removing a trailing `-vN` from it, or adding or removing a company suffix
   (`-llc`, `-inc`, `-corp`, `-co`, `-company`), gives the scope's name or

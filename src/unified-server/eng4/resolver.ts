@@ -8,6 +8,11 @@
  * machinery get_entity_detail uses). Substring and semantic matching are
  * FORBIDDEN here (spec A3; the legacy LOWER-LIKE path is dead in resume).
  *
+ * Exact before variant: a ref that is exactly a canonical name or declared
+ * alias resolves to those entities only; -vN/company-suffix variants apply
+ * only when no entity has the ref exactly (version siblings x-v2/x-v3 or
+ * x/x-v3 each resolve to themselves).
+ *
  * Fail-closed rules (contract-tested):
  * - Unknown ref → ids null, scopeKey null (absence explicit, never an error dump).
  * - Ambiguous ref (multiple distinct entity ids) → scopeKey null +
@@ -34,6 +39,17 @@ export interface EntityDirectory {
   resolveEntityCandidatesExact(name: string, tenantId: string): EntityCandidate[];
   /** Tenant-scoped canonical mailbox identity for an asserted agent id. */
   resolveCanonicalAgent(agentId: string, tenantId: string): { canonical: string; aliases: string[] };
+  /**
+   * Run `fn` on one owner snapshot (MemoryManager.withOwnerSnapshot): every
+   * exact-owner lookup inside sees the same state and the owner catalog is
+   * built once while nothing has been written. Optional for test doubles.
+   */
+  withOwnerSnapshot?<T>(fn: () => T): T;
+}
+
+/** Run `fn` on the directory's owner snapshot when it has one. */
+export function onOwnerSnapshot<T>(directory: Pick<EntityDirectory, 'withOwnerSnapshot'>, fn: () => T): T {
+  return directory.withOwnerSnapshot ? directory.withOwnerSnapshot(fn) : fn();
 }
 
 /** Deterministic storage scope key from resolved entity UUIDs (never names). */

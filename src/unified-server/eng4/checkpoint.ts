@@ -60,7 +60,7 @@ import Ajv from 'ajv';
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, CheckpointOperation, CheckpointParams, CheckpointResult, FactChange, LoopChange, ReconciledBlock, ReconciliationRecord } from './contracts.js';
 import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint, type CheckpointContentEnvelope } from './canonical.js';
-import { resolveScope, type EntityDirectory } from './resolver.js';
+import { onOwnerSnapshot, resolveScope, type EntityDirectory } from './resolver.js';
 import { advancePointerAfterInsert, effectiveCurrentHead, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
 import { memoGet, memoSet, runWithEnvelopeMemo } from './memo.js';
 import { WORKING_STATE } from './schemas.js';
@@ -485,9 +485,63 @@ export function readVerifiedEnvelope(
 }
 
 /**
+ * performCheckpoint was called while the connection already had a
+ * transaction open. Checkpoint resolves and writes in its OWN IMMEDIATE
+ * transaction; better-sqlite3 would turn it into a SAVEPOINT of the outer
+ * (possibly DEFERRED) transaction and silently lose the write lock, so it
+ * refuses instead.
+ */
+export class CheckpointNestingError extends Error {
+  constructor() {
+    super('eng4: checkpoint must not run inside an open transaction (it resolves and writes in its own IMMEDIATE transaction)');
+    this.name = 'CheckpointNestingError';
+  }
+}
+
+/**
+ * Write contention (SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT) persisted through
+ * every bounded attempt. Nothing was written; the caller may retry.
+ */
+export class CheckpointBusyError extends Error {
+  readonly retryable = true;
+  readonly code: string;
+  constructor(code: string, attempts: number) {
+    super(`eng4: checkpoint hit write contention (${code}) on ${attempts} attempts; nothing was written, retry`);
+    this.name = 'CheckpointBusyError';
+    this.code = code;
+  }
+}
+
+/** Bounded attempts for recognized write contention only. */
+export const CHECKPOINT_BUSY_ATTEMPTS = 3;
+
+/**
+ * Test seams for the two-connection race tests: `beforeTransaction` runs
+ * before each attempt's BEGIN IMMEDIATE, `afterResolve` right after scope
+ * resolution inside the transaction. Never set in production.
+ */
+export const checkpointTestHooks: { beforeTransaction?: () => void; afterResolve?: () => void } = {};
+
+function contentionCode(error: unknown): string | null {
+  const code = (error as { code?: unknown })?.code;
+  return typeof code === 'string' && (code === 'SQLITE_BUSY' || code.startsWith('SQLITE_BUSY_')) ? code : null;
+}
+
+/**
  * Perform one checkpoint write. `tenantId` MUST come from the server-side
- * request context (never a caller parameter). The entire decision + write
- * path runs in ONE transaction on the provided connection.
+ * request context (never a caller parameter).
+ *
+ * Scope resolution, envelope preparation and every write run in ONE
+ * IMMEDIATE transaction, which is also the call's owner snapshot: the write
+ * lock is taken before resolving, so no other connection can create a name
+ * collision between resolution and the write (a DEFERRED transaction would
+ * instead fail with SQLITE_BUSY_SNAPSHOT under WAL when another connection
+ * committed first). Nesting contract: it must be called with no transaction
+ * open on `db` (CheckpointNestingError otherwise; never silently degraded).
+ * Recognized contention (SQLITE_BUSY*) rolls back and retries the WHOLE
+ * transaction, resolution included, at most CHECKPOINT_BUSY_ATTEMPTS times,
+ * then fails with the retryable CheckpointBusyError. Other errors propagate
+ * unchanged.
  */
 export function performCheckpoint(
   db: DatabaseType.Database,
@@ -495,7 +549,34 @@ export function performCheckpoint(
   tenantId: string,
   params: CheckpointParams
 ): CheckpointResult {
+  if (db.inTransaction) throw new CheckpointNestingError();
+  let lastCode = 'SQLITE_BUSY';
+  for (let attempt = 1; attempt <= CHECKPOINT_BUSY_ATTEMPTS; attempt++) {
+    try {
+      checkpointTestHooks.beforeTransaction?.();
+      // One verification memo per attempt (H5): payloads are hashed and
+      // parsed once per checkpoint, never cached across calls or attempts.
+      return runWithEnvelopeMemo(() =>
+        db.transaction(() => onOwnerSnapshot(directory, () => checkpointInTransaction(db, directory, tenantId, params))).immediate()
+      );
+    } catch (error) {
+      const code = contentionCode(error);
+      if (code === null) throw error;
+      lastCode = code;
+    }
+  }
+  throw new CheckpointBusyError(lastCode, CHECKPOINT_BUSY_ATTEMPTS);
+}
+
+/** The checkpoint body; runs inside performCheckpoint's IMMEDIATE transaction. */
+function checkpointInTransaction(
+  db: DatabaseType.Database,
+  directory: EntityDirectory,
+  tenantId: string,
+  params: CheckpointParams
+): CheckpointResult {
   const resolved = resolveScope(directory, tenantId, params.scope);
+  checkpointTestHooks.afterResolve?.();
   if (!resolved.scopeKey) {
     throw new CheckpointScopeError(
       resolved.ambiguousCandidates?.length
@@ -528,7 +609,7 @@ export function performCheckpoint(
   const derivesState = operation === 'record' || operation === 'patch';
   if (derivesState) baseEnvelope.state = null;
   // Canonicalization (RFC 8785, fail-closed on malformed input) happens
-  // before the transaction opens — a rejected envelope writes nothing. A
+  // before any write — a rejected envelope writes nothing. A
   // reconcile's envelope additionally carries the reconciliation record,
   // which is derived INSIDE the transaction (§4.2 step 4), so its final bytes
   // and contentHash are computed there; the base envelope is validated here.
@@ -543,11 +624,11 @@ export function performCheckpoint(
   canonicalEnvelopeBytes(baseEnvelope);
   if (operation === 'patch') {
     canonicalize(params.statePatch);
-    applyMergePatch({}, params.statePatch); // prototype keys fail closed before the transaction opens
+    applyMergePatch({}, params.statePatch); // prototype keys fail closed before any write
   }
   const normalized = operation === 'reconcile' ? normalizeReconcileRequest(params) : undefined;
 
-  const run = db.transaction((): CheckpointResult => {
+  const run = (): CheckpointResult => {
     // Parent resolution is a same-scope revision lookup; a revision from
     // another scope is unreachable by construction (wrong-scope = missing).
     const parentRow = params.expectedRevision === null
@@ -814,9 +895,7 @@ export function performCheckpoint(
       ...(resultVersion >= 2 ? { changes } : {}),
       ...(reconciled ? { reconciled } : {}),
     };
-  });
+  };
 
-  // The whole call shares one verification memo (H5): payloads are hashed and
-  // parsed once per checkpoint, never cached across calls.
-  return runWithEnvelopeMemo(run);
+  return run();
 }
