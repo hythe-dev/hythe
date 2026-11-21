@@ -1098,8 +1098,7 @@ describe('checkpoint resolves and writes in one IMMEDIATE transaction (PR #36 ro
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vsib-r6-race-'));
     dbPath = path.join(tmpDir, 'test.db');
     server = new NeuralMCPServer(0, dbPath);
-    // The reported failure (SQLITE_BUSY_SNAPSHOT) is a WAL behavior.
-    server.getMemoryManager().getDb().pragma('journal_mode = WAL');
+    // The server opens its database in WAL (issue #39); the race runs in that mode.
     checkpointMod = await import('../src/unified-server/eng4/checkpoint.js');
   });
 
@@ -1115,7 +1114,7 @@ describe('checkpoint resolves and writes in one IMMEDIATE transaction (PR #36 ro
     entities: [{ name, entityType: 'project', observations: [], aliases: [] }],
   });
 
-  it('the database is in WAL mode for the race', () => {
+  it('the server opened the database in WAL mode (issue #39), so the race runs in WAL', () => {
     expect(String(db().pragma('journal_mode', { simple: true })).toLowerCase()).toBe('wal');
   });
 

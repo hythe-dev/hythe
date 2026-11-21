@@ -23,6 +23,33 @@ to `mixed`, canary and promote each exact principal, then move it to
   a release tag is acceptable only when its locally verified image ID is also
   recorded in the cutover log.
 
+## SQLite journal mode (WAL)
+
+The server runs its database in WAL mode with `synchronous = FULL` (issue
+#39). It switches the file to WAL at every start; while it runs, every other
+connection (CLI tools included) uses WAL too. On a graceful stop it
+checkpoints the WAL and switches the file back to the rollback journal, so a
+stopped database is one self-contained file, as offline tools (migrations,
+sanitation) and file copies expect. Server snapshots are always single-file
+rollback-journal databases.
+
+- While the server runs, the database is three files: `engram.db`,
+  `engram.db-wal` and `engram.db-shm`. Never copy `engram.db` alone from a
+  running server. Back up with the SQLite backup API (`sqlite3 engram.db
+  ".backup <target>"`, or the server's own snapshots).
+- After a crash or a forced stop (`SIGKILL`) the file stays in WAL and the
+  sidecars may remain. Before offline work, open it once with no server
+  running, run `PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;`,
+  and confirm the `-wal` and `-shm` files are gone (the sanitation tool
+  refuses to run while they exist).
+- Restoring a server snapshot needs exclusive use of the database: it
+  checkpoints the WAL first and refuses to run while another connection holds
+  a read open.
+- WAL is not safe on network filesystems (NFS, SMB). The data directory must
+  be a local filesystem (Pavilion binds a local host directory). For a
+  network mount, set `HYTHE_SQLITE_JOURNAL_MODE=delete`; `wal` (the default)
+  and `delete` are the only accepted values.
+
 ## Validate the rendered deployment
 
 Run this on Pavilion before a cutover:

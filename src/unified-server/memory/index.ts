@@ -146,6 +146,7 @@ export class MemoryManager {
   constructor(dbPath: string = './data/unified-platform.db') {
     this.db = new Database(dbPath);
     this.dbPath = dbPath;
+    this.applyJournalMode();
     this.memorySystem = this.createEmptyMemorySystem();
 
     this.initializeDatabase();
@@ -155,6 +156,78 @@ export class MemoryManager {
     this.loadMemoryFromDatabase();
     this.initializeAdvancedSystems();
     this.initializeDualWrite();
+  }
+
+  /**
+   * Journal mode of the server database (issue #39), applied on every open
+   * (startup and snapshot restore) before any schema work.
+   *
+   * WAL by default: readers and the one writer run concurrently, and
+   * checkpoint's IMMEDIATE transaction does not block resume readers. The
+   * mode is stored in the file, so while the server runs every other
+   * connection (CLI tools included) uses WAL too; on graceful close the file
+   * goes back to DELETE (releaseWalForStoppedFile). While running, WAL keeps
+   * `-wal` and `-shm` files next to the database: copy it with the SQLite
+   * backup API (createSnapshot does), not by copying the main file alone. WAL is not safe on network filesystems; set
+   * HYTHE_SQLITE_JOURNAL_MODE=delete for such a mount (the only other value
+   * accepted). `synchronous` is set to FULL on this connection: the bundled
+   * SQLite opens an existing WAL database at NORMAL, which is faster but can
+   * lose the last commits on power loss; FULL keeps the durability the
+   * rollback journal had.
+   *
+   * In-memory databases report `memory` and are left alone. If the mode
+   * cannot be set (another connection holds the file), the server logs a
+   * warning and continues in the file's current mode.
+   */
+  private applyJournalMode(): void {
+    const requested = String(process.env.HYTHE_SQLITE_JOURNAL_MODE ?? '').trim().toLowerCase();
+    if (requested && requested !== 'wal' && requested !== 'delete') {
+      console.warn(`⚠️ Ignoring HYTHE_SQLITE_JOURNAL_MODE=${requested}: only "wal" or "delete" is accepted; using wal`);
+    }
+    const mode = requested === 'delete' ? 'delete' : 'wal';
+    try {
+      const actual = String(this.db.pragma(`journal_mode = ${mode}`, { simple: true })).toLowerCase();
+      if (actual !== mode && actual !== 'memory') {
+        console.warn(`⚠️ SQLite journal_mode is ${actual}, not ${mode}`);
+      }
+      this.db.pragma('synchronous = FULL');
+    } catch (error: any) {
+      console.warn(`⚠️ Could not set SQLite journal_mode=${mode}:`, error?.message || error);
+    }
+  }
+
+  /**
+   * A database that is not being served is kept as ONE file in rollback-
+   * journal mode, so offline tools (migrations, sanitation, file copies) see
+   * no -wal/-shm sidecars: on graceful close (and for every snapshot file)
+   * the WAL is checkpointed and the file switched back to DELETE. The next
+   * startup switches it to WAL again. If another connection still holds the
+   * database the switch cannot happen; the file stays in WAL and a warning
+   * is logged (after a crash it also stays WAL: checkpoint before offline
+   * work, see docs/PAVILION-PRODUCTION.md).
+   */
+  private releaseWalForStoppedFile(db: Database.Database): void {
+    try {
+      if (String(db.pragma('journal_mode', { simple: true })).toLowerCase() !== 'wal') return;
+      db.pragma('wal_checkpoint(TRUNCATE)');
+      const mode = String(db.pragma('journal_mode = DELETE', { simple: true })).toLowerCase();
+      if (mode !== 'delete') console.warn(`⚠️ SQLite database left in journal_mode=${mode} at close`);
+    } catch (error: any) {
+      console.warn('⚠️ Could not switch the SQLite database back to journal_mode=DELETE at close:', error?.message || error);
+    }
+  }
+
+  /**
+   * Before the database file is replaced (restoreSnapshot): checkpoint the
+   * WAL with TRUNCATE so no committed frame is left in the -wal file. Throws
+   * when another connection prevents a complete checkpoint. No-op outside
+   * WAL (SQLite reports log = -1).
+   */
+  private checkpointWalForFileSwap(): void {
+    const [result] = this.db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number; log: number; checkpointed: number }>;
+    if (result && result.log !== -1 && (result.busy !== 0 || result.checkpointed !== result.log)) {
+      throw new Error('restore: another connection is using the database, so its WAL cannot be checkpointed; close it and retry');
+    }
   }
 
   private createEmptyMemorySystem(): MemorySystem {
@@ -2919,6 +2992,7 @@ export class MemoryManager {
   }
 
   async close(): Promise<void> {
+    this.releaseWalForStoppedFile(this.db);
     this.db.close();
     // Embedded vector client does not require explicit closing.
     console.log('🧠 Enhanced memory manager closed');
@@ -6498,6 +6572,14 @@ export class MemoryManager {
 
     // Use better-sqlite3 built-in backup
     await this.db.backup(targetPath);
+    // A snapshot is a stopped database: one self-contained file in
+    // rollback-journal mode, whatever mode the live database runs in.
+    const snapshotDb = new Database(targetPath);
+    try {
+      this.releaseWalForStoppedFile(snapshotDb);
+    } finally {
+      snapshotDb.close();
+    }
 
     const stats = fs.statSync(targetPath);
     const createdAt = now.toISOString();
@@ -6614,6 +6696,14 @@ export class MemoryManager {
     // Create pre-restore safety backup
     const preRestoreBackup = await this.createSnapshot('pre-restore');
 
+    // In WAL mode the -wal file must be folded into the main file and emptied
+    // before the file is replaced: frames left in it would be replayed onto
+    // the restored file at reopen. If another connection is mid-read the
+    // checkpoint cannot finish, and the restore is refused here, before any
+    // cache is cleared or the file is touched. Everything from here to the
+    // close below is synchronous.
+    this.checkpointWalForFileSwap();
+
     // A snapshot replaces every tenant's entity set. Drop both the old cache
     // before the file swap and any references populated during reinitialization
     // after it, so no request can classify observations using the wrong DB.
@@ -6625,7 +6715,7 @@ export class MemoryManager {
       // cannot survive solely in individual/shared/task caches.
       this.resetServedMemoryCaches();
 
-      // Close current DB
+      // Close current DB (its WAL was emptied above).
       this.db.close();
 
       // Copy snapshot over live DB
@@ -6634,6 +6724,7 @@ export class MemoryManager {
       // Reopen — the FK pragma is PER CONNECTION, so the eng4 apply (pragma +
       // idempotent DDL) must run again on this fresh handle.
       this.db = new Database(this.dbPath);
+      this.applyJournalMode();
       this.initializeDatabase();
       applyEng4Schema(this.db);
       this.loadMemoryFromDatabase();
