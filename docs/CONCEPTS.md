@@ -138,11 +138,17 @@ reports how many such records exist as `databases.sqlite.invalidEntityRows`
 (a count, never content; `null` if the count fails). Any non-zero value
 needs repair, not just watching.
 
-The exact-owner list is cached and rebuilt after any database change: a row
-write, or a schema change in the main or temp schema (creating or dropping a
-TEMP table counts), so on a busy server most requests rebuild it:
-roughly 15 to 25 ms per resume with 3,000 entities and 40 to 55 ms with
-8,000; about 2 ms when nothing has changed.
+Each resume and checkpoint resolves and reads on one snapshot; checkpoint
+resolves and writes in one IMMEDIATE transaction; nothing is cached across
+calls. Within one call the exact-owner list is built once (one scan of the
+tenant's entity records, roughly 15 to 20 ms with 3,000 entities and 35 to
+45 ms with 8,000) and reused only until the call writes something; after
+that, lookups read fresh. Owner lists are never kept from one call to the
+next. `checkpoint` must not be called inside an open transaction: it refuses
+rather than nesting. If another writer holds the database, it retries a few
+times and then fails with a retryable error, having written nothing. Direct
+SQL on a live server's connection, including TEMP or ATTACH tables that
+shadow `shared_memory`, is unsupported.
 
 Only observations whose `entityName` names the scope entity, and only that
 entity, count. Names are compared case- and punctuation-insensitively:
