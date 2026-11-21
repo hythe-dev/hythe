@@ -8,6 +8,11 @@
  * machinery get_entity_detail uses). Substring and semantic matching are
  * FORBIDDEN here (spec A3; the legacy LOWER-LIKE path is dead in resume).
  *
+ * Exact before variant: a ref that is exactly a canonical name or declared
+ * alias resolves to those entities only; -vN/company-suffix variants apply
+ * only when no entity has the ref exactly (version siblings x-v2/x-v3 or
+ * x/x-v3 each resolve to themselves).
+ *
  * Fail-closed rules (contract-tested):
  * - Unknown ref → ids null, scopeKey null (absence explicit, never an error dump).
  * - Ambiguous ref (multiple distinct entity ids) → scopeKey null +

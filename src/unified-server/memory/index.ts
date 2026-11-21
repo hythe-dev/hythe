@@ -4778,7 +4778,16 @@ export class MemoryManager {
   ): Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> {
     const queryVariants = new Set(this.entityQueryVariants(entityName));
     if (queryVariants.size === 0) return [];
+    const queryKey = this.normalizeEntityLookup(entityName);
     const candidates: Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> = [];
+    // EXACT before VARIANT (issue #35, version siblings): a name that is
+    // exactly some entity's canonical name or declared alias resolves to
+    // those entities only. Variant matches (-vN stripped, company suffix
+    // added/removed) count only when no entity has the name exactly, so
+    // "x-v2" is not made ambiguous by "x-v3" (both reduce to "x"), and "x" is
+    // not made ambiguous by "x-v3". Two entities sharing the exact name or an
+    // alias stay ambiguous.
+    const exact: typeof candidates = [];
     for (const row of this.findEntitiesByNameOrAlias(entityName, tenantId)) {
       try {
         const content = JSON.parse(row.content || '{}');
@@ -4792,16 +4801,26 @@ export class MemoryManager {
         const isNameOrAlias = isCanonical ||
           this.entityNameAndAliasLookupValues(content).some((v) => queryVariants.has(v));
         if (!isNameOrAlias) continue;
-        candidates.push({
+        const candidate = {
           id: String(row.id),
           name: String(content?.name ?? ''),
-          matchedBy: isCanonical ? 'canonical_name' : 'alias',
-        });
+          matchedBy: (isCanonical ? 'canonical_name' : 'alias') as 'canonical_name' | 'alias',
+        };
+        candidates.push(candidate);
+        if (queryKey) {
+          const exactName = this.normalizeEntityLookup(String(content?.name ?? '')) === queryKey;
+          const exactAlias = !exactName && Array.isArray(content?.aliases) && content.aliases.some(
+            (alias: unknown) => typeof alias === 'string' && this.normalizeEntityLookup(alias) === queryKey
+          );
+          if (exactName || exactAlias) {
+            exact.push({ ...candidate, matchedBy: exactName ? 'canonical_name' : 'alias' });
+          }
+        }
       } catch {
         /* unparseable row: never a candidate */
       }
     }
-    return candidates;
+    return exact.length > 0 ? exact : candidates;
   }
 
   /**

@@ -102,6 +102,13 @@ newest observation decisions are listed; `observationDecisions` reports
 budget and cursor. The frozen v1 bundle lists checkpoint decisions only,
 without `source`.
 
+`scope.project` and `scope.task` resolve the same way, exact first. A name
+that is exactly an entity's canonical name or declared alias resolves to that
+entity, even when version or suffix siblings exist (`x-v2` and `x-v3`, or
+`hb-voice` and `hb-voice-v3`). A `-vN` or company-suffix variant is used only
+when no entity has the name exactly. A name that two entities share exactly is
+ambiguous: `resolvedScope` lists `ambiguousCandidates` and no scope is read.
+
 Only observations whose `entityName` names the scope entity, and only that
 entity, count. Names are compared case- and punctuation-insensitively:
 
