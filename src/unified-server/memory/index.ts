@@ -133,11 +133,14 @@ export class MemoryManager {
   private isDualWriteEnabled: boolean = false;
   private confidentialEntityReferenceCache = new Map<string, Set<string>>();
   /**
-   * Exact-owner map per tenant (normalized name/alias key -> owners), built
-   * from the STORED entity records, valid while the database is unchanged
-   * (see entityExactOwners).
+   * The owner snapshot of the operation in progress (see withOwnerSnapshot):
+   * total_changes() when it opened, and the exact-owner catalogs built while
+   * the counter still had that value. Null between operations; nothing is
+   * cached across calls.
    */
-  private entityExactOwnerCache = new Map<string, { db: Database.Database; stamp: string; catalog: ExactOwnerCatalog }>();
+  private ownerSnapshot: { changesAtOpen: number; catalogs: Map<string, ExactOwnerCatalog> } | null = null;
+  /** Full exact-owner catalog builds (tenant scans) so far: for tests and profiling only. */
+  ownerCatalogBuilds = 0;
   readonly contentSizeThreshold: number = parseInt(process.env.CONTENT_SIZE_THRESHOLD || '51200', 10); // 50KB default
 
   constructor(dbPath: string = './data/unified-platform.db') {
@@ -4801,6 +4804,15 @@ export class MemoryManager {
     entityName: string,
     tenantId: string
   ): Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> {
+    // A bare call opens its own owner snapshot; inside an operation's
+    // snapshot it reuses that one.
+    return this.withOwnerSnapshot(() => this.resolveEntityCandidatesExactInSnapshot(entityName, tenantId));
+  }
+
+  private resolveEntityCandidatesExactInSnapshot(
+    entityName: string,
+    tenantId: string
+  ): Array<{ id: string; name: string; matchedBy: 'canonical_name' | 'alias' }> {
     const queryVariants = new Set(this.entityQueryVariants(entityName));
     if (queryVariants.size === 0) return [];
     // EXACT before VARIANT (issue #35, version siblings). A name that is
@@ -4877,30 +4889,35 @@ export class MemoryManager {
    *    lookup key the index still has for it is BLOCKED (never resolves).
    *  - Deleted entities are gone from shared_memory and own nothing.
    *
-   * Cached per tenant and connection while the database is unchanged (stamp:
-   * PRAGMA data_version for other connections' commits, PRAGMA
-   * schema_version and temp.schema_version for DDL such as a table swap or
-   * a TEMP table shadowing shared_memory, and total_changes() for this
-   * connection's row writes). Inside a transaction the cache may be
-   * READ when the stamp matches but is never POPULATED: a rollback does not
-   * move the stamp back, so a map built from uncommitted rows must not
-   * outlive the transaction. restoreSnapshot clears it. Returns null when
-   * the read fails; callers fail closed.
+   * Built at most once per tenant per owner snapshot (withOwnerSnapshot)
+   * while nothing has been written; never cached across calls. Returns null
+   * when the read fails; callers fail closed.
    */
   private entityExactOwners(tenantId: string): ExactOwnerCatalog | null {
     try {
-      // schema_version moves on main-schema DDL (a table swap by ALTER TABLE
-      // ... RENAME changes no row count on this connection); temp.schema_version
-      // moves when a TEMP table is created or dropped, which can shadow (or
-      // stop shadowing) shared_memory for every unqualified reader.
-      const dataVersion = this.db.pragma('data_version', { simple: true });
-      const schemaVersion = this.db.pragma('schema_version', { simple: true });
-      const tempSchemaVersion = this.db.pragma('temp.schema_version', { simple: true });
-      const changes = (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
-      const stamp = `${dataVersion}:${schemaVersion}:${tempSchemaVersion}:${changes}`;
-      const cached = this.entityExactOwnerCache.get(tenantId);
-      if (cached && cached.db === this.db && cached.stamp === stamp) return cached.catalog;
+      const snapshot = this.ownerSnapshot;
+      // Reuse only while this connection has written nothing since the
+      // snapshot opened. After the first write (which a savepoint may later
+      // roll back without the counter going down) every lookup reads fresh
+      // for the rest of the operation, and nothing built after a write is
+      // kept.
+      const reusable = snapshot !== null && this.totalChanges() === snapshot.changesAtOpen;
+      if (reusable) {
+        const kept = snapshot!.catalogs.get(tenantId);
+        if (kept) return kept;
+      }
+      const catalog = this.buildExactOwnerCatalog(tenantId);
+      if (reusable) snapshot!.catalogs.set(tenantId, catalog);
+      return catalog;
+    } catch (error: any) {
+      console.warn('⚠️ Exact-owner lookup failed; resolution fails closed:', error?.message || error);
+      return null;
+    }
+  }
 
+  /** One full scan of the tenant's entity records (see entityExactOwners). */
+  private buildExactOwnerCatalog(tenantId: string): ExactOwnerCatalog {
+    this.ownerCatalogBuilds++;
       const rows = this.db.prepare(
         `SELECT id, content FROM shared_memory WHERE tenant_id = ? AND memory_type = 'entity'`
       ).all(tenantId) as Array<{ id: string; content: string }>;
@@ -4948,15 +4965,33 @@ export class MemoryManager {
         ).all(tenantId, JSON.stringify(unreadable)) as Array<{ lookup_key: string }>;
         for (const row of blocked) blockedKeys.add(String(row.lookup_key));
       }
-      const catalog = { owners, blockedKeys };
-      if (!this.db.inTransaction) {
-        this.entityExactOwnerCache.set(tenantId, { db: this.db, stamp, catalog });
+    return { owners, blockedKeys };
+  }
+
+  private totalChanges(): number {
+    return (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
+  }
+
+  /**
+   * Run `fn` on ONE owner snapshot: a single transaction in which every
+   * exact-owner lookup sees the same committed state (other connections
+   * cannot change it), and the owner catalog is built once per tenant while
+   * nothing has been written. Nested calls reuse the open snapshot. Inside a
+   * caller's transaction (checkpoint's IMMEDIATE one) no new transaction is
+   * opened: that transaction is the snapshot. The snapshot is dropped in
+   * `finally`; nothing survives the call. `fn` must be synchronous.
+   */
+  withOwnerSnapshot<T>(fn: () => T): T {
+    if (this.ownerSnapshot) return fn();
+    const open = (): T => {
+      this.ownerSnapshot = { changesAtOpen: this.totalChanges(), catalogs: new Map() };
+      try {
+        return fn();
+      } finally {
+        this.ownerSnapshot = null;
       }
-      return catalog;
-    } catch (error: any) {
-      console.warn('⚠️ Exact-owner lookup failed; resolution fails closed:', error?.message || error);
-      return null;
-    }
+    };
+    return this.db.inTransaction ? open() : this.db.transaction(open)();
   }
 
   /** countInvalidEntityRows for status reporting: null when the count fails. */
@@ -5082,10 +5117,11 @@ export class MemoryManager {
     tenantId: string,
     decisionLimit: number = MemoryManager.RESUME_DECISION_OBSERVATION_LIMIT
   ): ScopeObservationSelections {
-    // ONE read transaction: every page of the scan and every ownership lookup
-    // see the same snapshot, so a concurrent writer (WAL) cannot make pages
-    // repeat or skip rows, or change the catalog between ownership checks.
-    return this.db.transaction(() => this.selectScopeObservations(entityId, tenantId, decisionLimit))();
+    // ONE owner snapshot (a read transaction, or the caller's): every page of
+    // the scan and every ownership lookup see the same state, so a concurrent
+    // writer (WAL) cannot make pages repeat or skip rows, or change the
+    // catalog between ownership checks.
+    return this.withOwnerSnapshot(() => this.selectScopeObservations(entityId, tenantId, decisionLimit));
   }
 
   private selectScopeObservations(
@@ -5380,6 +5416,15 @@ export class MemoryManager {
     limit: number = 100,
     expectedEntityId?: string,
   ): { rows: any[]; truncated: boolean; degradedReason?: string; degradedReasons?: string[] } {
+    return this.withOwnerSnapshot(() => this.findRelatedContextObservationsInSnapshot(entityName, tenantId, limit, expectedEntityId));
+  }
+
+  private findRelatedContextObservationsInSnapshot(
+    entityName: string,
+    tenantId: string,
+    limit: number,
+    expectedEntityId?: string,
+  ): { rows: any[]; truncated: boolean; degradedReason?: string; degradedReasons?: string[] } {
     const cap = Math.max(1, Math.min(Math.floor(Number(limit) || 100), 100));
     const { entityId, lookupKeys, truncated: lookupKeysTruncated } =
       this.relatedContextEntityLookupKeys(entityName, tenantId, expectedEntityId);
@@ -5447,6 +5492,15 @@ export class MemoryManager {
     entityName: string,
     tenantId: string,
     limit: number = 200,
+    expectedEntityId?: string,
+  ): { rows: any[]; truncated: boolean; degradedReason?: string; degradedReasons?: string[] } {
+    return this.withOwnerSnapshot(() => this.findRelatedContextRelationsInSnapshot(entityName, tenantId, limit, expectedEntityId));
+  }
+
+  private findRelatedContextRelationsInSnapshot(
+    entityName: string,
+    tenantId: string,
+    limit: number,
     expectedEntityId?: string,
   ): { rows: any[]; truncated: boolean; degradedReason?: string; degradedReasons?: string[] } {
     const cap = Math.max(1, Math.min(Math.floor(Number(limit) || 200), 200));
@@ -6564,7 +6618,6 @@ export class MemoryManager {
     // before the file swap and any references populated during reinitialization
     // after it, so no request can classify observations using the wrong DB.
     this.confidentialEntityReferenceCache.clear();
-    this.entityExactOwnerCache.clear();
     try {
       // All cache branches are served directly by getAgentMemory(),
       // getSharedMemory(), and legacy context builders. Clear the entire
@@ -6587,7 +6640,6 @@ export class MemoryManager {
       this.initializeAdvancedSystems();
     } finally {
       this.confidentialEntityReferenceCache.clear();
-      this.entityExactOwnerCache.clear();
     }
 
     return {

@@ -18,7 +18,7 @@
 import type DatabaseType from 'better-sqlite3';
 import type { SnapshotSelector, StateSnapshot, ChangesSinceQuery } from './contracts.js';
 import { readVerifiedPayload } from './checkpoint.js';
-import { parseScopeKey, resolveScope, type EntityDirectory } from './resolver.js';
+import { onOwnerSnapshot, parseScopeKey, resolveScope, type EntityDirectory } from './resolver.js';
 import { ENGRAM_URI_PATTERN } from './schemas.js';
 
 /** Absence/foreign-tenant/unresolved-scope fetches fail CLOSED as this. */
@@ -109,6 +109,15 @@ const SNAPSHOT_COLS = `state_id, scope_key, revision, parent_state_id, content_h
 
 /** Snapshot fetch by {scope, stateId} XOR {scope, revision} — tenant-keyed. */
 export function fetchSnapshot(
+  db: DatabaseType.Database,
+  directory: EntityDirectory,
+  tenantId: string,
+  selector: SnapshotSelector
+): FetchedSnapshot {
+  return onOwnerSnapshot(directory, () => fetchSnapshotInSnapshot(db, directory, tenantId, selector));
+}
+
+function fetchSnapshotInSnapshot(
   db: DatabaseType.Database,
   directory: EntityDirectory,
   tenantId: string,
@@ -206,6 +215,16 @@ export function changesSince(
   tenantId: string,
   query: ChangesSinceQuery,
   pageSize = 100
+): ChangesSincePage {
+  return onOwnerSnapshot(directory, () => changesSinceInSnapshot(db, directory, tenantId, query, pageSize));
+}
+
+function changesSinceInSnapshot(
+  db: DatabaseType.Database,
+  directory: EntityDirectory,
+  tenantId: string,
+  query: ChangesSinceQuery,
+  pageSize: number
 ): ChangesSincePage {
   const resolved = resolveScope(directory, tenantId, query.scope);
   if (!resolved.scopeKey) throw new ResourceNotFoundError('eng4: changes-since scope did not resolve');

@@ -60,7 +60,7 @@ import { selectV3Values, type V3Selection } from './selection.js';
 import { runWithEnvelopeMemo } from './memo.js';
 import { verifyVersionParity } from './versions.js';
 import { buildHandoffUri, buildMessageUri } from './resource.js';
-import { resolveScope, type EntityDirectory } from './resolver.js';
+import { onOwnerSnapshot, resolveScope, type EntityDirectory } from './resolver.js';
 
 /** Bodies above this inline as null + verifiable handle instead (2(d)). */
 export const MAX_INLINE_MESSAGE_BODY_CHARS = 2000;
@@ -187,7 +187,9 @@ export function performResume(
 ): ResumeBundle {
   // One verification memo per call (H5): every payload is hashed and parsed
   // once per resume; nothing is cached across calls.
-  return runWithEnvelopeMemo(() => performResumeInner(db, directory, tenantId, params));
+  // One owner snapshot per call as well: scope resolution and the capsule /
+  // decision ownership checks read the same state and share one catalog.
+  return runWithEnvelopeMemo(() => onOwnerSnapshot(directory, () => performResumeInner(db, directory, tenantId, params)));
 }
 
 function performResumeInner(

@@ -39,6 +39,17 @@ export interface EntityDirectory {
   resolveEntityCandidatesExact(name: string, tenantId: string): EntityCandidate[];
   /** Tenant-scoped canonical mailbox identity for an asserted agent id. */
   resolveCanonicalAgent(agentId: string, tenantId: string): { canonical: string; aliases: string[] };
+  /**
+   * Run `fn` on one owner snapshot (MemoryManager.withOwnerSnapshot): every
+   * exact-owner lookup inside sees the same state and the owner catalog is
+   * built once while nothing has been written. Optional for test doubles.
+   */
+  withOwnerSnapshot?<T>(fn: () => T): T;
+}
+
+/** Run `fn` on the directory's owner snapshot when it has one. */
+export function onOwnerSnapshot<T>(directory: Pick<EntityDirectory, 'withOwnerSnapshot'>, fn: () => T): T {
+  return directory.withOwnerSnapshot ? directory.withOwnerSnapshot(fn) : fn();
 }
 
 /** Deterministic storage scope key from resolved entity UUIDs (never names). */

@@ -60,7 +60,7 @@ import Ajv from 'ajv';
 import type DatabaseType from 'better-sqlite3';
 import type { CheckpointChanges, CheckpointOperation, CheckpointParams, CheckpointResult, FactChange, LoopChange, ReconciledBlock, ReconciliationRecord } from './contracts.js';
 import { canonicalEnvelopeBytes, canonicalize, envelopeContentHash, requestFingerprint, type CheckpointContentEnvelope } from './canonical.js';
-import { resolveScope, type EntityDirectory } from './resolver.js';
+import { onOwnerSnapshot, resolveScope, type EntityDirectory } from './resolver.js';
 import { advancePointerAfterInsert, effectiveCurrentHead, isRetired, liveHeads, readScopePointer, setPointerOnReconcile } from './heads.js';
 import { memoGet, memoSet, runWithEnvelopeMemo } from './memo.js';
 import { WORKING_STATE } from './schemas.js';
@@ -495,7 +495,7 @@ export function performCheckpoint(
   tenantId: string,
   params: CheckpointParams
 ): CheckpointResult {
-  const resolved = resolveScope(directory, tenantId, params.scope);
+  const resolved = onOwnerSnapshot(directory, () => resolveScope(directory, tenantId, params.scope));
   if (!resolved.scopeKey) {
     throw new CheckpointScopeError(
       resolved.ambiguousCandidates?.length

@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
 import { NeuralMCPServer } from '../src/unified-neural-mcp-server.js';
 import type { RequestContext } from '../src/middleware/auth/types.js';
 import { DEFAULT_REQUEST_CONTEXT } from '../src/middleware/auth/types.js';
@@ -597,20 +598,9 @@ describe('exact-owner catalog edge cases (PR #36 round 3)', () => {
     expect(names(num)).toEqual([num]);
     expect(manager().resolveEntityCandidatesExact(alias, 'default').map((c: any) => c.id)).toEqual([`nsn-${s}`]);
   });
-
-  it('a forged cache entry for another connection is ignored', async () => {
-    const shared = `conn-shared-${s}`;
-    const a = `conn-a-${s}`;
-    await create([{ name: a, aliases: [shared] }, { name: shared }]);
-    expect(names(shared)).toEqual([a, shared].sort()); // warms the cache
-    const entry = manager().entityExactOwnerCache.get('default');
-    const forged = { owners: new Map([[shared, [{ id: idOf(shared), name: shared, viaName: true, confidential: false }]]]), blockedKeys: new Set() };
-    manager().entityExactOwnerCache.set('default', { ...entry, db: {}, catalog: forged });
-    expect(names(shared)).toEqual([a, shared].sort());
-  });
 });
 
-describe('exact-owner cache across snapshot restore (PR #36 round 3, R3)', () => {
+describe('owner lookups across snapshot restore (PR #36 round 3, R3)', () => {
   let server: NeuralMCPServer;
   let tmpDir = '';
   const s = Date.now();
@@ -627,7 +617,7 @@ describe('exact-owner cache across snapshot restore (PR #36 round 3, R3)', () =>
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('restoreSnapshot drops the warmed catalog: a shared name is ambiguous again', async () => {
+  it('after restoreSnapshot a shared name is ambiguous again', async () => {
     const manager = server.getMemoryManager() as any;
     const shared = `r3-shared-${s}`;
     const a = `r3-a-${s}`;
@@ -641,10 +631,9 @@ describe('exact-owner cache across snapshot restore (PR #36 round 3, R3)', () =>
     expect(names()).toEqual([a, shared].sort());
     const snapshot = await manager.createSnapshot(`r3-${s}`);
     await manager.retireEntitiesToTrash([a], 'default', 'r3');
-    expect(names()).toEqual([shared]); // warms a B-only catalog
-    expect(manager.entityExactOwnerCache.size).toBe(1);
+    expect(names()).toEqual([shared]);
+    expect(manager.ownerSnapshot).toBeNull(); // nothing is retained between calls
     await manager.restoreSnapshot(snapshot.snapshotId);
-    expect(manager.entityExactOwnerCache.size).toBe(0);
     expect(names()).toEqual([a, shared].sort());
   });
 });
@@ -948,5 +937,123 @@ describe('search and key-deriving readers with a non-string entity name (PR #36 
     expect(keys.entityId).toBe(id);
     expect(keys.lookupKeys).toContain(alias);
     expect(keys.lookupKeys).not.toContain(arrName);
+  });
+});
+
+/**
+ * PR #36 round 6 (C1): no cross-call owner cache. Each operation runs on one
+ * owner snapshot (MemoryManager.withOwnerSnapshot): one transaction, one
+ * catalog build per tenant while nothing has been written, fresh reads after
+ * any write, nothing retained after the call.
+ */
+describe('owner snapshot per operation (PR #36 round 6, C1)', () => {
+  let server: NeuralMCPServer;
+  let tmpDir = '';
+  const s = Date.now();
+  const agentId = 'snap-agent';
+  const call = async (toolName: string, args: Record<string, any>) => {
+    const result = await (server as any)._handleToolCall(toolName, args);
+    const text = result?.content?.[0]?.text;
+    if (result?.isError) throw new Error(`Tool error: ${text}`);
+    return JSON.parse(text);
+  };
+  const manager = () => server.getMemoryManager() as any;
+  const db = () => server.getMemoryManager().getDb();
+  const create = (entities: Array<{ name: string; aliases?: string[] }>) =>
+    call('create_entities', {
+      entities: entities.map((e) => ({ name: e.name, entityType: 'project', observations: [], aliases: e.aliases ?? [] })),
+    });
+  const idOf = (name: string) =>
+    (db().prepare(`SELECT id FROM shared_memory WHERE memory_type = 'entity' AND json_valid(content) AND json_extract(content, '$.name') = ?`).get(name) as any).id as string;
+  const names = (ref: string) => [...new Set(manager().resolveEntityCandidatesExact(ref, 'default').map((c: any) => c.name))].sort();
+  const setAliases = (id: string, aliases: string[]) =>
+    db().prepare(`UPDATE shared_memory SET content = json_set(content, '$.aliases', json(?)) WHERE id = ?`).run(JSON.stringify(aliases), id);
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vsib-r6-'));
+    server = new NeuralMCPServer(0, path.join(tmpDir, 'test.db'));
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('builds the owner catalog once per resume (v2, v3) and once per checkpoint', async () => {
+    const scope = `cnt-${s}`;
+    await create([{ name: scope, aliases: [`cnt-alias-${s}`] }, { name: `cnt-${s}-v3` }]);
+    for (const [entityName, kind] of [[scope, 'capsule'], [`cnt-alias-${s}`, 'decision'], [`${scope} LLC`, 'note'], [`cnt-${s}-v9`, 'capsule']]) {
+      await call('add_observations', { observations: [{ entityName, contents: [`${kind} row`], kind }] });
+    }
+    for (const resultVersion of [2, 3]) {
+      manager().ownerCatalogBuilds = 0;
+      const bundle = await call('resume', { agentId, scope: { project: scope }, budget: 8000, resultVersion });
+      expect(bundle.resolvedScope.projectId).toBe(idOf(scope));
+      expect(bundle.capsule.candidatesConsidered).toBeGreaterThan(0);
+      expect(manager().ownerCatalogBuilds).toBe(1);
+    }
+    manager().ownerCatalogBuilds = 0;
+    const written = await call('checkpoint', {
+      agentId, scope: { project: scope }, expectedRevision: null, idempotencyKey: `cnt-ckpt-${s}`,
+      state: { objective: 'o', status: 's', owner: agentId, nextActions: [], blockers: [], guardrails: [] },
+    });
+    expect(written.outcome).toBe('written');
+    expect(manager().ownerCatalogBuilds).toBe(1);
+    expect(manager().ownerSnapshot).toBeNull();
+  });
+
+  it('a catalog built after a write inside a savepoint is not reused after ROLLBACK TO / RELEASE', async () => {
+    const shared = `sp-shared-${s}`;
+    const a = `sp-a-${s}`;
+    await create([{ name: a, aliases: [shared] }, { name: shared }]);
+    const aId = idOf(a);
+    manager().withOwnerSnapshot(() => {
+      try {
+        db().transaction(() => {
+          setAliases(aId, []);
+          expect(names(shared)).toEqual([shared]); // built after the write
+          throw new Error('rollback to savepoint');
+        })();
+      } catch { /* rolled back: A holds the alias again */ }
+      expect(names(shared)).toEqual([a, shared].sort());
+    });
+    expect(names(shared)).toEqual([a, shared].sort());
+
+    const shared2 = `sp2-shared-${s}`;
+    const a2 = `sp2-a-${s}`;
+    await create([{ name: a2, aliases: [shared2] }, { name: shared2 }]);
+    const a2Id = idOf(a2);
+    manager().withOwnerSnapshot(() => {
+      expect(names(shared2)).toEqual([a2, shared2].sort()); // kept (no write yet)
+      db().transaction(() => { setAliases(a2Id, []); })(); // RELEASE: the change stays
+      expect(names(shared2)).toEqual([shared2]);
+    });
+    expect(names(shared2)).toEqual([shared2]);
+  });
+
+  it('after a write inside the snapshot (project skeleton insert) later lookups read fresh', async () => {
+    const key = `skel6-${s}`;
+    manager().withOwnerSnapshot(() => {
+      expect(names(key)).toEqual([]);
+      manager().ensureProjectEntity(agentId, key, 'default');
+      expect(names(key)).toEqual([key]);
+    });
+  });
+
+  it('nothing survives across calls: a commit from another connection is seen by the next call', async () => {
+    const shared = `xc-shared-${s}`;
+    const a = `xc-a-${s}`;
+    await create([{ name: a, aliases: [shared] }, { name: shared }]);
+    expect(names(shared)).toEqual([a, shared].sort());
+    expect(manager().ownerSnapshot).toBeNull();
+    const other = new Database(path.join(tmpDir, 'test.db'));
+    try {
+      other.prepare(`UPDATE shared_memory SET content = json_set(content, '$.aliases', json('[]')) WHERE id = ?`).run(idOf(a));
+    } finally {
+      other.close();
+    }
+    expect(names(shared)).toEqual([shared]);
   });
 });

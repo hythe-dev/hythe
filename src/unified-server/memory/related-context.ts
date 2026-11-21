@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import type { ScopeRef, ResolvedScope } from '../eng4/contracts.js';
-import { resolveScope, type EntityDirectory } from '../eng4/resolver.js';
+import { onOwnerSnapshot, resolveScope, type EntityDirectory } from '../eng4/resolver.js';
 import type { SearchResult } from '../types/memory.js';
 
 export const RELATED_CONTEXT_LIMITS = Object.freeze({
@@ -392,7 +392,9 @@ export async function performRelatedContextDiscovery(
     RELATED_CONTEXT_LIMITS.maxBudget,
   );
 
-  const resolvedScope: ResolvedScope = resolveScope(directory, tenantId, scope);
+  // Discovery awaits the semantic backend, so it runs on two owner snapshots:
+  // one for scope resolution here, one for the synchronous graph phase below.
+  const resolvedScope: ResolvedScope = onOwnerSnapshot(directory, () => resolveScope(directory, tenantId, scope));
   const coverage = emptyCoverage(candidateLimit, graphDepth, requestedBudget, budget);
   const baseEnvelope = {
     schemaVersion: 1,
@@ -491,260 +493,263 @@ export async function performRelatedContextDiscovery(
     if (semanticTimer) clearTimeout(semanticTimer);
   }
 
-  let semanticSeedsAttached = 0;
-  let semanticSeedsRootFiltered = 0;
-  for (const result of semanticSearch.results.slice(0, semanticFetchLimit)) {
-    if (semanticSeedsAttached >= semanticAttachBudget) break;
-    examinedCount++;
-    const memoryType = String(result.memoryType || '').trim().toLowerCase();
-    if (!['entity', 'observation', 'relation'].includes(memoryType)) continue;
-    const payload = parseContent(result.content);
-    if (!payload || directory.isConfidentialGraphRow(memoryType, payload, tenantId)) continue;
-    const similarity = clampScore(result.semanticSimilarity);
-    let attached = false;
-    let rootTouched = false;
-    for (const reference of semanticEntityReferences(memoryType, payload)) {
-      const entity = uniqueEntityForReference(directory, tenantId, reference, entityReferenceCache);
-      if (!entity) continue;
-      if (rootIdSet.has(entity.id)) {
-        rootTouched = true;
-        continue;
+  const graphPhase = (): Record<string, any> => {
+    let semanticSeedsAttached = 0;
+    let semanticSeedsRootFiltered = 0;
+    for (const result of semanticSearch.results.slice(0, semanticFetchLimit)) {
+      if (semanticSeedsAttached >= semanticAttachBudget) break;
+      examinedCount++;
+      const memoryType = String(result.memoryType || '').trim().toLowerCase();
+      if (!['entity', 'observation', 'relation'].includes(memoryType)) continue;
+      const payload = parseContent(result.content);
+      if (!payload || directory.isConfidentialGraphRow(memoryType, payload, tenantId)) continue;
+      const similarity = clampScore(result.semanticSimilarity);
+      let attached = false;
+      let rootTouched = false;
+      for (const reference of semanticEntityReferences(memoryType, payload)) {
+        const entity = uniqueEntityForReference(directory, tenantId, reference, entityReferenceCache);
+        if (!entity) continue;
+        if (rootIdSet.has(entity.id)) {
+          rootTouched = true;
+          continue;
+        }
+        const candidate = ensureCandidate(entity);
+        if (!candidate) continue;
+        attached = true;
+        if (!candidate.semanticMatches.some((match) => match.memoryId === result.id)) {
+          candidate.semanticMatches.push({
+            memoryId: String(result.id),
+            memoryType,
+            similarity,
+            createdBy: exactString(result.source?.replace(/^sqlite-vec:/, ''), 100),
+            createdAt: asIsoString(result.timestamp),
+          });
+        }
       }
-      const candidate = ensureCandidate(entity);
-      if (!candidate) continue;
-      attached = true;
-      if (!candidate.semanticMatches.some((match) => match.memoryId === result.id)) {
-        candidate.semanticMatches.push({
-          memoryId: String(result.id),
-          memoryType,
-          similarity,
-          createdBy: exactString(result.source?.replace(/^sqlite-vec:/, ''), 100),
-          createdAt: asIsoString(result.timestamp),
-        });
-      }
+      if (attached) semanticSeedsAttached++;
+      else if (rootTouched) semanticSeedsRootFiltered++;
     }
-    if (attached) semanticSeedsAttached++;
-    else if (rootTouched) semanticSeedsRootFiltered++;
-  }
-  // Backend success with zero candidate attribution is a starved leg, not a
-  // healthy one. Say so instead of letting the ranking silently degenerate to
-  // graph adjacency.
-  const semanticStarved = semanticSearch.results.length > 0 && semanticSeedsAttached === 0;
-  const semanticDegraded = semanticSearch.degraded || semanticStarved;
-  const semanticReasons = semanticStarved
-    ? [...semanticSearch.reasons, semanticSeedsRootFiltered > 0
-        ? 'semantic_seeds_root_scope_only'
-        : 'semantic_seeds_unattributable']
-    : [...semanticSearch.reasons];
+    // Backend success with zero candidate attribution is a starved leg, not a
+    // healthy one. Say so instead of letting the ranking silently degenerate to
+    // graph adjacency.
+    const semanticStarved = semanticSearch.results.length > 0 && semanticSeedsAttached === 0;
+    const semanticDegraded = semanticSearch.degraded || semanticStarved;
+    const semanticReasons = semanticStarved
+      ? [...semanticSearch.reasons, semanticSeedsRootFiltered > 0
+          ? 'semantic_seeds_root_scope_only'
+          : 'semantic_seeds_unattributable']
+      : [...semanticSearch.reasons];
 
-  let graphDegraded = false;
-  const graphReasons: string[] = [];
-  const scannedRelationIds = new Set<string>();
-  const bestHop = new Map<string, number>(rootEntities.map((entity) => [entity.id, 0]));
-  const queue = rootEntities.map((entity) => ({ entity, path: null as GraphPath | null }));
+    let graphDegraded = false;
+    const graphReasons: string[] = [];
+    const scannedRelationIds = new Set<string>();
+    const bestHop = new Map<string, number>(rootEntities.map((entity) => [entity.id, 0]));
+    const queue = rootEntities.map((entity) => ({ entity, path: null as GraphPath | null }));
 
-  try {
-    while (queue.length > 0 && scannedRelationIds.size < RELATED_CONTEXT_LIMITS.maxGraphEdges) {
-      const state = queue.shift()!;
-      const stateHop = bestHop.get(state.entity.id) ?? 0;
-      if (stateHop >= graphDepth) continue;
-      const remainingEdges = RELATED_CONTEXT_LIMITS.maxGraphEdges - scannedRelationIds.size;
-      const relationPage = directory.findRelatedContextRelations(
-        state.entity.name,
-        tenantId,
-        remainingEdges,
-        state.entity.id,
-      );
-      const relationDegradedReasons = relationPage.degradedReasons
-        ?? (relationPage.degradedReason ? [relationPage.degradedReason] : []);
-      if (relationDegradedReasons.length > 0) {
-        graphDegraded = true;
-        graphReasons.push(...relationDegradedReasons);
+    try {
+      while (queue.length > 0 && scannedRelationIds.size < RELATED_CONTEXT_LIMITS.maxGraphEdges) {
+        const state = queue.shift()!;
+        const stateHop = bestHop.get(state.entity.id) ?? 0;
+        if (stateHop >= graphDepth) continue;
+        const remainingEdges = RELATED_CONTEXT_LIMITS.maxGraphEdges - scannedRelationIds.size;
+        const relationPage = directory.findRelatedContextRelations(
+          state.entity.name,
+          tenantId,
+          remainingEdges,
+          state.entity.id,
+        );
+        const relationDegradedReasons = relationPage.degradedReasons
+          ?? (relationPage.degradedReason ? [relationPage.degradedReason] : []);
+        if (relationDegradedReasons.length > 0) {
+          graphDegraded = true;
+          graphReasons.push(...relationDegradedReasons);
+        }
+        if (relationPage.truncated) {
+          graphDegraded = true;
+          graphReasons.push('graph_edge_limit_reached');
+        }
+        const rows = relationPage.rows;
+        for (const row of rows) {
+          const relationId = String(row.id || '');
+          if (!relationId || scannedRelationIds.has(relationId)) continue;
+          if (scannedRelationIds.size >= RELATED_CONTEXT_LIMITS.maxGraphEdges) break;
+          scannedRelationIds.add(relationId);
+          examinedCount++;
+          const payload = parseContent(row.content);
+          if (!payload || directory.isConfidentialGraphRow('relation', payload, tenantId)) continue;
+          if (typeof payload.from !== 'string' || typeof payload.to !== 'string') continue;
+          const fromEntity = uniqueEntityForReference(directory, tenantId, payload.from, entityReferenceCache);
+          const toEntity = uniqueEntityForReference(directory, tenantId, payload.to, entityReferenceCache);
+          if (!fromEntity || !toEntity) continue;
+          const other = fromEntity.id === state.entity.id
+            ? toEntity
+            : (toEntity.id === state.entity.id ? fromEntity : null);
+          if (!other || other.id === state.entity.id) continue;
+          const relationType = exactString(payload.relationType, 200);
+          if (!relationType) continue;
+
+          const edge = {
+            id: relationId,
+            relationType,
+            from: fromEntity.name,
+            to: toEntity.name,
+            createdBy: exactString(row.created_by, 100),
+            createdAt: asIsoString(row.created_at),
+          };
+          const path: GraphPath = state.path
+            ? {
+                hops: state.path.hops + 1,
+                nodes: [...state.path.nodes, other.name],
+                edges: [...state.path.edges, edge],
+              }
+            : {
+                hops: 1,
+                nodes: [state.entity.name, other.name],
+                edges: [edge],
+              };
+
+          if (!rootIdSet.has(other.id)) {
+            const candidate = ensureCandidate(other);
+            if (candidate && candidate.paths.length < 3 && !candidate.paths.some((known) =>
+              known.edges.map((knownEdge) => knownEdge.id).join('|') === path.edges.map((pathEdge) => pathEdge.id).join('|')
+            )) {
+              candidate.paths.push(path);
+            }
+          }
+
+          const nextHop = stateHop + 1;
+          const previousHop = bestHop.get(other.id);
+          if (nextHop < graphDepth && (previousHop === undefined || nextHop < previousHop)) {
+            bestHop.set(other.id, nextHop);
+            queue.push({ entity: other, path });
+          }
+        }
       }
-      if (relationPage.truncated) {
+      if (queue.length > 0 && scannedRelationIds.size >= RELATED_CONTEXT_LIMITS.maxGraphEdges) {
         graphDegraded = true;
         graphReasons.push('graph_edge_limit_reached');
       }
-      const rows = relationPage.rows;
-      for (const row of rows) {
-        const relationId = String(row.id || '');
-        if (!relationId || scannedRelationIds.has(relationId)) continue;
-        if (scannedRelationIds.size >= RELATED_CONTEXT_LIMITS.maxGraphEdges) break;
-        scannedRelationIds.add(relationId);
-        examinedCount++;
-        const payload = parseContent(row.content);
-        if (!payload || directory.isConfidentialGraphRow('relation', payload, tenantId)) continue;
-        if (typeof payload.from !== 'string' || typeof payload.to !== 'string') continue;
-        const fromEntity = uniqueEntityForReference(directory, tenantId, payload.from, entityReferenceCache);
-        const toEntity = uniqueEntityForReference(directory, tenantId, payload.to, entityReferenceCache);
-        if (!fromEntity || !toEntity) continue;
-        const other = fromEntity.id === state.entity.id
-          ? toEntity
-          : (toEntity.id === state.entity.id ? fromEntity : null);
-        if (!other || other.id === state.entity.id) continue;
-        const relationType = exactString(payload.relationType, 200);
-        if (!relationType) continue;
+    } catch {
+      graphDegraded = true;
+      graphReasons.push('graph_discovery_failed');
+    }
 
-        const edge = {
-          id: relationId,
-          relationType,
-          from: fromEntity.name,
-          to: toEntity.name,
-          createdBy: exactString(row.created_by, 100),
-          createdAt: asIsoString(row.created_at),
-        };
-        const path: GraphPath = state.path
-          ? {
-              hops: state.path.hops + 1,
-              nodes: [...state.path.nodes, other.name],
-              edges: [...state.path.edges, edge],
-            }
-          : {
-              hops: 1,
-              nodes: [state.entity.name, other.name],
-              edges: [edge],
-            };
+    const scored = [...candidateMap.values()].map((candidate) => {
+      candidate.semanticMatches.sort((left, right) =>
+        (right.similarity ?? -1) - (left.similarity ?? -1)
+        || left.memoryId.localeCompare(right.memoryId)
+      );
+      candidate.paths.sort((left, right) =>
+        left.hops - right.hops
+        || left.edges.map((edge) => edge.id).join('|').localeCompare(right.edges.map((edge) => edge.id).join('|'))
+      );
+      const semanticValues = candidate.semanticMatches
+        .map((match) => match.similarity)
+        .filter((value): value is number => value !== null);
+      const semantic = semanticValues.length > 0 ? Math.max(...semanticValues) : null;
+      const graph = candidate.paths.length > 0
+        ? Math.max(...candidate.paths.map((path) => 1 / path.hops))
+        : 0;
 
-        if (!rootIdSet.has(other.id)) {
-          const candidate = ensureCandidate(other);
-          if (candidate && candidate.paths.length < 3 && !candidate.paths.some((known) =>
-            known.edges.map((knownEdge) => knownEdge.id).join('|') === path.edges.map((pathEdge) => pathEdge.id).join('|')
-          )) {
-            candidate.paths.push(path);
-          }
-        }
+      return {
+        candidate,
+        semantic,
+        graph: roundScore(graph),
+        combined: roundScore(0.7 * (semantic ?? 0) + 0.3 * graph),
+      };
+    }).sort((left, right) =>
+      right.combined - left.combined
+      || (right.semantic ?? -1) - (left.semantic ?? -1)
+      || right.graph - left.graph
+      || left.candidate.entity.id.localeCompare(right.candidate.entity.id)
+    );
 
-        const nextHop = stateHop + 1;
-        const previousHop = bestHop.get(other.id);
-        if (nextHop < graphDepth && (previousHop === undefined || nextHop < previousHop)) {
-          bestHop.set(other.id, nextHop);
-          queue.push({ entity: other, path });
-        }
+    const limited = scored.slice(0, candidateLimit).map((scoredCandidate, index) => {
+      const { candidate, semantic, graph, combined } = scoredCandidate;
+      const currentness = currentnessForCandidate(directory, tenantId, candidate);
+      for (const reason of currentness.degradedReasons) {
+        graphDegraded = true;
+        graphReasons.push(reason);
       }
-    }
-    if (queue.length > 0 && scannedRelationIds.size >= RELATED_CONTEXT_LIMITS.maxGraphEdges) {
-      graphDegraded = true;
-      graphReasons.push('graph_edge_limit_reached');
-    }
-  } catch {
-    graphDegraded = true;
-    graphReasons.push('graph_discovery_failed');
-  }
-
-  const scored = [...candidateMap.values()].map((candidate) => {
-    candidate.semanticMatches.sort((left, right) =>
-      (right.similarity ?? -1) - (left.similarity ?? -1)
-      || left.memoryId.localeCompare(right.memoryId)
-    );
-    candidate.paths.sort((left, right) =>
-      left.hops - right.hops
-      || left.edges.map((edge) => edge.id).join('|').localeCompare(right.edges.map((edge) => edge.id).join('|'))
-    );
-    const semanticValues = candidate.semanticMatches
-      .map((match) => match.similarity)
-      .filter((value): value is number => value !== null);
-    const semantic = semanticValues.length > 0 ? Math.max(...semanticValues) : null;
-    const graph = candidate.paths.length > 0
-      ? Math.max(...candidate.paths.map((path) => 1 / path.hops))
-      : 0;
-
-    return {
-      candidate,
-      semantic,
-      graph: roundScore(graph),
-      combined: roundScore(0.7 * (semantic ?? 0) + 0.3 * graph),
-    };
-  }).sort((left, right) =>
-    right.combined - left.combined
-    || (right.semantic ?? -1) - (left.semantic ?? -1)
-    || right.graph - left.graph
-    || left.candidate.entity.id.localeCompare(right.candidate.entity.id)
-  );
-
-  const limited = scored.slice(0, candidateLimit).map((scoredCandidate, index) => {
-    const { candidate, semantic, graph, combined } = scoredCandidate;
-    const currentness = currentnessForCandidate(directory, tenantId, candidate);
-    for (const reason of currentness.degradedReasons) {
-      graphDegraded = true;
-      graphReasons.push(reason);
-    }
-    const provenanceMap = new Map<string, any>();
-    for (const match of candidate.semanticMatches.slice(0, 5)) {
-      provenanceMap.set(`memory:${match.memoryId}`, {
-        memoryId: match.memoryId,
-        memoryType: match.memoryType,
-        createdBy: match.createdBy,
-        createdAt: match.createdAt,
-      });
-    }
-    for (const path of candidate.paths.slice(0, 3)) {
-      for (const edge of path.edges) {
-        provenanceMap.set(`relation:${edge.id}`, {
-          memoryId: edge.id,
-          memoryType: 'relation',
-          createdBy: edge.createdBy,
-          createdAt: edge.createdAt,
+      const provenanceMap = new Map<string, any>();
+      for (const match of candidate.semanticMatches.slice(0, 5)) {
+        provenanceMap.set(`memory:${match.memoryId}`, {
+          memoryId: match.memoryId,
+          memoryType: match.memoryType,
+          createdBy: match.createdBy,
+          createdAt: match.createdAt,
         });
       }
-    }
-    if (currentness.currentness.currentObservation) {
-      const current = currentness.currentness.currentObservation;
-      provenanceMap.set(`observation:${current.id}`, {
-        memoryId: current.id,
-        memoryType: 'observation',
-        createdBy: currentness.currentProvenance?.createdBy ?? null,
-        createdAt: currentness.currentProvenance?.createdAt ?? null,
-      });
-    }
+      for (const path of candidate.paths.slice(0, 3)) {
+        for (const edge of path.edges) {
+          provenanceMap.set(`relation:${edge.id}`, {
+            memoryId: edge.id,
+            memoryType: 'relation',
+            createdBy: edge.createdBy,
+            createdAt: edge.createdAt,
+          });
+        }
+      }
+      if (currentness.currentness.currentObservation) {
+        const current = currentness.currentness.currentObservation;
+        provenanceMap.set(`observation:${current.id}`, {
+          memoryId: current.id,
+          memoryType: 'observation',
+          createdBy: currentness.currentProvenance?.createdBy ?? null,
+          createdAt: currentness.currentProvenance?.createdAt ?? null,
+        });
+      }
 
-    return {
-      rank: 0,
-      entity: candidate.entity,
-      scores: {
-        semantic,
-        graph,
-        combined,
+      return {
+        rank: 0,
+        entity: candidate.entity,
+        scores: {
+          semantic,
+          graph,
+          combined,
+        },
+        explanation: {
+          semanticMatches: candidate.semanticMatches.slice(0, 5).map(({ memoryId, memoryType, similarity }) => ({
+            memoryId,
+            memoryType,
+            similarity,
+          })),
+          paths: candidate.paths.slice(0, 3).map((path) => ({
+            hops: path.hops,
+            nodes: path.nodes,
+            edges: path.edges.map(({ id, relationType, from, to }) => ({ id, relationType, from, to })),
+          })),
+          currentness: currentness.currentness,
+          evidenceRefs: currentness.evidenceRefs,
+          sourceRefs: currentness.sourceRefs,
+          contradictions: currentness.contradictions,
+          referenceCoverage: currentness.referenceCoverage,
+          provenance: [...provenanceMap.values()].slice(0, 12),
+        },
+      };
+    });
+
+    limited.forEach((candidate, index) => { candidate.rank = index + 1; });
+    const reasons = [...new Set([...semanticReasons, ...graphReasons])].sort();
+    const result = {
+      ...baseEnvelope,
+      candidates: limited,
+      degraded: {
+        semantic: semanticDegraded,
+        graph: graphDegraded,
+        reasons,
       },
-      explanation: {
-        semanticMatches: candidate.semanticMatches.slice(0, 5).map(({ memoryId, memoryType, similarity }) => ({
-          memoryId,
-          memoryType,
-          similarity,
-        })),
-        paths: candidate.paths.slice(0, 3).map((path) => ({
-          hops: path.hops,
-          nodes: path.nodes,
-          edges: path.edges.map(({ id, relationType, from, to }) => ({ id, relationType, from, to })),
-        })),
-        currentness: currentness.currentness,
-        evidenceRefs: currentness.evidenceRefs,
-        sourceRefs: currentness.sourceRefs,
-        contradictions: currentness.contradictions,
-        referenceCoverage: currentness.referenceCoverage,
-        provenance: [...provenanceMap.values()].slice(0, 12),
+      coverage: {
+        ...coverage,
+        examinedCount,
+        rankedCount: scored.length,
+        returnedCount: limited.length,
+        truncated: scored.length > limited.length,
+        omittedReason: scored.length > limited.length ? 'limit' as const : 'none' as const,
       },
     };
-  });
-
-  limited.forEach((candidate, index) => { candidate.rank = index + 1; });
-  const reasons = [...new Set([...semanticReasons, ...graphReasons])].sort();
-  const result = {
-    ...baseEnvelope,
-    candidates: limited,
-    degraded: {
-      semantic: semanticDegraded,
-      graph: graphDegraded,
-      reasons,
-    },
-    coverage: {
-      ...coverage,
-      examinedCount,
-      rankedCount: scored.length,
-      returnedCount: limited.length,
-      truncated: scored.length > limited.length,
-      omittedReason: scored.length > limited.length ? 'limit' as const : 'none' as const,
-    },
+    result.coverage.tokenEstimate = Math.ceil(JSON.stringify(result).length / 4);
+    return result;
   };
-  result.coverage.tokenEstimate = Math.ceil(JSON.stringify(result).length / 4);
-  return result;
+  return onOwnerSnapshot(directory, graphPhase);
 }
