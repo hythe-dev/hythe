@@ -817,3 +817,136 @@ describe('exact-owner cache sees a same-connection table swap (PR #36 round 4, F
     expect((db.prepare('SELECT COUNT(*) AS c FROM eng4_state_snapshots').get() as any).c).toBe(before);
   });
 });
+
+/**
+ * PR #36 round 5: a TEMP table can shadow shared_memory for every unqualified
+ * reader without moving total_changes() or the main schema_version, so the
+ * cache stamp includes temp.schema_version. Search must not crash on (or
+ * list under) a non-string name, and the two readers that derive keys from a
+ * stored name skip non-string names.
+ */
+describe('exact-owner cache sees a TEMP table shadowing shared_memory (PR #36 round 5)', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('creating a TEMP shadow rebuilds the catalog (ambiguous, checkpoint refused); dropping it rebuilds again', async () => {
+    const manager = server.getMemoryManager() as any;
+    const db = server.getMemoryManager().getDb();
+    const shared = `tmp-shared-${s}`;
+    const a = `tmp-a-${s}`;
+    const call = async (toolName: string, args: Record<string, any>) => (server as any)._handleToolCall(toolName, args);
+    await call('create_entities', {
+      entities: [
+        { name: a, entityType: 'project', observations: [], aliases: [shared] },
+        { name: shared, entityType: 'project', observations: [], aliases: [] },
+      ],
+    });
+    const names = () => [...new Set(manager.resolveEntityCandidatesExact(shared, 'default').map((c: any) => c.name))].sort();
+    const bId = (db.prepare(`SELECT id FROM shared_memory WHERE json_extract(content, '$.name') = ?`).get(shared) as any).id;
+    const aId = (db.prepare(`SELECT id FROM shared_memory WHERE json_extract(content, '$.name') = ?`).get(a) as any).id;
+    db.exec('CREATE TABLE main.shadow_copy AS SELECT * FROM main.shared_memory'); // A still holds the alias here
+    db.prepare(`UPDATE main.shared_memory SET content = json_set(content, '$.aliases', json('[]')) WHERE id = ?`).run(aId);
+    expect(names()).toEqual([shared]); // warms a B-only catalog
+    const snapshots = () => (db.prepare('SELECT COUNT(*) AS c FROM eng4_state_snapshots').get() as any).c as number;
+    const before = snapshots();
+
+    // (create) the TEMP table hides the real one: A holds the alias again.
+    db.exec('CREATE TEMP TABLE shared_memory AS SELECT * FROM main.shadow_copy');
+    expect(names()).toEqual([a, shared].sort());
+    for (const version of [2, 3]) {
+      const result = await call('resume', { agentId: 'tmp-agent', scope: { project: shared }, budget: 8000, resultVersion: version });
+      const bundle = JSON.parse(result.content[0].text);
+      expect(bundle.resolvedScope.scopeKey).toBeNull();
+      expect(bundle.resolvedScope.ambiguousCandidates).toEqual([a, shared].sort());
+    }
+    const refused = await call('checkpoint', {
+      agentId: 'tmp-agent', scope: { project: shared }, expectedRevision: null, idempotencyKey: `tmp-${s}`,
+      state: { objective: 'o', status: 's', owner: 'tmp-agent', nextActions: [], blockers: [], guardrails: [] },
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toMatch(/ambiguous/);
+    expect(snapshots()).toBe(before);
+
+    // (drop) the real table is visible again: B alone.
+    db.exec('DROP TABLE temp.shared_memory');
+    expect(names()).toEqual([shared]);
+    const result = await call('resume', { agentId: 'tmp-agent', scope: { project: shared }, budget: 8000, resultVersion: 2 });
+    expect(JSON.parse(result.content[0].text).resolvedScope.projectId).toBe(bId);
+  });
+});
+
+describe('search and key-deriving readers with a non-string entity name (PR #36 round 5)', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+  const call = async (toolName: string, args: Record<string, any>) => {
+    const result = await (server as any)._handleToolCall(toolName, args);
+    const text = result?.content?.[0]?.text;
+    if (result?.isError) throw new Error(`Tool error: ${text}`);
+    return JSON.parse(text);
+  };
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('search_entities (exact, semantic, hybrid) does not crash on an imported array name and never lists it under that name', async () => {
+    const name = `srch-imported-${s}`;
+    await (server.getMemoryManager() as any).importEntities({
+      schemaVersion: 1,
+      entities: [{
+        id: `srch-${s}`,
+        content: JSON.stringify({ name: [name], entityType: ['project'], aliases: [], metadata: { aliases: [name] } }),
+        created_by: 'r5', tags: '[]', created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }],
+      observations: [],
+      relations: [],
+    }, 'default');
+    for (const searchType of ['exact', 'semantic', 'hybrid']) {
+      const found = await call('search_entities', { query: name, searchType, compact: false });
+      const text = JSON.stringify(found);
+      expect(text).not.toContain(`"canonicalEntityName":["${name}"]`);
+      for (const r of found.results ?? []) {
+        expect(r.canonicalEntityName === undefined || typeof r.canonicalEntityName === 'string').toBe(true);
+      }
+    }
+  });
+
+  it('observation lookup and related-context keys never derive keys from a non-string name', async () => {
+    const orig = `kd-orig-${s}`;
+    const alias = `kd-alias-${s}`;
+    const arrName = `kd-arr-${s}`;
+    await call('create_entities', { entities: [{ name: orig, entityType: 'project', observations: [], aliases: [alias] }] });
+    const manager = server.getMemoryManager() as any;
+    const db = server.getMemoryManager().getDb();
+    const id = (db.prepare(`SELECT id FROM shared_memory WHERE json_extract(content, '$.name') = ?`).get(orig) as any).id;
+    // The name becomes an array without a reindex; the alias index row stays.
+    db.prepare(`UPDATE shared_memory SET content = json_set(content, '$.name', json(?)) WHERE id = ?`).run(JSON.stringify([arrName]), id);
+    const stray = (await call('add_observations', { observations: [{ entityName: arrName, contents: ['filed under the array name text'] }] }))
+      .observations[0].id as string;
+    // entityNameLookupValuesForQuery: the entity found through its alias must
+    // not contribute String(["kd-arr-…"]) as a lookup value.
+    expect([...manager.entityNameLookupValuesForQuery(alias, 'default')]).not.toContain(arrName);
+    expect(manager.findObservationsByEntityOrAlias(alias, 'default').map((r: any) => r.id)).not.toContain(stray);
+    // related-context lookup keys for the resolved entity: aliases only.
+    const keys = manager.relatedContextEntityLookupKeys(alias, 'default', id);
+    expect(keys.entityId).toBe(id);
+    expect(keys.lookupKeys).toContain(alias);
+    expect(keys.lookupKeys).not.toContain(arrName);
+  });
+});

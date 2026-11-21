@@ -138,8 +138,9 @@ reports how many such records exist as `databases.sqlite.invalidEntityRows`
 (a count, never content; `null` if the count fails). Any non-zero value
 needs repair, not just watching.
 
-The exact-owner list is cached and rebuilt after any database change (a row
-write or a schema change), so on a busy server most requests rebuild it:
+The exact-owner list is cached and rebuilt after any database change: a row
+write, or a schema change in the main or temp schema (creating or dropping a
+TEMP table counts), so on a busy server most requests rebuild it:
 roughly 15 to 25 ms per resume with 3,000 entities and 40 to 55 ms with
 8,000; about 2 ms when nothing has changed.
 

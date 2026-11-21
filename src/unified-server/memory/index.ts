@@ -4879,8 +4879,9 @@ export class MemoryManager {
    *
    * Cached per tenant and connection while the database is unchanged (stamp:
    * PRAGMA data_version for other connections' commits, PRAGMA
-   * schema_version for DDL such as a table swap, and total_changes() for
-   * this connection's row writes). Inside a transaction the cache may be
+   * schema_version and temp.schema_version for DDL such as a table swap or
+   * a TEMP table shadowing shared_memory, and total_changes() for this
+   * connection's row writes). Inside a transaction the cache may be
    * READ when the stamp matches but is never POPULATED: a rollback does not
    * move the stamp back, so a map built from uncommitted rows must not
    * outlive the transaction. restoreSnapshot clears it. Returns null when
@@ -4888,12 +4889,15 @@ export class MemoryManager {
    */
   private entityExactOwners(tenantId: string): ExactOwnerCatalog | null {
     try {
-      // schema_version moves on DDL (a table swap by ALTER TABLE ... RENAME
-      // changes no row count on this connection).
+      // schema_version moves on main-schema DDL (a table swap by ALTER TABLE
+      // ... RENAME changes no row count on this connection); temp.schema_version
+      // moves when a TEMP table is created or dropped, which can shadow (or
+      // stop shadowing) shared_memory for every unqualified reader.
       const dataVersion = this.db.pragma('data_version', { simple: true });
       const schemaVersion = this.db.pragma('schema_version', { simple: true });
+      const tempSchemaVersion = this.db.pragma('temp.schema_version', { simple: true });
       const changes = (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
-      const stamp = `${dataVersion}:${schemaVersion}:${changes}`;
+      const stamp = `${dataVersion}:${schemaVersion}:${tempSchemaVersion}:${changes}`;
       const cached = this.entityExactOwnerCache.get(tenantId);
       if (cached && cached.db === this.db && cached.stamp === stamp) return cached.catalog;
 
@@ -4955,13 +4959,6 @@ export class MemoryManager {
     }
   }
 
-  /**
-   * Operator health count: entity rows whose stored content is not a valid
-   * JSON object (count only, never content). Such a row owns no name, and
-   * any name its index keys still point at does not resolve, until it is
-   * repaired. Surfaced as databases.sqlite.invalidEntityRows on
-   * /system/status.
-   */
   /** countInvalidEntityRows for status reporting: null when the count fails. */
   safeCountInvalidEntityRows(): number | null {
     try {
@@ -4972,6 +4969,13 @@ export class MemoryManager {
     }
   }
 
+  /**
+   * Operator health count: entity rows whose stored content is not a valid
+   * JSON object (count only, never content). Such a row owns no name, and
+   * any name its index keys still point at does not resolve, until it is
+   * repaired. Surfaced as databases.sqlite.invalidEntityRows on
+   * /system/status.
+   */
   countInvalidEntityRows(tenantId?: string): number {
     const sql = `SELECT COUNT(*) AS c FROM shared_memory
       WHERE memory_type = 'entity'
