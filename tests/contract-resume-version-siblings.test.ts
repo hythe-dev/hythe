@@ -1057,3 +1057,163 @@ describe('owner snapshot per operation (PR #36 round 6, C1)', () => {
     expect(names(shared)).toEqual([shared]);
   });
 });
+
+/**
+ * PR #36 round 6 (C2): checkpoint resolves and writes in ONE IMMEDIATE
+ * transaction. Two real connections to one WAL database race on a name
+ * collision; the nesting contract and bounded contention retry are pinned.
+ */
+describe('checkpoint resolves and writes in one IMMEDIATE transaction (PR #36 round 6, C2)', () => {
+  let server: NeuralMCPServer;
+  let tmpDir = '';
+  let dbPath = '';
+  const s = Date.now();
+  const agentId = 'race-agent';
+  const manager = () => server.getMemoryManager() as any;
+  const db = () => server.getMemoryManager().getDb();
+  const state = { objective: 'o', status: 's', owner: agentId, nextActions: [], blockers: [], guardrails: [] };
+  const params = (project: string, key: string) => ({ agentId, scope: { project }, expectedRevision: null, idempotencyKey: key, state });
+  const eng4Counts = () => Object.fromEntries((db().prepare(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'eng4_%' ORDER BY name`
+  ).all() as any[]).map((t) => [t.name, (db().prepare(`SELECT COUNT(*) AS c FROM "${t.name}"`).get() as any).c]));
+  const collision = (other: Database.Database, id: string, alias: string) =>
+    other.prepare(`INSERT INTO shared_memory (id, tenant_id, memory_type, content, created_by, tags) VALUES (?, 'default', 'entity', ?, 'race', '[]')`)
+      .run(id, JSON.stringify({ name: `collider-${id}`, entityType: 'project', aliases: [alias] }));
+  const openOther = () => {
+    const other = new Database(dbPath);
+    other.pragma('busy_timeout = 0');
+    return other;
+  };
+  let checkpointMod: typeof import('../src/unified-server/eng4/checkpoint.js');
+
+  beforeAll(async () => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vsib-r6-race-'));
+    dbPath = path.join(tmpDir, 'test.db');
+    server = new NeuralMCPServer(0, dbPath);
+    // The reported failure (SQLITE_BUSY_SNAPSHOT) is a WAL behavior.
+    server.getMemoryManager().getDb().pragma('journal_mode = WAL');
+    checkpointMod = await import('../src/unified-server/eng4/checkpoint.js');
+  });
+
+  afterAll(() => {
+    delete checkpointMod.checkpointTestHooks.beforeTransaction;
+    delete checkpointMod.checkpointTestHooks.afterResolve;
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const create = (name: string) => (server as any)._handleToolCall('create_entities', {
+    entities: [{ name, entityType: 'project', observations: [], aliases: [] }],
+  });
+
+  it('the database is in WAL mode for the race', () => {
+    expect(String(db().pragma('journal_mode', { simple: true })).toLowerCase()).toBe('wal');
+  });
+
+  it('(a) another connection commits a collision before BEGIN IMMEDIATE: the checkpoint refuses and writes nothing', async () => {
+    const shared = `race-a-${s}`;
+    await create(shared);
+    const other = openOther();
+    const before = eng4Counts();
+    let fired = 0;
+    checkpointMod.checkpointTestHooks.beforeTransaction = () => {
+      if (fired++ === 0) collision(other, `race-a-col-${s}`, shared);
+    };
+    try {
+      expect(() => checkpointMod.performCheckpoint(db(), manager(), 'default', params(shared, `race-a-${s}`) as any))
+        .toThrow(/ambiguous/);
+    } finally {
+      delete checkpointMod.checkpointTestHooks.beforeTransaction;
+      other.close();
+    }
+    expect(fired).toBe(1);
+    expect(eng4Counts()).toEqual(before);
+  });
+
+  it('(b) the checkpoint holds IMMEDIATE first: the other connection gets SQLITE_BUSY, then succeeds after the commit', async () => {
+    const shared = `race-b-${s}`;
+    await create(shared);
+    const other = openOther();
+    let otherError = '';
+    checkpointMod.checkpointTestHooks.afterResolve = () => {
+      try { collision(other, `race-b-col-${s}`, shared); } catch (e: any) { otherError = e.code; }
+    };
+    let result: any;
+    try {
+      result = checkpointMod.performCheckpoint(db(), manager(), 'default', params(shared, `race-b-${s}`) as any);
+    } finally {
+      delete checkpointMod.checkpointTestHooks.afterResolve;
+    }
+    expect(otherError).toBe('SQLITE_BUSY');
+    expect(result.outcome).toBe('written');
+    collision(other, `race-b-col-${s}`, shared); // after A's commit
+    other.close();
+    expect(() => checkpointMod.performCheckpoint(db(), manager(), 'default', params(shared, `race-b2-${s}`) as any))
+      .toThrow(/ambiguous/);
+  });
+
+  it('nesting contract: inside an open transaction (or owner snapshot) checkpoint refuses, writing nothing', async () => {
+    const name = `nest-${s}`;
+    await create(name);
+    const before = eng4Counts();
+    expect(() => db().transaction(() => checkpointMod.performCheckpoint(db(), manager(), 'default', params(name, `nest-${s}`) as any))())
+      .toThrow(checkpointMod.CheckpointNestingError);
+    expect(() => manager().withOwnerSnapshot(() => checkpointMod.performCheckpoint(db(), manager(), 'default', params(name, `nest2-${s}`) as any)))
+      .toThrow(checkpointMod.CheckpointNestingError);
+    expect(eng4Counts()).toEqual(before);
+  });
+
+  it('contention is retried a bounded number of times, then fails retryable with nothing written', async () => {
+    const name = `busy-${s}`;
+    await create(name);
+    const previousTimeout = db().pragma('busy_timeout', { simple: true });
+    db().pragma('busy_timeout = 0');
+    const holder = openOther();
+    const before = eng4Counts();
+    let attempts = 0;
+    try {
+      // Held for every attempt: exhausts the bound.
+      holder.exec('BEGIN IMMEDIATE');
+      checkpointMod.checkpointTestHooks.beforeTransaction = () => { attempts++; };
+      let thrown: any;
+      try { checkpointMod.performCheckpoint(db(), manager(), 'default', params(name, `busy-${s}`) as any); } catch (e) { thrown = e; }
+      expect(thrown).toBeInstanceOf(checkpointMod.CheckpointBusyError);
+      expect(thrown.retryable).toBe(true);
+      expect(thrown.code).toBe('SQLITE_BUSY');
+      expect(attempts).toBe(checkpointMod.CHECKPOINT_BUSY_ATTEMPTS);
+      expect(eng4Counts()).toEqual(before);
+      // Through the MCP tool: a tool error naming the retry, not a server error.
+      attempts = 0;
+      const viaTool = await (server as any)._handleToolCall('checkpoint', params(name, `busy-tool-${s}`));
+      expect(viaTool.isError).toBe(true);
+      expect(viaTool.content[0].text).toMatch(/contention.*retry/);
+      holder.exec('ROLLBACK');
+      // Released after the first attempt: the second attempt writes.
+      attempts = 0;
+      holder.exec('BEGIN IMMEDIATE');
+      checkpointMod.checkpointTestHooks.beforeTransaction = () => { if (attempts++ === 1) holder.exec('ROLLBACK'); };
+      const ok = checkpointMod.performCheckpoint(db(), manager(), 'default', params(name, `busy-ok-${s}`) as any);
+      expect(ok.outcome).toBe('written');
+      expect(attempts).toBe(2);
+    } finally {
+      delete checkpointMod.checkpointTestHooks.beforeTransaction;
+      if (holder.inTransaction) holder.exec('ROLLBACK');
+      holder.close();
+      db().pragma(`busy_timeout = ${previousTimeout}`);
+    }
+  });
+
+  it('non-contention errors are not retried', async () => {
+    let attempts = 0;
+    checkpointMod.checkpointTestHooks.beforeTransaction = () => { attempts++; };
+    try {
+      expect(() => checkpointMod.performCheckpoint(db(), manager(), 'default', params(`nope-${s}`, `nope-${s}`) as any))
+        .toThrow(/did not resolve/);
+    } finally {
+      delete checkpointMod.checkpointTestHooks.beforeTransaction;
+    }
+    expect(attempts).toBe(1);
+  });
+});
