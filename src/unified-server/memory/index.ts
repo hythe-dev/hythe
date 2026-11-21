@@ -2231,7 +2231,7 @@ export class MemoryManager {
 
   async getSystemStatus(): Promise<any> {
     const status = {
-      sqlite: { connected: true, type: 'SQLite', invalidEntityRows: this.countInvalidEntityRows() },
+      sqlite: { connected: true, type: 'SQLite', invalidEntityRows: this.safeCountInvalidEntityRows() },
       vector: { connected: false, type: 'sqlite-vec', backend: 'sqlite-vec' },
       // Backward-compat alias for older dashboards/clients.
       weaviate: { connected: false, type: 'Vector Database (legacy alias)', backend: 'sqlite-vec' },
@@ -4779,6 +4779,7 @@ export class MemoryManager {
     for (const row of rows) {
       try {
         const content = JSON.parse(row.content || '{}');
+        if (typeof content?.name !== 'string') continue; // a non-string name owns nothing
         for (const value of this.entityQueryVariants(content.name)) {
           values.add(value);
         }
@@ -4842,14 +4843,18 @@ export class MemoryManager {
         // candidacy is re-verified against the entity PAYLOAD: only the
         // canonical name or a registered alias qualifies — the same filter
         // the unindexed fallback applies.
-        const canonicalVariants = new Set(this.entityQueryVariants(content?.name || ''));
+        // Only a STRING name is a name: entityQueryVariants would stringify a
+        // number or an array back into one (a non-string name owns nothing).
+        const canonicalVariants = new Set(
+          typeof content?.name === 'string' ? this.entityQueryVariants(content.name) : []
+        );
         const isCanonical = [...queryVariants].some((v) => canonicalVariants.has(v));
         const isNameOrAlias = isCanonical ||
           this.entityNameAndAliasLookupValues(content).some((v) => queryVariants.has(v));
         if (!isNameOrAlias) continue;
         candidates.push({
           id: String(row.id),
-          name: String(content?.name ?? ''),
+          name: typeof content?.name === 'string' ? content.name : '',
           matchedBy: isCanonical ? 'canonical_name' : 'alias',
         });
       } catch {
@@ -4873,8 +4878,9 @@ export class MemoryManager {
    *  - Deleted entities are gone from shared_memory and own nothing.
    *
    * Cached per tenant and connection while the database is unchanged (stamp:
-   * PRAGMA data_version for other connections' commits plus total_changes()
-   * for this connection's writes). Inside a transaction the cache may be
+   * PRAGMA data_version for other connections' commits, PRAGMA
+   * schema_version for DDL such as a table swap, and total_changes() for
+   * this connection's row writes). Inside a transaction the cache may be
    * READ when the stamp matches but is never POPULATED: a rollback does not
    * move the stamp back, so a map built from uncommitted rows must not
    * outlive the transaction. restoreSnapshot clears it. Returns null when
@@ -4882,9 +4888,12 @@ export class MemoryManager {
    */
   private entityExactOwners(tenantId: string): ExactOwnerCatalog | null {
     try {
+      // schema_version moves on DDL (a table swap by ALTER TABLE ... RENAME
+      // changes no row count on this connection).
       const dataVersion = this.db.pragma('data_version', { simple: true });
+      const schemaVersion = this.db.pragma('schema_version', { simple: true });
       const changes = (this.db.prepare('SELECT total_changes() AS c').get() as { c: number }).c;
-      const stamp = `${dataVersion}:${changes}`;
+      const stamp = `${dataVersion}:${schemaVersion}:${changes}`;
       const cached = this.entityExactOwnerCache.get(tenantId);
       if (cached && cached.db === this.db && cached.stamp === stamp) return cached.catalog;
 
@@ -4953,6 +4962,16 @@ export class MemoryManager {
    * repaired. Surfaced as databases.sqlite.invalidEntityRows on
    * /system/status.
    */
+  /** countInvalidEntityRows for status reporting: null when the count fails. */
+  safeCountInvalidEntityRows(): number | null {
+    try {
+      return this.countInvalidEntityRows();
+    } catch (error: any) {
+      console.warn('⚠️ invalidEntityRows count failed:', error?.message || error);
+      return null;
+    }
+  }
+
   countInvalidEntityRows(tenantId?: string): number {
     const sql = `SELECT COUNT(*) AS c FROM shared_memory
       WHERE memory_type = 'entity'
@@ -5330,7 +5349,7 @@ export class MemoryManager {
       if (this.isConfidentialMessageSearchItem('entity', content)) {
         return { entityId: null, lookupKeys: [], truncated: false };
       }
-      const canonical = this.entityQueryVariants(content?.name || '').sort();
+      const canonical = (typeof content?.name === 'string' ? this.entityQueryVariants(content.name) : []).sort();
       const aliases = (Array.isArray(content?.aliases) ? content.aliases : [])
         .flatMap((alias: unknown) => typeof alias === 'string' ? this.entityQueryVariants(alias) : [])
         .sort();

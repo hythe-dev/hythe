@@ -129,14 +129,19 @@ resolve, and private names are never listed in `ambiguousCandidates`.
 
 An entity record that is not a valid JSON object owns nothing, and any name
 the search index still links to it does not resolve (it is not handed to
-another entity) until the record is repaired. `/system/status` reports how
-many such records exist as `databases.sqlite.invalidEntityRows` (a count,
-never content).
+another entity) until the record is repaired. That includes the index's
+derived forms of its names: a corrupt record that held `cb-x-v2` also blocks
+`cb-x`, so an unrelated, healthy name can come back unresolved. A corrupt
+record the index never linked blocks nothing, but it still owns nothing, so
+a name it should hold may resolve to another entity. `/system/status`
+reports how many such records exist as `databases.sqlite.invalidEntityRows`
+(a count, never content; `null` if the count fails). Any non-zero value
+needs repair, not just watching.
 
-The exact-owner list is cached and rebuilt after any database write, so on a
-busy server most requests rebuild it: roughly 15 to 25 ms per resume with
-3,000 entities and 40 to 55 ms with 8,000; about 2 ms when nothing has
-changed.
+The exact-owner list is cached and rebuilt after any database change (a row
+write or a schema change), so on a busy server most requests rebuild it:
+roughly 15 to 25 ms per resume with 3,000 entities and 40 to 55 ms with
+8,000; about 2 ms when nothing has changed.
 
 Only observations whose `entityName` names the scope entity, and only that
 entity, count. Names are compared case- and punctuation-insensitively:

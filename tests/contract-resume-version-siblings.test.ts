@@ -648,3 +648,172 @@ describe('exact-owner cache across snapshot restore (PR #36 round 3, R3)', () =>
     expect(names()).toEqual([a, shared].sort());
   });
 });
+
+/**
+ * PR #36 round 4: the cache stamp sees DDL (F1); a non-string name never
+ * mints a scope, also through the variant fallback (F2); the corrupt-row
+ * guards each have a test that fails without them (MINOR-1); the status
+ * count degrades instead of failing (NIT-2).
+ */
+describe('exact-owner catalog round 4', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+  const agentId = 'vsib-r4-agent';
+  const call = async (toolName: string, args: Record<string, any>) => {
+    const result = await (server as any)._handleToolCall(toolName, args);
+    const text = result?.content?.[0]?.text;
+    if (result?.isError) throw new Error(`Tool error: ${text}`);
+    return JSON.parse(text);
+  };
+  const manager = () => server.getMemoryManager() as any;
+  const db = () => server.getMemoryManager().getDb();
+  const resume = (project: string, resultVersion: number) =>
+    call('resume', { agentId, scope: { project }, budget: 8000, resultVersion });
+  const create = (entities: Array<{ name: string; aliases?: string[] }>) =>
+    call('create_entities', {
+      entities: entities.map((e) => ({ name: e.name, entityType: 'project', observations: [], aliases: e.aliases ?? [] })),
+    });
+  const idOf = (name: string) =>
+    (db().prepare(`SELECT id FROM shared_memory WHERE memory_type = 'entity' AND json_valid(content) AND json_extract(content, '$.name') = ?`).get(name) as any).id as string;
+  const checkpoint = (project: string, key: string) => call('checkpoint', {
+    agentId, scope: { project }, expectedRevision: null, idempotencyKey: key,
+    state: { objective: 'o', status: 's', owner: agentId, nextActions: [], blockers: [], guardrails: [] },
+  });
+  const snapshotRows = () => (db().prepare('SELECT COUNT(*) AS c FROM eng4_state_snapshots').get() as any).c as number;
+  const expectNoScope = async (ref: string) => {
+    for (const version of [2, 3]) {
+      const bundle = await resume(ref, version);
+      expect(bundle.resolvedScope.scopeKey).toBeNull();
+      expect(bundle.resolvedScope.projectId ?? null).toBeNull();
+    }
+    const before = snapshotRows();
+    await expect(checkpoint(ref, `noscope-${ref}`)).rejects.toThrow(/did not resolve|ambiguous/);
+    expect(snapshotRows()).toBe(before);
+  };
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('F2: an imported entity whose name is an array never mints a scope (no other entity has the name)', async () => {
+    const name = `imported-name-${s}`;
+    await manager().importEntities({
+      schemaVersion: 1,
+      entities: [{
+        id: `imp-${s}`,
+        content: JSON.stringify({ name: [name], entityType: 'project', aliases: [], metadata: { aliases: [name] } }),
+        created_by: 'r4', tags: '[]', created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }],
+      observations: [],
+      relations: [],
+    }, 'default');
+    expect(manager().resolveEntityCandidatesExact(name, 'default')).toEqual([]);
+    await expectNoScope(name);
+  });
+
+  it('F2: a name changed to a number or an array without a reindex does not resolve through old index rows', async () => {
+    const num = `7${String(s).slice(-7)}`;
+    const arr = `numeric-name-${s}`;
+    await create([{ name: num }, { name: arr }]);
+    for (const [name, replacement] of [[num, Number(num)], [arr, [arr]]] as const) {
+      const id = idOf(name);
+      db().prepare(`UPDATE shared_memory SET content = json_set(content, '$.name', json(?)) WHERE id = ?`).run(JSON.stringify(replacement), id);
+      expect((db().prepare('SELECT COUNT(*) AS c FROM graph_lookup_keys WHERE memory_id = ? AND lookup_key = ?').get(id, name) as any).c).toBe(1);
+      expect(manager().resolveEntityCandidatesExact(name, 'default')).toEqual([]);
+      await expectNoScope(name);
+    }
+  });
+
+  it('MINOR-1a: a variant whose base key points at a corrupt row is unresolved, not handed to another version', async () => {
+    const base = `mvx-${s}`;
+    const a = `mvx-owner-${s}`;
+    await create([{ name: a, aliases: [base] }, { name: `${base}-v7` }]);
+    db().prepare('UPDATE shared_memory SET content = ? WHERE id = ?').run('{corrupt', idOf(a));
+    expect(manager().resolveEntityCandidatesExact(`${base}-v2`, 'default')).toEqual([]);
+    await expectNoScope(`${base}-v2`);
+    expect(manager().resolveEntityCandidatesExact(`${base}-v7`, 'default').map((c: any) => c.name)).toEqual([`${base}-v7`]);
+  });
+
+  it('MINOR-1b: a capsule under a name a corrupt row also held is not owned by the other holder', async () => {
+    const sh = `msh-${s}`;
+    const a = `msh-a-${s}`;
+    const b = `msh-b-${s}`;
+    const handle = `msh-b-handle-${s}`;
+    await create([{ name: a, aliases: [sh] }, { name: b, aliases: [sh, handle] }]);
+    const legacy = (await call('add_observations', {
+      observations: [{ entityName: sh, contents: ['legacy capsule under the shared alias'], kind: 'capsule' }],
+    })).observations[0].id as string;
+    db().prepare('UPDATE shared_memory SET content = ? WHERE id = ?').run('{corrupt', idOf(a));
+    for (const version of [2, 3]) {
+      const bundle = await resume(handle, version);
+      expect(bundle.resolvedScope.projectId).toBe(idOf(b));
+      expect(bundle.capsule.current ?? null).toBeNull();
+      expect(JSON.stringify(bundle)).not.toContain(legacy);
+    }
+  });
+
+  it('NIT-2: a failing invalid-row count degrades to null in system status', async () => {
+    const original = manager().countInvalidEntityRows;
+    manager().countInvalidEntityRows = () => { throw new Error('count failed'); };
+    try {
+      const status = await manager().getSystemStatus();
+      expect(status.sqlite.connected).toBe(true);
+      expect(status.sqlite.invalidEntityRows).toBeNull();
+    } finally {
+      manager().countInvalidEntityRows = original;
+    }
+    expect(typeof (await manager().getSystemStatus()).sqlite.invalidEntityRows).toBe('number');
+  });
+});
+
+describe('exact-owner cache sees a same-connection table swap (PR #36 round 4, F1)', () => {
+  let server: NeuralMCPServer;
+  const s = Date.now();
+
+  beforeAll(() => {
+    process.env.ENABLE_ADVANCED_MEMORY = 'false';
+    server = new NeuralMCPServer(0, ':memory:');
+  });
+
+  afterAll(() => {
+    server.close();
+    delete process.env.ENABLE_ADVANCED_MEMORY;
+  });
+
+  it('after ALTER TABLE ... RENAME swaps shared_memory, a shared name is ambiguous again and checkpoint writes nothing', async () => {
+    const manager = server.getMemoryManager() as any;
+    const db = server.getMemoryManager().getDb();
+    const shared = `swap-shared-${s}`;
+    const a = `swap-a-${s}`;
+    await (server as any)._handleToolCall('create_entities', {
+      entities: [
+        { name: a, entityType: 'project', observations: [], aliases: [shared] },
+        { name: shared, entityType: 'project', observations: [], aliases: [] },
+      ],
+    });
+    const names = () => [...new Set(manager.resolveEntityCandidatesExact(shared, 'default').map((c: any) => c.name))].sort();
+    db.exec('CREATE TABLE replacement AS SELECT * FROM shared_memory');
+    const aId = (db.prepare(`SELECT id FROM shared_memory WHERE json_extract(content, '$.name') = ?`).get(a) as any).id;
+    db.prepare(`UPDATE shared_memory SET content = json_set(content, '$.aliases', json('[]')) WHERE id = ?`).run(aId);
+    expect(names()).toEqual([shared]); // warms a B-only catalog
+    db.exec(`BEGIN;
+      ALTER TABLE shared_memory RENAME TO old_entities;
+      ALTER TABLE replacement RENAME TO shared_memory;
+      COMMIT;`);
+    expect(names()).toEqual([a, shared].sort());
+    const before = (db.prepare('SELECT COUNT(*) AS c FROM eng4_state_snapshots').get() as any).c;
+    const result = await (server as any)._handleToolCall('checkpoint', {
+      agentId: 'swap-agent', scope: { project: shared }, expectedRevision: null, idempotencyKey: `swap-${s}`,
+      state: { objective: 'o', status: 's', owner: 'swap-agent', nextActions: [], blockers: [], guardrails: [] },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/ambiguous/);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM eng4_state_snapshots').get() as any).c).toBe(before);
+  });
+});
